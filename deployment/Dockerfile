@@ -23,5 +23,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Final config
-CMD ["bash"]
+# Copy source code
+COPY . .
+
+# Expose ports for Streamlit and FastAPI
+EXPOSE 8501
+EXPOSE 8000
+
+# Default command: run local dev server
+CMD ["streamlit", "run", "src/ui/app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
