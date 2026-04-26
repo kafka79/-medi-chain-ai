@@ -1,0 +1,50 @@
+# Core Machine Learning & Computer Vision
+torch==2.2.1
+torchvision==0.17.1
+transformers==4.38.2
+accelerate==0.27.2
+bitsandbytes==0.42.0
+scipy==1.12.0
+
+# Multimodal & Medical AI
+open-clip-torch==2.24.0
+pydicom==2.4.4
+fhir.resources==7.1.0
+
+# Data Processing & Visualization
+pandas==2.2.1
+numpy==1.26.4
+seaborn==0.13.2
+matplotlib==3.8.3
+scikit-learn==1.4.1.post1
+Pillow==10.2.0
+
+# Document Processing & PDF
+pdfplumber==0.10.4
+reportlab==4.1.0
+
+# Retrieval & Vector Database
+pymilvus==2.3.6
+sentence-transformers==2.5.1
+
+# Agentic Loop
+langgraph==0.0.26
+langchain==0.1.11
+
+# XAI & Privacy
+pytorch-grad-cam==1.1.8
+opacus==1.4.1
+
+# API & UI
+fastapi==0.110.0
+uvicorn==0.28.0
+streamlit==1.32.0
+httpx==0.27.0
+python-multipart==0.0.9
+
+# Infrastructure & Testing
+pytest==8.0.2
+pytest-cov==4.1.0
+python-dotenv==1.0.1
+tqdm==4.66.2
+xmltodict==0.13.0
