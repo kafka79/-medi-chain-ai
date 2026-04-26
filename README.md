@@ -57,32 +57,36 @@ graph TD
 
 ---
 
-## 🚀 Quick Start
+---
 
-### 1. Setup Environment
+## 🐳 Docker Deployment
+
+MEdi Chain AI is fully containerized for consistent deployment across environments.
+
+### 1. Build and Start Services
 ```bash
-# Setup Docker infrastructure (Milvus, etcd, minio)
-make setup
+# Build images and start all services (Milvus, UI, API)
+docker-compose -f deployment/docker-compose.yml up -d --build
 ```
 
-### 2. Edge/CPU Optimization (Sam's Fix)
-For deployment in hardware-constrained rural clinics:
-```bash
-# Export Fusion model to ONNX for 4x faster CPU inference
-python src/utils/export_onnx.py
-```
-*Supports OpenVINO runtime for Intel-based medical tablets.*
+### 2. Access the Applications
+- **Streamlit Dashboard**: [http://localhost:8501](http://localhost:8501)
+- **FastAPI Endpoint**: [http://localhost:8000/docs](http://localhost:8000/docs)
 
-### 3. Run Diagnostic UI
-```bash
-# Launch Streamlit dashboard
-streamlit run src/ui/app.py
-```
+### 3. "Upload" to Docker Registry (Pushing)
+To share your images or deploy to a cloud provider:
 
-### 3. API Access
 ```bash
-# Launch FastAPI production endpoint
-python deployment/api/main.py
+# 1. Login to your registry (e.g., Docker Hub)
+docker login
+
+# 2. Tag your images
+docker tag medi-chain-ui:latest your-username/medi-chain-ui:v1.0
+docker tag medi-chain-api:latest your-username/medi-chain-api:v1.0
+
+# 3. Push to registry
+docker push your-username/medi-chain-ui:v1.0
+docker push your-username/medi-chain-api:v1.0
 ```
 
 ---

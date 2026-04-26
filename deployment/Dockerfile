@@ -30,5 +30,9 @@ COPY . .
 EXPOSE 8501
 EXPOSE 8000
 
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8501/_stcore/health || exit 1
+
 # Default command: run local dev server
 CMD ["streamlit", "run", "src/ui/app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]

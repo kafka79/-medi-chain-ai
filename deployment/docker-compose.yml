@@ -42,11 +42,13 @@ services:
       - "etcd"
       - "minio"
 
-  app:
-    container_name: medi-chain-app
+  medi-ui:
+    container_name: medi-chain-ui
     build:
       context: ..
       dockerfile: deployment/Dockerfile
+    ports:
+      - "8501:8501"
     volumes:
       - ..:/app
       - /app/data
@@ -61,6 +63,29 @@ services:
               capabilities: [gpu]
     stdin_open: true
     tty: true
+    depends_on:
+      - standalone
+
+  medi-api:
+    container_name: medi-chain-api
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    command: ["uvicorn", "deployment.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ..:/app
+      - /app/data
+    environment:
+      - MILVUS_HOST=standalone
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     depends_on:
       - standalone
 
