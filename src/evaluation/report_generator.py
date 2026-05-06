@@ -6,6 +6,8 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Tabl
 from datetime import datetime
 import os
 
+from src.data.fhir_formatter import FHIRFormatter
+
 class ClinicalReportGenerator:
     """
     Generates professional PDF clinical reports for diagnostic results.
@@ -15,6 +17,7 @@ class ClinicalReportGenerator:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
         self.styles = getSampleStyleSheet()
+        self.fhir_formatter = FHIRFormatter()
 
     def generate_report(self, diagnosis_result, patient_metadata, heatmap_path, citations, output_filename=None):
         if not output_filename:
@@ -31,56 +34,41 @@ class ClinicalReportGenerator:
         elements.append(Paragraph(f"Date: {datetime.now().strftime('%B %d, %Y %H:%M')}", self.styles['Normal']))
         elements.append(Spacer(1, 12))
 
-        # Patient Info
-        elements.append(Paragraph("Patient Information", self.styles['Heading2']))
-        patient_data = [
-            ["Patient ID:", patient_metadata.get('patient_id', 'Unknown')],
-            ["Age:", str(patient_metadata.get('age', 'Unknown'))],
-            ["Gender:", patient_metadata.get('gender', 'Unknown')],
-            ["Occupation:", patient_metadata.get('occupation', 'Unknown')],
-        ]
-        t = Table(patient_data, colWidths=[100, 300])
-        t.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey)]))
-        elements.append(t)
-        elements.append(Spacer(1, 12))
-
-        # Diagnostic Summary
-        elements.append(Paragraph("Diagnostic Interpretation", self.styles['Heading2']))
+        # Clinical Key Takeaways (New High-Priority Section)
+        elements.append(Paragraph("Clinical Key Takeaways", self.styles['Heading2']))
         findings = diagnosis_result.get('top_finding', 'Inconclusive')
         confidence = diagnosis_result.get('confidence', 0.0)
         uncertainty = diagnosis_result.get('uncertainty_std', 0.0)
         
-        summary_text = f"<b>Primary Finding:</b> {findings}<br/>"
-        summary_text += f"<b>Confidence:</b> {confidence:.1%} (±{uncertainty:.1%})<br/>"
+        takeaway_style = ParagraphStyle(
+            'Takeaway',
+            parent=self.styles['Normal'],
+            backColor=colors.whitesmoke,
+            borderPadding=10,
+            leading=14
+        )
+        
+        takeaway_text = f"<b>Primary Finding:</b> {findings}<br/>"
+        takeaway_text += f"<b>Statistical Confidence:</b> {confidence:.1%} (±{uncertainty:.1%})<br/>"
         
         if diagnosis_result.get('escalation_required', False):
-            summary_text += "<br/><font color='red'><b>URGENT: Insufficient evidence for automated diagnosis. Escalated to Radiologist.</b></font>"
-        
-        elements.append(Paragraph(summary_text, self.styles['Normal']))
+            takeaway_text += "<br/><font color='red'><b>ACTION REQUIRED:</b> This case has been escalated for manual review due to insufficient automated evidence.</font>"
+        else:
+            takeaway_text += "<br/><b>Recommendation:</b> Correlate with clinical symptoms and history."
+
+        elements.append(Paragraph(takeaway_text, takeaway_style))
         elements.append(Spacer(1, 12))
 
-        # Visual Evidence (Heatmap)
+        # Visual Evidence
         if os.path.exists(heatmap_path):
-            elements.append(Paragraph("Visual Evidence (Grad-CAM Heatmap)", self.styles['Heading3']))
-            img = Image(heatmap_path, width=300, height=300)
+            elements.append(Paragraph("Visual Evidence (Attention Mapping)", self.styles['Heading3']))
+            img = Image(heatmap_path, width=250, height=250)
             elements.append(img)
-            elements.append(Paragraph("<i>Red regions indicates anatomical areas used for clinical classification.</i>", self.styles['Italic']))
+            elements.append(Paragraph("<i>Highlighted regions indicate anatomical areas driving the AI prediction.</i>", self.styles['Italic']))
             elements.append(Spacer(1, 12))
 
-        # RAG Citations
-        if citations:
-            elements.append(Paragraph("Biomedical Literatures / Citations", self.styles['Heading3']))
-            for cit in citations:
-                # cit is a dict: {'pmid': ..., 'text': ..., 'title': ...}
-                title = cit.get('title', 'Unknown Title')
-                pmid = cit.get('pmid', 'N/A')
-                snippet = cit.get('text', '')[:200] + "..."
-                elements.append(Paragraph(f"<b>{title}</b> (PMID: {pmid})", self.styles['Normal']))
-                elements.append(Paragraph(snippet, self.styles['Italic']))
-                elements.append(Spacer(1, 6))
-
         # Differential Diagnosis Table
-        elements.append(Paragraph("Differential Diagnosis Probabilities", self.styles['Heading3']))
+        elements.append(Paragraph("Differential Diagnosis Summary", self.styles['Heading3']))
         probs = diagnosis_result.get('probabilities', [])
         classes = ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
         diff_data = [["Condition", "Probability"]]
@@ -94,11 +82,42 @@ class ClinicalReportGenerator:
             ('GRID', (0,0), (-1,-1), 0.5, colors.grey)
         ]))
         elements.append(dt)
+        elements.append(Spacer(1, 12))
+
+        # Appendix: Supporting Literature (Condensed)
+        if citations:
+            elements.append(Paragraph("Appendix: Supporting Literature", self.styles['Heading3']))
+            for cit in citations:
+                title = cit.get('title', 'Unknown Title')
+                pmid = cit.get('pmid', 'N/A')
+                elements.append(Paragraph(f"• <b>{title}</b> (PMID: {pmid})", self.styles['Normal']))
+            elements.append(Paragraph("<i>Full snippets available in the digital FHIR sidecar.</i>", self.styles['Italic']))
 
         # Build PDF
         doc.build(elements)
+        fhir_path = self._write_fhir_sidecar(filepath, diagnosis_result, patient_metadata)
         print(f"Report generated successfully: {filepath}")
-        return filepath
+        return {"pdf_path": filepath, "fhir_path": fhir_path}
+
+    def _write_fhir_sidecar(self, pdf_path, diagnosis_result, patient_metadata):
+        probabilities = diagnosis_result.get('probabilities', [])
+        classes = ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
+        differential = {
+            classes[i]: probabilities[i]
+            for i in range(min(len(classes), len(probabilities)))
+        }
+        diagnosis_data = {
+            "patient_id": patient_metadata.get('patient_id', 'UNK'),
+            "primary_finding": diagnosis_result.get('top_finding', 'Inconclusive'),
+            "differential": differential,
+            "confidence": diagnosis_result.get('confidence', 0.0),
+            "report_path": pdf_path,
+        }
+        report = self.fhir_formatter.create_diagnostic_report(diagnosis_data)
+        fhir_path = os.path.splitext(pdf_path)[0] + ".fhir.json"
+        with open(fhir_path, "w", encoding="utf-8") as handle:
+            handle.write(self.fhir_formatter.to_json(report))
+        return fhir_path
 
 if __name__ == "__main__":
     # Test

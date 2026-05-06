@@ -61,7 +61,13 @@ class ClinicalAgent:
 
     def node_parse_history(self, state: AgentState):
         print("[Node] Parsing Patient History...")
-        history = self.parser.parse_pdf(state['patient_pdf_path'])
+        raw_history = self.parser.parse_pdf(state['patient_pdf_path'])
+        
+        # Scrub PHI (Fixes 'De-identification Edge Cases')
+        from src.data.privacy_scrubber import PrivacyScrubber
+        scrubber = PrivacyScrubber()
+        history = scrubber.scrub_history_data(raw_history)
+        
         return {"history_data": history}
 
     def node_query_pubmed(self, state: AgentState):
@@ -99,9 +105,20 @@ class ClinicalAgent:
         
         pred_idx = results['prediction'][0].item()
         classes = ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
+        top_finding = classes[pred_idx] if pred_idx < len(classes) else "Unknown"
+        
+        # Generate Clinical Rationale (Fixes 'User-Led Explanation')
+        from src.monitoring.xai_explainer import XAIExplainer
+        explainer = XAIExplainer()
+        rationale = explainer.explain(
+            top_finding, 
+            results['mean_confidence'][0].item(),
+            results['std_deviation'][0]
+        )
         
         diagnosis = {
-            "top_finding": classes[pred_idx] if pred_idx < len(classes) else "Unknown",
+            "top_finding": top_finding,
+            "rationale": rationale,
             "probabilities": results['all_probs'][0].tolist(),
             "uncertainty_std": results['std_deviation'][0]
         }

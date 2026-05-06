@@ -2,51 +2,49 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class LateFusionModel(nn.Module):
+class AttentionFusion(nn.Module):
     """
-    Late fusion model for clinical classification.
-    Concatenates visual embeddings from BiomedCLIP (512D) 
-    and text embeddings from clinical history (768D).
+    Addresses Tara's 'Oversimplification' critique.
+    Implements a cross-attention mechanism to better align visual and text embeddings
+    before final classification.
     """
-    def __init__(self, vision_dim=512, text_dim=768, hidden_dim=512, output_dim=256, num_classes=5):
-        super(LateFusionModel, self).__init__()
+    def __init__(self, vision_dim=512, text_dim=768, hidden_dim=512, num_classes=5):
+        super(AttentionFusion, self).__init__()
         
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(vision_dim + text_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        # Projection layers to align dimensions
+        self.v_proj = nn.Linear(vision_dim, hidden_dim)
+        self.t_proj = nn.Linear(text_dim, hidden_dim)
+        
+        # Multi-head attention
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
+        
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
             nn.ReLU(),
-            nn.Dropout(p=0.5), # Increased p for better MC Dropout signal
-            nn.Linear(hidden_dim, output_dim),
-            nn.LayerNorm(output_dim),
-            nn.ReLU(),
-            nn.Dropout(p=0.2)
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
         )
         
-        self.classifier = nn.Linear(output_dim, num_classes)
-        
     def forward(self, vision_emb, text_emb):
-        """
-        Args:
-            vision_emb: Tensor of shape (batch, 512)
-            text_emb: Tensor of shape (batch, 768)
-        Returns:
-            Joint representation (batch, 256) and Logits (batch, num_classes)
-        """
-        # Concatenate modalities
-        combined = torch.cat((vision_emb, text_emb), dim=1)
+        # Project and prepare for attention (batch, seq_len=1, hidden_dim)
+        v = self.v_proj(vision_emb).unsqueeze(1)
+        t = self.t_proj(text_emb).unsqueeze(1)
         
-        # Fusion
-        joint_repr = self.fusion_layer(combined)
+        # Cross-attention: Query=Visual, Key/Value=Text
+        attn_output, _ = self.attention(v, t, t)
         
-        # Classification
-        logits = self.classifier(joint_repr)
+        # Residual connection and Norm
+        fused = self.norm1(v + attn_output).squeeze(1)
         
-        return joint_repr, logits
+        logits = self.classifier(fused)
+        return fused, logits
 
-    def get_embeddings(self, vision_emb, text_emb):
-        """Return only the joint representation for indexing/retrieval."""
-        joint_repr, _ = self.forward(vision_emb, text_emb)
-        return joint_repr
+# Keep LateFusionModel for backward compatibility or rename it
+class LateFusionModel(AttentionFusion):
+    pass
 
 if __name__ == "__main__":
     model = LateFusionModel()

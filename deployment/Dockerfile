@@ -1,15 +1,15 @@
-FROM pytorch/pytorch:2.2.1-cuda12.1-cudnn8-devel
+FROM python:3.12-slim-bookworm
 
 # Set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
-ENV DEBIAN_FRONTEND noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     curl \
     make \
@@ -20,11 +20,18 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements-docker.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \
+    torch==2.11.0 torchvision==0.26.0
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements-docker.txt
 
 # Copy source code
 COPY . .
+
+# Warm-up: Pre-download model weights during build to fix 'Cold-Start Latency'
+RUN python scripts/warmup.py
 
 # Expose ports for Streamlit and FastAPI
 EXPOSE 8501
