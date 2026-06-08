@@ -20,9 +20,9 @@ def test_patient_leakage():
     val_df = pd.read_csv(val_path)
     test_df = pd.read_csv(test_path)
     
-    train_ids = set(train_df['report_id'].unique())
-    val_ids = set(val_df['report_id'].unique())
-    test_ids = set(test_df['report_id'].unique())
+    train_ids = set(train_df['patient_id'].unique())
+    val_ids = set(val_df['patient_id'].unique())
+    test_ids = set(test_df['patient_id'].unique())
     
     # Check intersections
     assert train_ids.isdisjoint(val_ids), "Leakage detected between Train and Val"

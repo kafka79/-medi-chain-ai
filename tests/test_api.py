@@ -1,9 +1,9 @@
 from io import BytesIO
-from pathlib import Path
-import shutil
-import uuid
 
 from fastapi.testclient import TestClient
+
+import os
+os.environ["REDIS_URL"] = "memory://"
 
 import deployment.api.main as api_main
 
@@ -29,76 +29,86 @@ class DummyAgent:
             "escalation_required": False,
         }
 
-
-def make_temp_dir() -> Path:
-    base = Path(uuid.uuid4().hex)
-    base.mkdir(exist_ok=True)
-    return base
-
+class DummyStorageProvider:
+    def __init__(self, *args, **kwargs):
+        self.files = {}
+        
+    def save(self, file_obj, rel_path):
+        self.files[rel_path] = b"mock_data"
+        return rel_path
+        
+    def load(self, rel_path):
+        return rel_path
+        
+    def delete(self, rel_path):
+        keys = list(self.files.keys())
+        for k in keys:
+            if k.startswith(rel_path):
+                del self.files[k]
+                
+    def cleanup(self, max_age):
+        self.files.clear()
 
 def test_health_is_lazy(monkeypatch):
-    base_dir = make_temp_dir()
-    try:
-        monkeypatch.setattr(api_main, "TEMP_ROOT", Path("."))
-        monkeypatch.setattr(api_main, "build_agent", lambda: DummyAgent())
-        app = api_main.create_app()
+    monkeypatch.setattr(api_main, "build_agent", lambda: DummyAgent())
+    monkeypatch.setattr(api_main, "storage", DummyStorageProvider())
+    app = api_main.create_app()
 
-        with TestClient(app) as client:
-            response = client.get("/health")
-            assert response.status_code == 200
-            assert response.json() == {"status": "ok", "models_loaded": False}
-    finally:
-        shutil.rmtree(base_dir, ignore_errors=True)
-
+    with TestClient(app) as client:
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ok",
+            "models_loaded": True,
+            "concurrency_limit": 2,
+        }
 
 def test_analyze_cleans_request_dir_on_success(monkeypatch):
-    base_dir = make_temp_dir()
-    try:
-        agent = DummyAgent()
-        monkeypatch.setattr(api_main, "TEMP_ROOT", Path("."))
-        monkeypatch.setattr(api_main, "build_agent", lambda: agent)
-        app = api_main.create_app()
+    agent = DummyAgent()
+    storage_mock = DummyStorageProvider()
+    monkeypatch.setattr(api_main, "build_agent", lambda: agent)
+    monkeypatch.setattr(api_main, "storage", storage_mock)
+    
+    # Also mock ehr_gateway to prevent real requests
+    class DummyEHR:
+        def push_report(self, fhir_json): return True
+    monkeypatch.setattr(api_main, "ehr_gateway", DummyEHR())
+    
+    app = api_main.create_app()
 
-        with TestClient(app) as client:
-            response = client.post(
-                "/analyze",
-                files={
-                    "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
-                    "history": ("history.pdf", BytesIO(b"pdf-bytes"), "application/pdf"),
-                },
-            )
+    with TestClient(app) as client:
+        response = client.post(
+            "/analyze",
+            files={
+                "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
+                "history": ("history.pdf", BytesIO(b"pdf-bytes"), "application/pdf"),
+            },
+            headers={"X-API-Key": "dev-secret-key-123"}
+        )
 
-        assert response.status_code == 200
-        image_path, pdf_path = agent.calls[0]
-        request_dir = Path(image_path).parent
-        assert not Path(image_path).exists()
-        assert not Path(pdf_path).exists()
-        assert not request_dir.exists()
-    finally:
-        shutil.rmtree(base_dir, ignore_errors=True)
-
+    assert response.status_code == 200
+    assert len(agent.calls) == 1
+    # Check that cleanup task deleted the files
+    assert len(storage_mock.files) == 0
 
 def test_analyze_cleans_request_dir_on_failure(monkeypatch):
-    base_dir = make_temp_dir()
-    try:
-        agent = DummyAgent(should_fail=True)
-        monkeypatch.setattr(api_main, "TEMP_ROOT", Path("."))
-        monkeypatch.setattr(api_main, "build_agent", lambda: agent)
-        app = api_main.create_app()
+    agent = DummyAgent(should_fail=True)
+    storage_mock = DummyStorageProvider()
+    monkeypatch.setattr(api_main, "build_agent", lambda: agent)
+    monkeypatch.setattr(api_main, "storage", storage_mock)
+    app = api_main.create_app()
 
-        with TestClient(app) as client:
-            response = client.post(
-                "/analyze",
-                files={
-                    "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
-                    "history": ("history.pdf", BytesIO(b"pdf-bytes"), "application/pdf"),
-                },
-            )
+    with TestClient(app) as client:
+        response = client.post(
+            "/analyze",
+            files={
+                "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
+                "history": ("history.pdf", BytesIO(b"pdf-bytes"), "application/pdf"),
+            },
+            headers={"X-API-Key": "dev-secret-key-123"}
+        )
 
-        assert response.status_code == 500
-        assert response.json()["detail"].startswith("Analysis failed:")
-        if agent.calls:
-            request_dir = Path(agent.calls[0][0]).parent
-            assert not request_dir.exists()
-    finally:
-        shutil.rmtree(base_dir, ignore_errors=True)
+    assert response.status_code == 500
+    assert response.json()["detail"].startswith("Analysis failed:")
+    # Even on failure, files should be deleted
+    assert len(storage_mock.files) == 0

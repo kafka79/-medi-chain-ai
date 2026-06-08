@@ -15,13 +15,15 @@ class AgentState(TypedDict):
     escalation_required: bool
 
 class ClinicalAgent:
-    def __init__(self, visual_encoder, history_parser, rag_evaluator, fusion_model, text_encoder, uncertainty_estimator):
-        self.encoder = visual_encoder
+    def __init__(self, history_parser, rag_evaluator, inference_api_url: str = None):
         self.parser = history_parser
         self.rag = rag_evaluator
-        self.fusion = fusion_model
-        self.text_encoder = text_encoder
-        self.uncertainty = uncertainty_estimator
+        import os
+        self.inference_api_url = inference_api_url or os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
+        self.internal_api_key = os.getenv("INTERNAL_API_KEY", "internal-secret-token")
+        
+        from ..data.privacy_scrubber import PrivacyScrubber
+        self.scrubber = PrivacyScrubber()
         
         self.workflow = StateGraph(AgentState)
         self._build_graph()
@@ -56,7 +58,38 @@ class ClinicalAgent:
     # Node Functions
     def node_extract_visuals(self, state: AgentState):
         print("[Node] Extracting Visuals...")
-        features = self.encoder.encode_image(state['image_path'])
+        import os
+        from pathlib import Path
+        
+        orig_img_path = state['image_path']
+        
+        # Mask the burned-in text and retrieve the anonymized image path
+        img_to_encode = self.scrubber.mask_burned_in_text(orig_img_path)
+        success = (img_to_encode != orig_img_path)
+        
+        import requests
+        
+        # Call inference API instead of local encoder
+        try:
+            with open(img_to_encode, "rb") as f:
+                resp = requests.post(
+                    f"{self.inference_api_url}/encode/image",
+                    files={"image": ("image.jpg", f, "image/jpeg")},
+                    headers={"X-Internal-API-Key": self.internal_api_key}
+                )
+            resp.raise_for_status()
+            features = resp.json()["features"]
+        except Exception as e:
+            print(f"[Clinical Graph] Error calling inference API: {e}")
+            raise RuntimeError(f"Visual encoder failed: {e}")
+        
+        # Clean up the temporary scrubbed image if it was created
+        if success and os.path.exists(img_to_encode) and img_to_encode != orig_img_path:
+            try:
+                os.remove(img_to_encode)
+            except Exception as e:
+                print(f"[Clinical Graph] Warning: failed to clean up temp scrubbed image: {e}")
+                
         return {"visual_features": features}
 
     def node_parse_history(self, state: AgentState):
@@ -64,9 +97,7 @@ class ClinicalAgent:
         raw_history = self.parser.parse_pdf(state['patient_pdf_path'])
         
         # Scrub PHI (Fixes 'De-identification Edge Cases')
-        from src.data.privacy_scrubber import PrivacyScrubber
-        scrubber = PrivacyScrubber()
-        history = scrubber.scrub_history_data(raw_history)
+        history = self.scrubber.scrub_history_data(raw_history)
         
         return {"history_data": history}
 
@@ -84,26 +115,46 @@ class ClinicalAgent:
 
     def node_synthesize_diagnosis(self, state: AgentState):
         print("[Node] Synthesizing Diagnosis...")
-        # Get visual features
+        # Get visual features (already list from API)
         v = state['visual_features']
-        if not torch.is_tensor(v):
-            v = torch.from_numpy(v).float()
-        if v.ndim == 1:
-            v = v.unsqueeze(0)
             
         # Get text features from history
         history = state['history_data']
         text_content = f"{history.get('chief_complaint', '')} {history.get('history_present_illness', '')} {history.get('labs', '')}"
         
-        # Embed text using SapBERT/PubMedBERT
-        t = self.text_encoder.encode([text_content], convert_to_tensor=True)
-        if t.ndim == 1:
-            t = t.unsqueeze(0)
+        import requests
         
-        # Run uncertainty estimation (includes fusion model call)
-        results = self.uncertainty.estimate_uncertainty(v, t, num_passes=20)
+        # Embed text using remote API
+        try:
+            resp = requests.post(
+                f"{self.inference_api_url}/encode/text",
+                json={"text": text_content},
+                headers={"X-Internal-API-Key": self.internal_api_key}
+            )
+            resp.raise_for_status()
+            t = resp.json()["embeddings"]
+        except Exception as e:
+            print(f"[Clinical Graph] Error calling inference API text encoder: {e}")
+            raise RuntimeError(f"Text encoder failed: {e}")
         
-        pred_idx = results['prediction'][0].item()
+        # Run uncertainty estimation via remote API
+        try:
+            resp = requests.post(
+                f"{self.inference_api_url}/estimate",
+                json={
+                    "visual_features": v,
+                    "text_features": t,
+                    "num_passes": 20
+                },
+                headers={"X-Internal-API-Key": self.internal_api_key}
+            )
+            resp.raise_for_status()
+            results = resp.json()
+        except Exception as e:
+            print(f"[Clinical Graph] Error calling inference API uncertainty estimator: {e}")
+            raise RuntimeError(f"Uncertainty estimator failed: {e}")
+        
+        pred_idx = int(results['prediction'][0])
         classes = ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
         top_finding = classes[pred_idx] if pred_idx < len(classes) else "Unknown"
         
@@ -112,20 +163,22 @@ class ClinicalAgent:
         explainer = XAIExplainer()
         rationale = explainer.explain(
             top_finding, 
-            results['mean_confidence'][0].item(),
-            results['std_deviation'][0]
+            float(results['mean_confidence'][0]),
+            float(results['std_deviation'][0]),
+            probabilities=results['all_probs'][0],
+            history_data=history
         )
         
         diagnosis = {
             "top_finding": top_finding,
             "rationale": rationale,
-            "probabilities": results['all_probs'][0].tolist(),
-            "uncertainty_std": results['std_deviation'][0]
+            "probabilities": results['all_probs'][0],
+            "uncertainty_std": float(results['std_deviation'][0])
         }
         
         return {
             "diagnosis": diagnosis, 
-            "confidence": results['mean_confidence'][0].item()
+            "confidence": float(results['mean_confidence'][0])
         }
 
     def node_self_verify(self, state: AgentState):
@@ -149,7 +202,14 @@ class ClinicalAgent:
     def should_continue(self, state: AgentState):
         if state.get('escalation_required', False):
             return "end"
-        if state['confidence'] < 0.6 and state['iteration_count'] < 3:
+        
+        confidence = state.get('confidence', 1.0)
+        diagnosis = state.get('diagnosis', {})
+        uncertainty_std = diagnosis.get('uncertainty_std', 0.0)
+        
+        is_uncertain = confidence < 0.6 or uncertainty_std > 0.15
+        
+        if is_uncertain and state.get('iteration_count', 0) < 3:
             return "retry"
         return "end"
 

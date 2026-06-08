@@ -13,19 +13,22 @@ class UncertaintyEstimator:
         """
         self.model.eval()
         
-        # Enable dropout layers specifically
-        for m in self.model.modules():
-            if isinstance(m, torch.nn.Dropout):
-                m.train()
-            # Safety: Ensure no BatchNorm is in training mode
-            if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
-                m.eval()
-        
-        all_logits = []
-        with torch.no_grad():
-            for _ in range(num_passes):
-                _, logits = self.model(vision_emb, text_emb)
-                all_logits.append(torch.softmax(logits, dim=1))
+        try:
+            # Enable dropout layers specifically
+            for m in self.model.modules():
+                if isinstance(m, torch.nn.Dropout):
+                    m.train()
+                # Safety: Ensure no BatchNorm is in training mode
+                if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
+                    m.eval()
+            
+            all_logits = []
+            with torch.no_grad():
+                for _ in range(num_passes):
+                    _, logits = self.model(vision_emb, text_emb)
+                    all_logits.append(torch.softmax(logits, dim=1))
+        finally:
+            self.model.eval()
         
         # Stack results (num_passes, batch, num_classes)
         stacked_probs = torch.stack(all_logits)

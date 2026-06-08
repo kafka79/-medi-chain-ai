@@ -25,6 +25,15 @@ services:
       timeout: 20s
       retries: 3
 
+  redis:
+    container_name: medi-chain-redis
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   standalone:
     container_name: milvus-standalone
     image: milvusdb/milvus:v2.3.16
@@ -34,9 +43,6 @@ services:
       - MINIO_ADDRESS=minio:9000
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
-    ports:
-      - "19530:19530"
-      - "9091:9091"
     depends_on:
       - "etcd"
       - "minio"
@@ -54,36 +60,24 @@ services:
       - /app/data
     environment:
       - MILVUS_HOST=standalone
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     stdin_open: true
     tty: true
     depends_on:
       - standalone
+      - medi-api
 
-  medi-api:
-    container_name: medi-chain-api
-    image: saya2572/medi-chain-api:v1.1
+  inference-api:
+    container_name: medi-chain-inference
+    image: saya2572/medi-chain-inference:v1.0
     build:
       context: ..
       dockerfile: deployment/Dockerfile
-    # Use gunicorn for process management in production
-    command: ["gunicorn", "deployment.api.main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
+    command: ["uvicorn", "deployment.api.inference_service:app", "--host", "0.0.0.0", "--port", "8001"]
     ports:
-      - "8000:8000"
+      - "8001:8001"
     volumes:
       - ..:/app
-      - /app/temp/storage:/app/temp/storage # Shared volume for local storage provider
-    environment:
-      - MILVUS_HOST=standalone
-      - MAX_CONCURRENT_REQUESTS=1 # Per worker limit to protect VRAM
     deploy:
-      replicas: 3 # Addresses 'Single-Node Bottleneck'
       resources:
         reservations:
           devices:
@@ -91,12 +85,38 @@ services:
               count: 1
               capabilities: [gpu]
     healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  medi-api:
+    image: saya2572/medi-chain-api:v1.1
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    # Use gunicorn for process management in production
+    command: ["gunicorn", "deployment.api.main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
+    ports:
+      - "8000-8002:8000"
+    volumes:
+      - ..:/app
+      - ./temp/storage:/app/temp/storage # Shared volume for local storage provider
+    environment:
+      - MILVUS_HOST=standalone
+      - MAX_CONCURRENT_REQUESTS=1 # Per worker limit to protect VRAM
+    deploy:
+      replicas: 3 # Addresses 'Single-Node Bottleneck'
+    healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
     depends_on:
       - standalone
+      - inference-api
+      - redis
+      - minio
 
 networks:
   default:

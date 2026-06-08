@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+
 from PIL import Image
 import open_clip
 import time

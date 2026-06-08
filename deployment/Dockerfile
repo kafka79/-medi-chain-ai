@@ -22,8 +22,7 @@ WORKDIR /app
 # Install Python dependencies
 COPY requirements-docker.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \
-    torch==2.11.0 torchvision==0.26.0
+    pip install torch==2.11.0 torchvision==0.26.0
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements-docker.txt
 

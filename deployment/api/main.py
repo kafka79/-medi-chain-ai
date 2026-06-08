@@ -9,23 +9,27 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, BackgroundTasks, Security, Depends
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
+import secrets
 import uvicorn
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Use Redis for distributed rate limiting across all API replicas
+redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+limiter = Limiter(key_func=get_remote_address, storage_uri=redis_url)
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from sentence_transformers import SentenceTransformer
-
 from src.agent.clinical_graph import ClinicalAgent
 from src.data.pdf_parser import ClinicalPDFParser
 from src.data.fhir_formatter import EHRGateway
-from src.models.fusion import LateFusionModel
-from src.models.uncertainty import UncertaintyEstimator
 from src.rag.evaluator import RAGEvaluator
-from src.vlm.visual_encoder import BiomedVisualEncoder
-from src.utils.storage import LocalStorageProvider
+from src.utils.storage import S3StorageProvider
 from src.monitoring.drift_detector import DriftDetector
 
 # Setup logging
@@ -33,40 +37,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("medi-chain-api")
 
 # Global dependencies (Ready for DI)
-storage = LocalStorageProvider()
+TEMP_ROOT = Path("temp/storage")
+storage = S3StorageProvider(endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"))
 drift_detector = DriftDetector()
 ehr_gateway = EHRGateway()
 
-MODEL_NAME = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
 
 # Global semaphore for model inference
 inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
+
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
+    expected_key = os.getenv("API_KEY", "dev-secret-key-123")
+    if not api_key or not secrets.compare_digest(api_key, expected_key):
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return api_key
+
 def build_agent() -> ClinicalAgent:
-    logger.info("Initializing models (BiomedVisualEncoder, SapBERT, LateFusion)...")
-    encoder = BiomedVisualEncoder()
+    logger.info("Initializing ClinicalAgent with remote inference API...")
     parser = ClinicalPDFParser()
-    text_encoder = SentenceTransformer(MODEL_NAME)
-    fusion = LateFusionModel()
-    uncertainty = UncertaintyEstimator(fusion)
     rag = RAGEvaluator(
         milvus_host=os.getenv("MILVUS_HOST", "localhost"),
         milvus_port=os.getenv("MILVUS_PORT", "19530"),
+        inference_api_url=os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
     )
-    return ClinicalAgent(encoder, parser, rag, fusion, text_encoder, uncertainty)
+    return ClinicalAgent(
+        history_parser=parser, 
+        rag_evaluator=rag,
+        inference_api_url=os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
+    )
 
 async def cleanup_old_temp_files():
     """Background task to clean up storage older than 1 hour."""
     while True:
         try:
-            now = time.time()
-            root = Path(storage.root)
-            if root.exists():
-                for item in root.iterdir():
-                    if item.is_dir() and (now - item.stat().st_mtime > 3600):
-                        logger.info(f"Cleaning up old storage directory: {item}")
-                        storage.delete(item.name)
+            await asyncio.to_thread(storage.cleanup, max_age_seconds=3600)
         except Exception as e:
             logger.error(f"Error in cleanup task: {e}")
         await asyncio.sleep(600)
@@ -88,14 +97,23 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         description="Enterprise-ready multimodal diagnostic API."
     )
+    
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     @app.post("/analyze")
+    @limiter.limit("10/minute")
     async def analyze_case(
         request: Request,
         background_tasks: BackgroundTasks,
         image: UploadFile = File(...),
         history: UploadFile = File(...),
+        api_key: str = Depends(verify_api_key)
     ):
+        if image.content_type not in ["image/jpeg", "image/png", "application/dicom"]:
+            raise HTTPException(415, "Unsupported image type. Use JPEG, PNG, or DICOM.")
+        if history.content_type != "application/pdf":
+            raise HTTPException(415, "Unsupported history document type. Use PDF.")
         agent = request.app.state.agent
         if agent is None:
             raise HTTPException(status_code=503, detail="Models not loaded.")
@@ -106,25 +124,35 @@ def create_app() -> FastAPI:
 
         try:
             # Use StorageProvider (addresses 'Stateful Temp Storage')
-            img_path = storage.save(image.file, img_rel)
-            pdf_path = storage.save(history.file, pdf_rel)
+            img_path = await asyncio.to_thread(storage.save, image.file, img_rel)
+            pdf_path = await asyncio.to_thread(storage.save, history.file, pdf_rel)
+            
+            # Hydrate S3 blobs to local filesystem for ML models
+            local_img_path = await asyncio.to_thread(storage.load, img_path)
+            local_pdf_path = await asyncio.to_thread(storage.load, pdf_path)
             
             async with inference_semaphore:
                 loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, agent.run, img_path, pdf_path)
+                result = await loop.run_in_executor(None, agent.run, local_img_path, local_pdf_path)
                 
-            # Monitor for drift (addresses 'Model Drifting')
-            drift_detector.add_prediction(result['diagnosis']['probabilities'])
+            # Monitor for drift (prediction drift and covariate shift)
+            background_tasks.add_task(drift_detector.add_prediction, result['diagnosis']['probabilities'], result.get('visual_features'))
             
-            # Simulated EHR Push (addresses 'Integration Friction')
-            background_tasks.add_task(ehr_gateway.push_report, str(result))
+            # EHR Push is officially handled by the Presentation Layer (app.py)
+            # to prevent duplicate background transmissions.
                 
             return JSONResponse(content=result)
         except Exception as exc:
             logger.error(f"Analysis failed: {exc}")
-            raise HTTPException(status_code=500, detail=str(exc))
+            return JSONResponse(status_code=500, content={"detail": f"Analysis failed: {exc}"})
         finally:
             background_tasks.add_task(storage.delete, request_id)
+            if 'local_img_path' in locals() and os.path.exists(local_img_path):
+                try: os.unlink(local_img_path)
+                except Exception: pass
+            if 'local_pdf_path' in locals() and os.path.exists(local_pdf_path):
+                try: os.unlink(local_pdf_path)
+                except Exception: pass
 
     @app.get("/health")
     async def health_check(request: Request):

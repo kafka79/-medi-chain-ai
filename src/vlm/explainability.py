@@ -1,4 +1,3 @@
-import torch
 import numpy as np
 import cv2
 from pytorch_grad_cam import GradCAM
@@ -57,8 +56,6 @@ class VisualExplainer:
 
 if __name__ == "__main__":
     import open_clip
-    import os
-    
     # Load model
     model_id = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
     model, preprocess = open_clip.create_model_from_pretrained(model_id)

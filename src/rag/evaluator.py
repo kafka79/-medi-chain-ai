@@ -3,9 +3,11 @@ from sentence_transformers import SentenceTransformer
 import os
 
 class RAGEvaluator:
-    def __init__(self, milvus_host="localhost", milvus_port="19530"):
+    def __init__(self, milvus_host="localhost", milvus_port="19530", inference_api_url: str = None):
         self.collection_name = "pubmed_abstracts"
-        self.embedding_model = SentenceTransformer('cambridgeltl/SapBERT-from-PubMedBERT-fulltext')
+        import os
+        self.inference_api_url = inference_api_url or os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
+        self.internal_api_key = os.getenv("INTERNAL_API_KEY", "internal-secret-token")
         
         try:
             connections.connect("default", host=milvus_host, port=milvus_port)
@@ -20,7 +22,18 @@ class RAGEvaluator:
         if not self.collection:
             return []
             
-        vector = self.embedding_model.encode([query])[0].tolist()
+        import requests
+        try:
+            resp = requests.post(
+                f"{self.inference_api_url}/encode/text",
+                json={"text": query},
+                headers={"X-Internal-API-Key": self.internal_api_key}
+            )
+            resp.raise_for_status()
+            vector = resp.json()["embeddings"][0]
+        except Exception as e:
+            print(f"[RAGEvaluator] Error calling inference API: {e}")
+            return []
         
         search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
         results = self.collection.search(
@@ -28,9 +41,17 @@ class RAGEvaluator:
             anns_field="vector",
             param=search_params,
             limit=k,
-            output_fields=["pmid", "text"]
+            output_fields=["pmid", "text", "title"]
         )
-        return results[0]
+        
+        parsed_results = []
+        for hit in results[0]:
+            parsed_results.append({
+                "pmid": hit.entity.get("pmid"),
+                "text": hit.entity.get("text"),
+                "title": hit.entity.get("title", "Unknown Title")
+            })
+        return parsed_results
 
     def evaluate_hit_rate(self, test_cases):
         """
@@ -44,7 +65,7 @@ class RAGEvaluator:
         for case in test_cases:
             results = self.search(case['query'], k=5)
             # Check if expected_pmid is in results
-            pmids = [res.entity.get('pmid') for res in results]
+            pmids = [res.get('pmid') for res in results]
             if case['expected_pmid'] in pmids:
                 hits += 1
                 

@@ -3,20 +3,10 @@ import sys
 import uuid
 
 import streamlit as st
-from sentence_transformers import SentenceTransformer
-
-# Add project root to sys.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
-from src.agent.clinical_graph import ClinicalAgent
-from src.data.pdf_parser import ClinicalPDFParser
+import requests
 from src.evaluation.report_generator import ClinicalReportGenerator
-from src.models.fusion import LateFusionModel
-from src.models.uncertainty import UncertaintyEstimator
-from src.rag.evaluator import RAGEvaluator
 from src.utils.feedback_logger import FeedbackLogger
-from src.vlm.explainability import VisualExplainer
-from src.vlm.visual_encoder import BiomedVisualEncoder
+from src.utils.cleanup import cleanup_old_sessions
 
 
 st.set_page_config(
@@ -60,20 +50,11 @@ st.markdown(
 
 
 @st.cache_resource
-def load_models():
-    """Load all models once and cache them."""
-    with st.spinner("Initializing AI Core..."):
-        encoder = BiomedVisualEncoder()
-        parser = ClinicalPDFParser()
-        text_encoder = SentenceTransformer("cambridgeltl/SapBERT-from-PubMedBERT-fulltext")
-        fusion = LateFusionModel()
-        uncertainty = UncertaintyEstimator(fusion)
-        rag = RAGEvaluator()
-        explainer = VisualExplainer(encoder.model, encoder.preprocess)
-        report_gen = ClinicalReportGenerator()
-        feedback_logger = FeedbackLogger()
-        agent = ClinicalAgent(encoder, parser, rag, fusion, text_encoder, uncertainty)
-        return agent, explainer, report_gen, feedback_logger
+def load_tools():
+    """Load lightweight reporting and logging tools."""
+    report_gen = ClinicalReportGenerator()
+    feedback_logger = FeedbackLogger()
+    return report_gen, feedback_logger
 
 
 def main():
@@ -86,9 +67,7 @@ def main():
     session_dir = os.path.join("temp", "sessions", st.session_state.session_id)
     os.makedirs(session_dir, exist_ok=True)
 
-    agent, explainer, report_gen, feedback_logger = load_models()
-
-    from src.utils.cleanup import cleanup_old_sessions
+    report_gen, feedback_logger = load_tools()
 
     cleanup_old_sessions()
 
@@ -114,10 +93,25 @@ def main():
             with open(pdf_path, "wb") as pdf_handle:
                 pdf_handle.write(uploaded_pdf.getbuffer())
 
-            with st.status("Agentic reasoning in progress...", expanded=True) as status:
-                st.write("Extracting visual features and clinical context...")
-                result = agent.run(img_path, pdf_path)
-                status.update(label="Analysis complete", state="complete", expanded=False)
+            with st.status("Requesting remote analysis...", expanded=True) as status:
+                st.write("Sending data to inference cluster...")
+                try:
+                    # In a real setup, configure API_URL via env var
+                    api_url = os.getenv("API_URL", "http://medi-api:8000")
+                    headers = {"X-API-Key": os.getenv("API_KEY", "dev-secret-key-123")}
+                    
+                    files = {
+                        "image": ("image.jpg", open(img_path, "rb"), "image/jpeg"),
+                        "history": ("history.pdf", open(pdf_path, "rb"), "application/pdf")
+                    }
+                    response = requests.post(f"{api_url}/analyze", files=files, headers=headers)
+                    response.raise_for_status()
+                    result = response.json()
+                    status.update(label="Analysis complete", state="complete", expanded=False)
+                except Exception as e:
+                    status.update(label="Analysis failed", state="error", expanded=False)
+                    st.error(f"API Request Failed: {e}")
+                    return
 
             col1, col2 = st.columns([1, 1])
 
@@ -176,9 +170,9 @@ def main():
 
             with col2:
                 st.header("Visual Evidence")
-                heatmap_path = os.path.join(session_dir, "heatmap.png")
-                explainer.generate_heatmap(img_path, output_path=heatmap_path)
-                st.image(heatmap_path, caption="Grad-CAM Heatmap Overlay")
+                # Since the backend no longer runs locally, the UI doesn't have the Grad-CAM explainer.
+                # In a robust setup, the API would return the base64 heatmap or a URL to MinIO.
+                st.info("Heatmap generation requires the VisualExplainer, which is now handled by the backend. (To fully restore, update API to return a heatmap URL).")
 
             st.markdown("---")
 
@@ -202,7 +196,7 @@ def main():
                 report_bundle = report_gen.generate_report(
                     diagnosis_for_export,
                     result.get("history_data", {}).get("metadata", {}),
-                    heatmap_path,
+                    "", # heatmap_path is omitted until API provides it
                     citations,
                     output_filename=f"Report_{st.session_state.session_id}.pdf",
                 )
@@ -212,6 +206,23 @@ def main():
                         report_handle,
                         file_name=os.path.basename(report_bundle["pdf_path"]),
                     )
+                st.success("Report Generated!")
+                
+                # Push report to EHR via Gateway
+                st.write("Transmitting to Hospital EHR...")
+                try:
+                    from src.data.fhir_formatter import EHRGateway
+                    ehr_gateway = EHRGateway()
+                    with open(report_bundle['fhir_path'], "r", encoding="utf-8") as f:
+                        fhir_json = f.read()
+                    success = ehr_gateway.push_report(fhir_json)
+                    if success:
+                        st.success("Successfully transmitted to EHR!")
+                    else:
+                        st.warning("EHR Transmission failed. Saved to Dead Letter Queue.")
+                except Exception as e:
+                    st.error(f"EHR Integration Error: {e}")
+                
                 with open(report_bundle["fhir_path"], "rb") as fhir_handle:
                     st.download_button(
                         "Download FHIR DiagnosticReport JSON",

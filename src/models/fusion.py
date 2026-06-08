@@ -29,15 +29,21 @@ class AttentionFusion(nn.Module):
         )
         
     def forward(self, vision_emb, text_emb):
-        # Project and prepare for attention (batch, seq_len=1, hidden_dim)
-        v = self.v_proj(vision_emb).unsqueeze(1)
-        t = self.t_proj(text_emb).unsqueeze(1)
+        # Project both to a common semantic space
+        v = self.v_proj(vision_emb).unsqueeze(1)  # Shape: (batch, 1, hidden_dim)
+        t = self.t_proj(text_emb).unsqueeze(1)    # Shape: (batch, 1, hidden_dim)
         
-        # Cross-attention: Query=Visual, Key/Value=Text
-        attn_output, _ = self.attention(v, t, t)
+        # Concatenate tokens to form a sequence of length 2 (true multimodal attention)
+        seq = torch.cat([v, t], dim=1)            # Shape: (batch, 2, hidden_dim)
         
-        # Residual connection and Norm
-        fused = self.norm1(v + attn_output).squeeze(1)
+        # Self-attention enables mutual information exchange between vision and text tokens
+        attn_output, _ = self.attention(seq, seq, seq) # Shape: (batch, 2, hidden_dim)
+        
+        # Residual connection and LayerNorm
+        seq = self.norm1(seq + attn_output)
+        
+        # Average pooling along the sequence dimension to obtain a single joint representation
+        fused = seq.mean(dim=1)                   # Shape: (batch, hidden_dim)
         
         logits = self.classifier(fused)
         return fused, logits

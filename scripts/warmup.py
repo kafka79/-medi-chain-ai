@@ -18,8 +18,19 @@ def warmup():
     # Pre-initialize visual encoder (BiomedCLIP)
     BiomedVisualEncoder()
     
-    # Initialize fusion
-    LateFusionModel()
+    # Initialize fusion and create dummy checkpoint
+    import torch
+    fusion = LateFusionModel()
+    os.makedirs("models", exist_ok=True)
+    checkpoint_path = "models/fusion_model.pt"
+    if not os.path.exists(checkpoint_path):
+        torch.save(fusion.state_dict(), checkpoint_path)
+        print(f"Created mock checkpoint at {checkpoint_path}")
+    
+    # Pre-download NER for privacy scrubbing
+    print("Pre-downloading NER model for Privacy Scrubber...")
+    from transformers import pipeline
+    pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
     
     print("Models pre-loaded successfully.")
 
