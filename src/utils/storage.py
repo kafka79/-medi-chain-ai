@@ -70,11 +70,18 @@ class S3StorageProvider(StorageProvider):
         self.bucket = bucket
         
         try:
+            import urllib3
+            # Set connection timeout to 2.0 seconds to prevent blocking threads when MinIO is down
+            http_client = urllib3.PoolManager(
+                timeout=urllib3.Timeout(connect=2.0, read=5.0),
+                retries=False
+            )
             self.client = Minio(
                 self.endpoint,
                 access_key=self.access_key,
                 secret_key=self.secret_key,
-                secure=False
+                secure=False,
+                http_client=http_client
             )
             # Create bucket if it doesn't exist
             if not self.client.bucket_exists(self.bucket):

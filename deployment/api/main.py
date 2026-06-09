@@ -18,10 +18,6 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-# Use Redis for distributed rate limiting across all API replicas
-redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-limiter = Limiter(key_func=get_remote_address, storage_uri=redis_url)
-
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -38,9 +34,44 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("medi-chain-api")
 
+# Check if Redis is actually responsive before using it for rate limiting
+redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+use_redis = False
+if redis_url.startswith("redis://"):
+    try:
+        import redis
+        import urllib.parse
+        parsed = urllib.parse.urlparse(redis_url)
+        r = redis.Redis(host=parsed.hostname, port=parsed.port or 6379, socket_connect_timeout=1)
+        r.ping()
+        use_redis = True
+        logger.info("Successfully connected to Redis for rate limiting.")
+    except Exception as e:
+        logger.warning(f"Redis not responsive ({e}). Falling back to in-memory rate limiting.")
+
+if not use_redis:
+    redis_url = "memory://"
+
+limiter = Limiter(key_func=get_remote_address, storage_uri=redis_url)
+
 # Global dependencies (Ready for DI)
 TEMP_ROOT = Path("temp/storage")
-storage = S3StorageProvider(endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"))
+
+# Initialize storage provider: fall back to LocalStorageProvider if MinIO connection fails
+try:
+    s3_storage = S3StorageProvider(endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"))
+    if s3_storage.client is not None:
+        storage = s3_storage
+        logger.info("Using S3/MinIO Storage Provider.")
+    else:
+        from src.utils.storage import LocalStorageProvider
+        storage = LocalStorageProvider()
+        logger.warning("MinIO client not initialized. Falling back to Local Storage Provider.")
+except Exception as e:
+    from src.utils.storage import LocalStorageProvider
+    storage = LocalStorageProvider()
+    logger.warning(f"Failed to initialize S3 storage ({e}). Falling back to Local Storage Provider.")
+
 drift_detector = DriftDetector()
 ehr_gateway = EHRGateway()
 feedback_logger = FeedbackLogger()

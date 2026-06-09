@@ -9,13 +9,22 @@ class RAGEvaluator:
         self.inference_api_url = inference_api_url or os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
         self.internal_api_key = os.getenv("INTERNAL_API_KEY", "internal-secret-token")
         
-        try:
-            connections.connect("default", host=milvus_host, port=milvus_port)
-            self.collection = Collection(self.collection_name)
-            self.collection.load()
-        except Exception as e:
-            print(f"Warning: Could not connect to Milvus/Collection: {e}")
-            self.collection = None
+        import time
+        max_attempts = 5
+        self.collection = None
+        
+        for attempt in range(max_attempts):
+            try:
+                # Add retry loop to give Milvus database time to spin up in Docker Compose
+                connections.connect("default", host=milvus_host, port=milvus_port)
+                self.collection = Collection(self.collection_name)
+                self.collection.load()
+                break
+            except Exception as e:
+                if attempt == max_attempts - 1:
+                    print(f"Warning: Could not connect to Milvus/Collection after {max_attempts} attempts: {e}")
+                else:
+                    time.sleep(1)
 
     def search(self, query, k=5):
         """Perform search in Milvus."""
