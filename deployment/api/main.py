@@ -31,6 +31,8 @@ from src.data.fhir_formatter import EHRGateway
 from src.rag.evaluator import RAGEvaluator
 from src.utils.storage import S3StorageProvider
 from src.monitoring.drift_detector import DriftDetector
+from src.utils.feedback_logger import FeedbackLogger
+from pydantic import BaseModel
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +43,7 @@ TEMP_ROOT = Path("temp/storage")
 storage = S3StorageProvider(endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"))
 drift_detector = DriftDetector()
 ehr_gateway = EHRGateway()
+feedback_logger = FeedbackLogger()
 
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
 
@@ -153,6 +156,33 @@ def create_app() -> FastAPI:
             if 'local_pdf_path' in locals() and os.path.exists(local_pdf_path):
                 try: os.unlink(local_pdf_path)
                 except Exception: pass
+
+    class FeedbackPayload(BaseModel):
+        session_id: str
+        verdict: str
+        notes: str
+        diagnosis: dict
+        history_metadata: dict
+        doctor_id: str = "dr-anonymous"
+
+    @app.post("/feedback")
+    async def receive_feedback(
+        payload: FeedbackPayload,
+        api_key: str = Depends(verify_api_key)
+    ):
+        try:
+            path = await asyncio.to_thread(
+                feedback_logger.log_feedback,
+                session_id=payload.session_id,
+                verdict=payload.verdict,
+                notes=payload.notes,
+                diagnosis=payload.diagnosis,
+                history_metadata=payload.history_metadata
+            )
+            return JSONResponse(content={"status": "success", "saved_path": str(path)})
+        except Exception as e:
+            logger.error(f"Feedback logging failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to log feedback: {e}")
 
     @app.get("/health")
     async def health_check(request: Request):

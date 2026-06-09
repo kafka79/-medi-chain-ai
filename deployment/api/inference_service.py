@@ -11,6 +11,8 @@ import uvicorn
 import shutil
 import tempfile
 import asyncio
+import base64
+import cv2
 from typing import List, Dict, Any
 
 # Add project root to sys.path
@@ -19,6 +21,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 from src.vlm.visual_encoder import BiomedVisualEncoder
 from sentence_transformers import SentenceTransformer
 from src.models.fusion import LateFusionModel
+from src.vlm.explainability import VisualExplainer
 
 app = FastAPI(
     title="MEdi Chain AI - Inference Microservice",
@@ -44,6 +47,7 @@ class InferenceService:
         self.fusion.eval()
         from src.models.uncertainty import UncertaintyEstimator
         self.uncertainty = UncertaintyEstimator(self.fusion)
+        self.visual_explainer = VisualExplainer(self.encoder.model, self.encoder.preprocess)
 
 service = None
 
@@ -80,7 +84,21 @@ async def encode_image(image: UploadFile = File(...), api_key: str = Depends(ver
     try:
         async with inference_semaphore:
             features = service.encoder.encode_image(tmp_path)
-        return {"features": features.tolist()}
+            
+            # Generate heatmap
+            heatmap_base64 = ""
+            try:
+                visualization = service.visual_explainer.generate_heatmap(tmp_path)
+                visualization_bgr = cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR)
+                _, buffer = cv2.imencode('.jpg', visualization_bgr)
+                heatmap_base64 = base64.b64encode(buffer).decode('utf-8')
+            except Exception as e:
+                print(f"Failed to generate heatmap: {e}")
+                
+        return {
+            "features": features.tolist(),
+            "heatmap_base64": heatmap_base64
+        }
     finally:
         os.unlink(tmp_path)
 

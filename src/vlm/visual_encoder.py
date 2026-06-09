@@ -75,10 +75,14 @@ class BiomedVisualEncoder:
             
         # Warmup
         _ = self.encode_image(img)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
         
         start_time = time.time()
         for _ in range(iterations):
             _ = self.encode_image(img)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
         end_time = time.time()
         
         avg_time = (end_time - start_time) / iterations

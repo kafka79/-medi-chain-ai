@@ -20,9 +20,12 @@ class PrivacyScrubber:
             "phone": re.compile(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b"),
             "date": re.compile(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}\b", re.IGNORECASE),
             "zipcode": re.compile(r"\b\d{5}(?:-\d{4})?\b"),
-            "ip_address": re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+            "ip_address": re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
+            "doctor": re.compile(r"\bDr\.\s+[A-Z][a-zA-Z]*\b"),
+            "patient": re.compile(r"\bPatient:\s+[A-Z][a-zA-Z]*\b")
         }
         self.ner = None
+        self.ner_load_error = None
         self._ner_lock = threading.Lock()
         self._ner_loaded = False
         
@@ -39,10 +42,12 @@ class PrivacyScrubber:
                 from transformers import pipeline
                 # Using aggregation_strategy="simple" merges B-PER and I-PER into a single PER entity
                 self.ner = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+                self.ner_load_error = None
                 logger.info("Hugging Face NER pipeline loaded successfully.")
             except Exception as e:
                 logger.error(f"Failed to load NER pipeline: {e}")
                 self.ner = None
+                self.ner_load_error = e
             finally:
                 self._ner_loaded = True
 
@@ -52,19 +57,25 @@ class PrivacyScrubber:
         if not self._ner_loaded:
             self._init_ner()
             
+        if self.ner is None or self.ner_load_error is not None:
+            raise RuntimeError(
+                f"Critical HIPAA Risk: Privacy scrubber failed to load the NER model. "
+                f"Aborting process to prevent patient data leakage. Error: {self.ner_load_error}"
+            )
+            
         scrubbed = text
         for label, pattern in self.patterns.items():
             scrubbed = pattern.sub(f"[{label.upper()}_REDACTED]", scrubbed)
             
-        if self.ner:
-            try:
-                entities = self.ner(scrubbed)
-                # Sort entities in reverse order to replace from end to start without affecting indices
-                for ent in sorted(entities, key=lambda x: x['start'], reverse=True):
-                    if ent['entity_group'] in ['PER', 'ORG', 'LOC']:
-                        scrubbed = scrubbed[:ent['start']] + f"[NER_{ent['entity_group']}_REDACTED]" + scrubbed[ent['end']:]
-            except Exception as e:
-                logger.error(f"NER scrubbing failed: {e}")
+        try:
+            entities = self.ner(scrubbed)
+            # Sort entities in reverse order to replace from end to start without affecting indices
+            for ent in sorted(entities, key=lambda x: x['start'], reverse=True):
+                if ent['entity_group'] in ['PER', 'ORG', 'LOC']:
+                    scrubbed = scrubbed[:ent['start']] + f"[NER_{ent['entity_group']}_REDACTED]" + scrubbed[ent['end']:]
+        except Exception as e:
+            logger.error(f"NER scrubbing failed: {e}")
+            raise RuntimeError(f"Critical HIPAA Risk: NER scrubbing failed at runtime. Aborting. Error: {e}")
                 
         return scrubbed
 

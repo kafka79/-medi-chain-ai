@@ -18,30 +18,15 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    :root {
-        --primary-color: #004a99;
-        --bg-color: #ffffff;
-        --card-bg: #f8f9fa;
-        --high-contrast-text: #1a1a1a;
-    }
-    .main {
-        background-color: var(--bg-color);
-        color: var(--high-contrast-text);
-    }
     .stBadge {
         font-size: 1.2rem;
         padding: 0.5rem;
     }
     .metric-card {
-        background-color: var(--card-bg);
         padding: 20px;
         border-radius: 10px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         border: 2px solid #ddd;
-    }
-    p, span, label {
-        color: var(--high-contrast-text) !important;
-        font-weight: 500;
     }
     </style>
     """,
@@ -57,6 +42,15 @@ def load_tools():
     return report_gen, feedback_logger
 
 
+@st.cache_resource
+def run_startup_cleanup():
+    """Run TTL session directory cleanup once on application startup."""
+    try:
+        cleanup_old_sessions()
+    except Exception:
+        pass
+
+
 def main():
     st.title("MEdi Chain AI")
     st.subheader("Multimodal Diagnostic Reasoning System")
@@ -69,7 +63,7 @@ def main():
 
     report_gen, feedback_logger = load_tools()
 
-    cleanup_old_sessions()
+    run_startup_cleanup()
 
     st.sidebar.header("Patient Data Ingestion")
     uploaded_image = st.sidebar.file_uploader(
@@ -100,11 +94,12 @@ def main():
                     api_url = os.getenv("API_URL", "http://medi-api:8000")
                     headers = {"X-API-Key": os.getenv("API_KEY", "dev-secret-key-123")}
                     
-                    files = {
-                        "image": ("image.jpg", open(img_path, "rb"), "image/jpeg"),
-                        "history": ("history.pdf", open(pdf_path, "rb"), "application/pdf")
-                    }
-                    response = requests.post(f"{api_url}/analyze", files=files, headers=headers)
+                    with open(img_path, "rb") as img_file, open(pdf_path, "rb") as pdf_file:
+                        files = {
+                            "image": ("image.jpg", img_file, "image/jpeg"),
+                            "history": ("history.pdf", pdf_file, "application/pdf")
+                        }
+                        response = requests.post(f"{api_url}/analyze", files=files, headers=headers)
                     response.raise_for_status()
                     result = response.json()
                     status.update(label="Analysis complete", state="complete", expanded=False)
@@ -159,20 +154,34 @@ def main():
                         key="feedback_notes",
                     )
                     if st.button("Submit Correction", key="feedback_submit"):
-                        feedback_path = feedback_logger.log_feedback(
-                            session_id=st.session_state.session_id,
-                            verdict=feedback,
-                            notes=feedback_notes,
-                            diagnosis=diagnosis,
-                            history_metadata=result.get("history_data", {}).get("metadata", {}),
-                        )
-                        st.success(f"Feedback saved to {feedback_path}.")
+                        try:
+                            api_url = os.getenv("API_URL", "http://medi-api:8000")
+                            headers = {"X-API-Key": os.getenv("API_KEY", "dev-secret-key-123")}
+                            payload = {
+                                "session_id": st.session_state.session_id,
+                                "verdict": feedback,
+                                "notes": feedback_notes,
+                                "diagnosis": diagnosis,
+                                "history_metadata": result.get("history_data", {}).get("metadata", {}),
+                                "doctor_id": "dr-authorized-1"
+                            }
+                            fb_resp = requests.post(f"{api_url}/feedback", json=payload, headers=headers)
+                            fb_resp.raise_for_status()
+                            st.success("Feedback securely logged via Authenticated API.")
+                        except Exception as e:
+                            st.error(f"Failed to securely transmit feedback: {e}")
 
             with col2:
                 st.header("Visual Evidence")
-                # Since the backend no longer runs locally, the UI doesn't have the Grad-CAM explainer.
-                # In a robust setup, the API would return the base64 heatmap or a URL to MinIO.
-                st.info("Heatmap generation requires the VisualExplainer, which is now handled by the backend. (To fully restore, update API to return a heatmap URL).")
+                heatmap_base64 = result.get("heatmap_base64", "")
+                if heatmap_base64:
+                    import base64
+                    try:
+                        st.image(base64.b64decode(heatmap_base64), use_container_width=True, caption="BiomedCLIP Grad-CAM Attention Heatmap")
+                    except Exception as e:
+                        st.error(f"Failed to render heatmap: {e}")
+                else:
+                    st.info("No heatmap was returned by the inference API.")
 
             st.markdown("---")
 

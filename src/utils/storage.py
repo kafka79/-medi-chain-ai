@@ -88,6 +88,7 @@ class S3StorageProvider(StorageProvider):
             logger.error("S3 client not initialized. Cannot save.")
             raise RuntimeError("S3 client not initialized")
             
+        tmp_path = None
         try:
             import os
             from tempfile import NamedTemporaryFile
@@ -105,16 +106,18 @@ class S3StorageProvider(StorageProvider):
                     f,
                     length=file_size
                 )
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
                 
             logger.info(f"Successfully uploaded to s3://{self.bucket}/{relative_path}")
             return relative_path
         except Exception as e:
             logger.error(f"Failed to save file to S3: {e}")
             raise
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     def load(self, relative_path: str):
         if not self.client:

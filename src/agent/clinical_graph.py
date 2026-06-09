@@ -13,6 +13,7 @@ class AgentState(TypedDict):
     confidence: float
     iteration_count: int
     escalation_required: bool
+    heatmap_base64: str
 
 class ClinicalAgent:
     def __init__(self, history_parser, rag_evaluator, inference_api_url: str = None):
@@ -78,7 +79,9 @@ class ClinicalAgent:
                     headers={"X-Internal-API-Key": self.internal_api_key}
                 )
             resp.raise_for_status()
-            features = resp.json()["features"]
+            resp_data = resp.json()
+            features = resp_data["features"]
+            heatmap_base64 = resp_data.get("heatmap_base64", "")
         except Exception as e:
             print(f"[Clinical Graph] Error calling inference API: {e}")
             raise RuntimeError(f"Visual encoder failed: {e}")
@@ -90,7 +93,7 @@ class ClinicalAgent:
             except Exception as e:
                 print(f"[Clinical Graph] Warning: failed to clean up temp scrubbed image: {e}")
                 
-        return {"visual_features": features}
+        return {"visual_features": features, "heatmap_base64": heatmap_base64}
 
     def node_parse_history(self, state: AgentState):
         print("[Node] Parsing Patient History...")
@@ -223,7 +226,8 @@ class ClinicalAgent:
             "visual_features": None,
             "history_data": {},
             "diagnosis": {},
-            "confidence": 0.0
+            "confidence": 0.0,
+            "heatmap_base64": ""
         }
         return self.app.invoke(initial_state)
 
