@@ -1,9 +1,11 @@
 from io import BytesIO
-
+import pytest
 from fastapi.testclient import TestClient
 
 import os
 os.environ["REDIS_URL"] = "memory://"
+os.environ["STORAGE_MODE"] = "local"
+os.environ["TESTING"] = "true"
 
 import deployment.api.main as api_main
 
@@ -13,7 +15,7 @@ class DummyAgent:
         self.should_fail = should_fail
         self.calls = []
 
-    def run(self, image_path: str, pdf_path: str):
+    async def run(self, image_path: str, pdf_path: str):
         self.calls.append((image_path, pdf_path))
         if self.should_fail:
             raise RuntimeError("boom")
@@ -46,7 +48,7 @@ class DummyStorageProvider:
             if k.startswith(rel_path):
                 del self.files[k]
                 
-    def cleanup(self, max_age):
+    def cleanup(self, max_age_seconds=None, *args, **kwargs):
         self.files.clear()
 
 def test_health_is_lazy(monkeypatch):
@@ -61,6 +63,7 @@ def test_health_is_lazy(monkeypatch):
             "status": "ok",
             "models_loaded": True,
             "concurrency_limit": 2,
+            "version": "1.3.0",
         }
 
 def test_analyze_cleans_request_dir_on_success(monkeypatch):
@@ -112,3 +115,28 @@ def test_analyze_cleans_request_dir_on_failure(monkeypatch):
     assert response.json()["detail"].startswith("Analysis failed:")
     # Even on failure, files should be deleted
     assert len(storage_mock.files) == 0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_circuit_breaker(monkeypatch):
+    import asyncio
+    # Mock storage.cleanup to fail consecutively
+    class FailingStorage:
+        def cleanup(self, max_age_seconds=None):
+            raise RuntimeError("storage error")
+            
+    monkeypatch.setattr(api_main, "storage", FailingStorage())
+    
+    sleep_calls = []
+    async def mock_sleep(seconds):
+        sleep_calls.append(seconds)
+        # return immediately
+        
+    monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+    
+    # Run the cleanup task, which should terminate due to the circuit breaker
+    await api_main.cleanup_old_temp_files()
+    
+    # It should fail 5 times, then return, sleeping 4 times in between
+    assert len(sleep_calls) == 4
+

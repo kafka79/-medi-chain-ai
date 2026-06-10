@@ -9,13 +9,16 @@ services:
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls=http://0.0.0.0:2379 --data-dir /etcd
+    networks:
+      - internal
 
   minio:
     container_name: milvus-minio
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     environment:
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
+      # Flaw #1 Fix: Credentials sourced from .env file, not hardcoded
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set in .env}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set in .env}
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/bin/data
     command: minio server /bin/data
@@ -24,6 +27,8 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+    networks:
+      - internal
 
   redis:
     container_name: medi-chain-redis
@@ -33,6 +38,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    networks:
+      - internal
 
   standalone:
     container_name: milvus-standalone
@@ -46,6 +53,8 @@ services:
     depends_on:
       - "etcd"
       - "minio"
+    networks:
+      - internal
 
   medi-ui:
     container_name: medi-chain-ui
@@ -64,7 +73,9 @@ services:
     tty: true
     depends_on:
       - standalone
-      - medi-api
+      - nginx
+    networks:
+      - internal
 
   inference-api:
     container_name: medi-chain-inference
@@ -73,10 +84,15 @@ services:
       context: ..
       dockerfile: deployment/Dockerfile
     command: ["uvicorn", "deployment.api.inference_service:app", "--host", "0.0.0.0", "--port", "8001"]
-    ports:
-      - "8001:8001"
+    # Flaw #18 Partial Fix: inference-api no longer exposed to host — only reachable via internal network
+    # Removed: ports: - "8001:8001"
+    expose:
+      - "8001"
     volumes:
       - ..:/app
+      - shared-scans:/app/shared_scans
+    environment:
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:?INTERNAL_API_KEY must be set in .env}
     deploy:
       resources:
         reservations:
@@ -89,6 +105,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    networks:
+      - internal
 
   medi-api:
     image: saya2572/medi-chain-api:v1.1
@@ -97,27 +115,60 @@ services:
       dockerfile: deployment/Dockerfile
     # Use gunicorn for process management in production
     command: ["gunicorn", "deployment.api.main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
-    ports:
-      - "8000-8002:8000"
+    # Flaw #3 Fix: No host port binding — traffic routed through Nginx load balancer
+    expose:
+      - "8000"
     volumes:
       - ..:/app
-      - ./temp/storage:/app/temp/storage # Shared volume for local storage provider
+      - shared-scans:/app/shared_scans
     environment:
       - MILVUS_HOST=standalone
-      - MAX_CONCURRENT_REQUESTS=1 # Per worker limit to protect VRAM
+      - MAX_CONCURRENT_REQUESTS=1
+      - API_KEY=${API_KEY:?API_KEY must be set in .env}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:?INTERNAL_API_KEY must be set in .env}
+      - REDIS_URL=redis://redis:6379/0
+      - MINIO_ENDPOINT=minio:9000
+      - S3_ACCESS_KEY=${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set in .env}
+      - S3_SECRET_KEY=${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set in .env}
+      - INFERENCE_API_URL=http://inference-api:8001
     deploy:
-      replicas: 3 # Addresses 'Single-Node Bottleneck'
+      replicas: 3
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
     depends_on:
-      - standalone
-      - inference-api
-      - redis
-      - minio
+      standalone:
+        condition: service_healthy
+      inference-api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - internal
+
+  # Flaw #3 Fix: Nginx reverse proxy for load balancing across medi-api replicas
+  nginx:
+    image: nginx:alpine
+    container_name: medi-chain-nginx
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      medi-api:
+        condition: service_healthy
+    networks:
+      - internal
+
+volumes:
+  shared-scans:
+    driver: local
 
 networks:
-  default:
-    name: milvus
+  internal:
+    name: medi-chain-internal
+    driver: bridge

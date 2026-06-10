@@ -6,21 +6,52 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 from PIL import Image
 import os
 
+import math
+
 class VisualExplainer:
     def __init__(self, model, preprocess):
         self.model = model
         self.preprocess = preprocess
         
-        # In Vit (BiomedCLIP), targets are usually transformer blocks
-        # Target the last layer of the visual backbone
-        # This depends on the specific architecture of BiomedCLIP
-        self.target_layers = [model.visual.trunk.blocks[-1].norm1]
+        # Resolve target layers dynamically to support different OpenCLIP versions and ViT trunk structures
+        self.target_layers = None
+        
+        # Strategy A: BiomedCLIP/OpenCLIP visual.trunk (standard in newer versions)
+        if hasattr(model, "visual") and hasattr(model.visual, "trunk"):
+            try:
+                self.target_layers = [model.visual.trunk.blocks[-1].norm1]
+            except Exception:
+                pass
+                
+        # Strategy B: Fallback to visual.transformer
+        if not self.target_layers and hasattr(model, "visual") and hasattr(model.visual, "transformer"):
+            try:
+                self.target_layers = [model.visual.transformer.resblocks[-1]]
+            except Exception:
+                pass
+
+        # Strategy C: General fallback searching for any module named norm1 or resblocks
+        if not self.target_layers:
+            for name, module in model.named_modules():
+                if "blocks" in name and "norm1" in name:
+                    self.target_layers = [module]
+            if not self.target_layers:
+                for name, module in model.named_modules():
+                    if "resblocks" in name:
+                        self.target_layers = [module]
+                        
+        # Fallback to the model itself if all fails
+        if not self.target_layers:
+            self.target_layers = [model.visual]
 
     def reshape_transform(self, tensor, height=14, width=14):
         # Result of ViT backbone is (Batch, Tokens, Dim)
         # We need to reshape to (Batch, Dim, Height, Width)
         # B/16 uses 224/16 = 14x14 patches + 1 cls token
-        result = tensor[:, 1:, :].reshape(tensor.size(0), height, width, tensor.size(2))
+        seq_len = tensor.size(1) - 1
+        grid_size = int(math.sqrt(seq_len))
+        
+        result = tensor[:, 1:, :].reshape(tensor.size(0), grid_size, grid_size, tensor.size(2))
         
         # Bring the channels to the first dimension
         result = result.transpose(2, 3).transpose(1, 2)

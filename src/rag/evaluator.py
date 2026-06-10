@@ -1,17 +1,39 @@
 from pymilvus import connections, Collection
-from sentence_transformers import SentenceTransformer
 import os
+import logging
+
+logger = logging.getLogger("rag-evaluator")
 
 class RAGEvaluator:
     def __init__(self, milvus_host="localhost", milvus_port="19530", inference_api_url: str = None):
         self.collection_name = "pubmed_abstracts"
-        import os
         self.inference_api_url = inference_api_url or os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
-        self.internal_api_key = os.getenv("INTERNAL_API_KEY", "internal-secret-token")
+        self.internal_api_key = os.getenv("INTERNAL_API_KEY", "")
+        if not self.internal_api_key and os.getenv("TESTING") != "true":
+            raise RuntimeError("INTERNAL_API_KEY environment variable is required.")
+
+        # Configure SSL / TLS settings
+        self.ssl_verify = os.getenv("INTERNAL_SSL_VERIFY", "false")
+        if self.ssl_verify.lower() == "true":
+            self.ssl_verify = True
+        elif self.ssl_verify.lower() == "false":
+            self.ssl_verify = False
+        
+        ssl_cert_file = os.getenv("INTERNAL_SSL_CERT_FILE", None)
+        ssl_key_file = os.getenv("INTERNAL_SSL_KEY_FILE", None)
+        if ssl_cert_file and ssl_key_file:
+            self.ssl_cert = (ssl_cert_file, ssl_key_file)
+        elif ssl_cert_file:
+            self.ssl_cert = ssl_cert_file
+        else:
+            self.ssl_cert = None
+
+        self.collection = None
+        if os.getenv("TESTING") == "true":
+            return
         
         import time
         max_attempts = 5
-        self.collection = None
         
         for attempt in range(max_attempts):
             try:
@@ -36,7 +58,9 @@ class RAGEvaluator:
             resp = requests.post(
                 f"{self.inference_api_url}/encode/text",
                 json={"text": query},
-                headers={"X-Internal-API-Key": self.internal_api_key}
+                headers={"X-Internal-API-Key": self.internal_api_key},
+                verify=self.ssl_verify,
+                cert=self.ssl_cert
             )
             resp.raise_for_status()
             vector = resp.json()["embeddings"][0]

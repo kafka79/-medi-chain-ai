@@ -6,7 +6,7 @@ class XAIExplainer:
     def __init__(self):
         pass
 
-    def explain(self, diagnosis: str, confidence: float, uncertainty: float, probabilities: list = None, history_data: dict = None) -> str:
+    def explain(self, diagnosis: str, confidence: float, uncertainty: float, probabilities: list = None, history_data: dict = None, pubmed_citations: list = None) -> str:
         # Extract patient metadata and history fields dynamically
         history_data = history_data or {}
         metadata = history_data.get("metadata", {})
@@ -19,6 +19,22 @@ class XAIExplainer:
         
         if chief_complaint.lower() == "not found":
             chief_complaint = "respiratory distress"
+
+        try:
+            from src.models.fusion import DIAGNOSTIC_CLASSES
+        except ImportError:
+            DIAGNOSTIC_CLASSES = ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
+
+        # Calculate confidence gap to next diagnostic class
+        gap_info = ""
+        if probabilities and len(probabilities) == len(DIAGNOSTIC_CLASSES):
+            indexed_probs = list(enumerate(probabilities))
+            sorted_probs = sorted(indexed_probs, key=lambda x: x[1], reverse=True)
+            if len(sorted_probs) >= 2:
+                top_idx, top_prob = sorted_probs[0]
+                sec_idx, sec_prob = sorted_probs[1]
+                gap = top_prob - sec_prob
+                gap_info = f" (Confidence gap of {gap:.2f} to next class '{DIAGNOSTIC_CLASSES[sec_idx]}')"
 
         # Dynamically build base reasoning based on specific patient demographics & symptoms
         if diagnosis == "Silicosis":
@@ -47,6 +63,11 @@ class XAIExplainer:
                 f"Visual features indicate clear lung fields, sharp costophrenic angles, and normal lung volume. "
                 f"There are no visual indicators to match the complaint of '{chief_complaint}'."
             )
+        elif diagnosis == "Out-of-Distribution":
+            base_reason = (
+                f"Visual features suggest a pathology outside the system's known diagnostic classes. "
+                f"This Out-of-Distribution case requires manual diagnostic assessment."
+            )
         else:
             base_reason = f"Atypical presentation detected for '{chief_complaint}'."
 
@@ -54,7 +75,23 @@ class XAIExplainer:
         if probabilities:
             dyn_text += f" Raw class probabilities: {[f'{p:.2f}' for p in probabilities]}."
             
-        if uncertainty > 0.15:
-            return f"CAUTION: {dyn_text} {base_reason} High predictive uncertainty suggests a non-standard presentation. Manual review of priors is advised."
+        import os
+        uncertainty_threshold = float(os.getenv("UNCERTAINTY_THRESHOLD", "0.15"))
         
-        return f"Rationale: {dyn_text} {base_reason}"
+        citation_info = ""
+        if pubmed_citations:
+            citations_list = []
+            for cit in pubmed_citations:
+                title = cit.get("title", "Unknown Title")
+                pmid = cit.get("pmid", "N/A")
+                citations_list.append(f"'{title}' (PMID: {pmid})")
+            if citations_list:
+                citation_info = " Supporting PubMed Literature: " + "; ".join(citations_list) + "."
+
+        if diagnosis == "Out-of-Distribution":
+            return f"CAUTION: {dyn_text}{gap_info} {base_reason} Unknown pathology detected. Immediate manual clinical review is required.{citation_info}"
+            
+        if uncertainty > uncertainty_threshold:
+            return f"CAUTION: {dyn_text}{gap_info} {base_reason} High predictive uncertainty suggests a non-standard presentation. Manual review of priors is advised.{citation_info}"
+        
+        return f"Rationale: {dyn_text}{gap_info} {base_reason}{citation_info}"

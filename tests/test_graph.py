@@ -1,10 +1,10 @@
 import pytest
 from src.agent.clinical_graph import ClinicalAgent
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 import torch
 import os
 
-def test_agent_loop_protection():
+async def test_agent_loop_protection():
     """
     Assert that the agent does not enter an infinite loop.
     We mock the components to simulate a low-confidence scenario.
@@ -20,28 +20,34 @@ def test_agent_loop_protection():
     agent.scrubber.mask_burned_in_text.return_value = "dummy_image.png"
     agent.scrubber.scrub_history_data.side_effect = lambda x: x
     
-    # Mock requests.post
+    # Mock httpx.AsyncClient
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    
     mock_logits = torch.tensor([[1.1, 1.1, 1.1, 1.1, 1.1]])
     all_probs = torch.softmax(mock_logits, dim=1)[0].tolist()
 
-    with patch("requests.post") as mock_post:
-        def side_effect(url, **kwargs):
-            mock_resp = MagicMock()
-            if "encode/image" in url:
-                mock_resp.json.return_value = {"features": [[0.1]*512]}
-            elif "encode/text" in url:
-                mock_resp.json.return_value = {"embeddings": [[0.2]*768]}
-            elif "estimate" in url:
-                mock_resp.json.return_value = {
-                    "prediction": [0],
-                    "mean_confidence": [0.2], # Low confidence
-                    "std_deviation": [0.25], # High uncertainty
-                    "all_probs": [all_probs]
-                }
-            return mock_resp
+    async def side_effect(url, **kwargs):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        if "encode/image" in url:
+            mock_resp.json.return_value = {"features": [[0.1]*512], "heatmap_base64": ""}
+        elif "encode/text" in url:
+            mock_resp.json.return_value = {"embeddings": [[0.2]*768]}
+        elif "estimate" in url:
+            mock_resp.json.return_value = {
+                "prediction": [0],
+                "mean_confidence": [0.2], # Low confidence
+                "std_deviation": [0.25], # High uncertainty
+                "all_probs": [all_probs]
+            }
+        return mock_resp
         
-        mock_post.side_effect = side_effect
-        
+    mock_client.post = AsyncMock(side_effect=side_effect)
+    
+    with patch("httpx.AsyncClient", return_value=mock_client):
         # Create dummy files
         with open("dummy_image.png", "wb") as f:
             f.write(b"fake image data")
@@ -49,7 +55,7 @@ def test_agent_loop_protection():
             f.write(b"fake pdf data")
             
         try:
-            result = agent.run("dummy_image.png", "dummy_history.pdf")
+            result = await agent.run("dummy_image.png", "dummy_history.pdf")
         finally:
             if os.path.exists("dummy_image.png"):
                 os.remove("dummy_image.png")
@@ -61,4 +67,5 @@ def test_agent_loop_protection():
         print(f"Agent terminated correctly after {result['iteration_count']} iterations.")
 
 if __name__ == "__main__":
-    test_agent_loop_protection()
+    import asyncio
+    asyncio.run(test_agent_loop_protection())

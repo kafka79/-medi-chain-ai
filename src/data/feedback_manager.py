@@ -3,7 +3,7 @@ import os
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger("feedback-manager")
 
@@ -12,10 +12,19 @@ class FeedbackManager:
     Manages clinician feedback to move from a 'Black Hole' to an 'Active Learning' pipeline.
     Aggregates feedback for periodic retraining and audit.
     """
-    def __init__(self, feedback_dir: str = "data/feedback"):
+    def __init__(self, feedback_dir: str = "data/feedback", drift_detector: Optional[Any] = None):
         self.feedback_dir = Path(feedback_dir)
         self.feedback_dir.mkdir(parents=True, exist_ok=True)
         self.summary_file = self.feedback_dir / "summary.json"
+        if drift_detector is not None:
+            self.drift_detector = drift_detector
+        else:
+            try:
+                from src.monitoring.drift_detector import DriftDetector
+                self.drift_detector = DriftDetector()
+            except Exception as exc:
+                logger.warning(f"Feedback drift detector unavailable: {exc}")
+                self.drift_detector = None
 
     def log_feedback(self, case_id: str, diagnosis: str, clinician_correction: str, agreement: bool, comments: str):
         """Logs individual feedback entry."""
@@ -53,6 +62,12 @@ class FeedbackManager:
         
         with open(self.summary_file, "w") as f:
             json.dump(summary, f, indent=4)
+
+        if self.drift_detector is not None:
+            try:
+                self.drift_detector.update_feedback_summary(agreement)
+            except Exception as exc:
+                logger.error(f"Failed to update drift feedback summary: {exc}")
 
     def get_discrepancy_report(self) -> List[Dict[str, Any]]:
         """Returns all cases where the clinician disagreed for priority review."""

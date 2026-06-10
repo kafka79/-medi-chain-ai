@@ -23,6 +23,11 @@ class UncertaintyEstimator:
                     m.eval()
             
             all_logits = []
+            # CRITICAL CONSTRAINT (Tara's T1): We use torch.no_grad() here because MC Dropout is strictly for
+            # inference-time uncertainty estimation, which benefits from no-grad memory optimization and speed.
+            # However, because gradients are disabled, Grad-CAM (which requires backpropagation to compute
+            # attention maps) cannot run in the same pass. Therefore, Grad-CAM and uncertainty estimation
+            # must be executed in separate model passes.
             with torch.no_grad():
                 for _ in range(num_passes):
                     _, logits = self.model(vision_emb, text_emb)
@@ -40,9 +45,11 @@ class UncertaintyEstimator:
         # Prediction is the class with highest mean probability
         conf, pred = torch.max(mean_probs, dim=1)
         
-        # Uncertainty is the std dev of the predicted class
+        # Flaw #14 Fix: Return std_deviation as a tensor instead of a Python list.
+        # Consumers call .tolist() on the full results dict via the API serialization layer,
+        # ensuring consistent type handling throughout the pipeline.
         batch_size = vision_emb.shape[0]
-        uncertainties = [std_probs[i, pred[i]].item() for i in range(batch_size)]
+        uncertainties = torch.tensor([std_probs[i, pred[i]].item() for i in range(batch_size)])
         
         return {
             "prediction": pred,
@@ -51,27 +58,9 @@ class UncertaintyEstimator:
             "all_probs": mean_probs
         }
 
-    def calculate_ece(self, y_true, y_prob, n_bins=10):
-        """Calculate Expected Calibration Error (ECE)."""
-        bin_boundaries = np.linspace(0, 1, n_bins + 1)
-        bin_lowers = bin_boundaries[:-1]
-        bin_uppers = bin_boundaries[1:]
-        
-        confidences = np.max(y_prob, axis=1)
-        predictions = np.argmax(y_prob, axis=1)
-        accuracies = predictions == y_true
-        
-        ece = 0
-        for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
-            # Calculated confidence and accuracy in each bin
-            in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
-            prop_in_bin = np.mean(in_bin)
-            if prop_in_bin > 0:
-                accuracy_in_bin = np.mean(accuracies[in_bin])
-                avg_confidence_in_bin = np.mean(confidences[in_bin])
-                ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
-                
-        return ece
+    # Flaw #19 Fix: Removed dead calculate_ece() method.
+    # ECE calculation should live in the evaluation pipeline (src/evaluation/)
+    # where it can be called with actual validation data, not as an orphan method here.
 
 if __name__ == "__main__":
     # Test would go here

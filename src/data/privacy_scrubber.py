@@ -1,9 +1,16 @@
 import re
 import logging
 import threading
-from typing import Dict, Any
+import os
+import json
+from datetime import datetime, timezone
+from typing import Dict, Any, List
 
 logger = logging.getLogger("privacy-scrubber")
+
+# Flaw #23 Fix: Dedicated audit logger for PHI de-identification operations
+_audit_logger = logging.getLogger("phi-audit")
+_audit_logger.setLevel(logging.INFO)
 
 class PrivacyScrubber:
     """
@@ -29,8 +36,20 @@ class PrivacyScrubber:
         self._ner_lock = threading.Lock()
         self._ner_loaded = False
         
-        # Pre-initialize/download NER in the background to prevent blocking application lifespan startup
-        threading.Thread(target=self._init_ner, daemon=True).start()
+        # Eagerly initialize/download NER synchronously at startup (fail-fast)
+        # unless configured for lazy loading (e.g. for CI speed/tests).
+        lazy_load = os.getenv("NER_LAZY_LOAD", "false").lower() == "true"
+        if os.getenv("TESTING") != "true":
+            if lazy_load:
+                logger.info("NER_LAZY_LOAD is true. Initializing NER pipeline in background thread...")
+                threading.Thread(target=self._init_ner, daemon=True).start()
+            else:
+                self._init_ner()
+                if self.ner_load_error is not None:
+                    raise RuntimeError(
+                        f"Critical HIPAA Risk: Privacy scrubber failed to load the NER model at startup. "
+                        f"Error: {self.ner_load_error}"
+                    )
 
     def _init_ner(self):
         """Thread-safe lazy initialization of the Hugging Face NER pipeline."""
@@ -40,8 +59,11 @@ class PrivacyScrubber:
             logger.info("Initializing Hugging Face NER pipeline in background thread...")
             try:
                 from transformers import pipeline
+                # Allow local path in air-gapped environments via NER_MODEL_PATH
+                model_name = os.getenv("NER_MODEL_PATH", "dslim/bert-base-NER")
+                logger.info(f"Loading NER model from path/name: {model_name}")
                 # Using aggregation_strategy="simple" merges B-PER and I-PER into a single PER entity
-                self.ner = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+                self.ner = pipeline("ner", model=model_name, aggregation_strategy="simple")
                 self.ner_load_error = None
                 logger.info("Hugging Face NER pipeline loaded successfully.")
             except Exception as e:
@@ -51,8 +73,8 @@ class PrivacyScrubber:
             finally:
                 self._ner_loaded = True
 
-    def scrub_text(self, text: str) -> str:
-        """Removes PII patterns from text."""
+    def scrub_text(self, text: str, source_context: str = "unknown") -> str:
+        """Removes PII patterns from text. Logs an audit trail of all redactions."""
         # Ensure NER is loaded (blocks if background thread is still initializing)
         if not self._ner_loaded:
             self._init_ner()
@@ -62,20 +84,40 @@ class PrivacyScrubber:
                 f"Critical HIPAA Risk: Privacy scrubber failed to load the NER model. "
                 f"Aborting process to prevent patient data leakage. Error: {self.ner_load_error}"
             )
+        
+        # Flaw #23 Fix: Track all redactions for the audit trail
+        redaction_log: List[Dict[str, str]] = []
             
         scrubbed = text
         for label, pattern in self.patterns.items():
+            matches = pattern.findall(scrubbed)
+            if matches:
+                redaction_log.append({"type": "regex", "pattern": label, "count": len(matches)})
             scrubbed = pattern.sub(f"[{label.upper()}_REDACTED]", scrubbed)
             
         try:
             entities = self.ner(scrubbed)
+            ner_redacted = []
             # Sort entities in reverse order to replace from end to start without affecting indices
             for ent in sorted(entities, key=lambda x: x['start'], reverse=True):
                 if ent['entity_group'] in ['PER', 'ORG', 'LOC']:
+                    ner_redacted.append({"group": ent['entity_group'], "score": round(ent.get('score', 0), 3)})
                     scrubbed = scrubbed[:ent['start']] + f"[NER_{ent['entity_group']}_REDACTED]" + scrubbed[ent['end']:]
+            if ner_redacted:
+                redaction_log.append({"type": "ner", "entities": ner_redacted})
         except Exception as e:
             logger.error(f"NER scrubbing failed: {e}")
             raise RuntimeError(f"Critical HIPAA Risk: NER scrubbing failed at runtime. Aborting. Error: {e}")
+        
+        # Flaw #23 Fix: Write audit record
+        if redaction_log:
+            audit_record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": source_context,
+                "operation": "text_scrub",
+                "redactions": redaction_log,
+            }
+            _audit_logger.info(json.dumps(audit_record))
                 
         return scrubbed
 
@@ -124,20 +166,25 @@ class PrivacyScrubber:
                 # Thresholding using Otsu's binarization to segment text contours
                 thresh = cv2.threshold(zone_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
                 
-                # Apply horizontal dilation to merge individual character contours into words/lines
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+                # Scale the dilation kernel width and height dynamically based on the image size
+                k_w = max(5, int(w * 0.015))
+                k_h = max(2, int(h * 0.003))
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, k_h))
                 dilated = cv2.dilate(thresh, kernel, iterations=1)
                 
                 # Find connected contours that could represent letters or words
                 contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
+                # Scale heuristics dynamically relative to image dimensions to support variable resolutions
+                min_h_c = max(4, int(h * 0.008))
+                max_h_c = max(15, int(h * 0.035))
+                min_w_c = max(6, int(w * 0.012))
+                
                 for cnt in contours:
                     x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
                     
-                    # Filtering contours using basic heuristics for typical text dimensions:
-                    # - Height must be between 8 and 35 pixels
-                    # - Width must be at least 12 pixels
-                    if 8 <= h_c <= 35 and w_c >= 12:
+                    # Filtering contours using dynamic scaled heuristics
+                    if min_h_c <= h_c <= max_h_c and w_c >= min_w_c:
                         # Translate zone-relative y-coordinate to full image space
                         boxes.append((x_c, start_y + y_c, w_c, h_c))
                         
@@ -165,9 +212,11 @@ class PrivacyScrubber:
                     "InstitutionName", "AccessionNumber", "PatientAddress", 
                     "ReferringPhysicianName", "PerformingPhysicianName", "OperatorsName"
                 ]
+                redacted_tags = []
                 for tag in phi_tags:
                     if tag in ds:
                         ds.data_element(tag).value = f"REDACTED_{tag.upper()}"
+                        redacted_tags.append(tag)
                         
                 tmp = tempfile.NamedTemporaryFile(suffix=".dcm", delete=False)
                 sanitized_path = tmp.name
@@ -175,6 +224,18 @@ class PrivacyScrubber:
                 
                 ds.save_as(sanitized_path)
                 logger.info(f"Successfully scrubbed DICOM metadata headers. Saved to {sanitized_path}")
+
+                # Flaw #23 Fix: Audit trail for DICOM header redaction
+                if redacted_tags:
+                    audit_record = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "source": os.path.basename(image_path),
+                        "operation": "dicom_header_scrub",
+                        "redacted_tags": redacted_tags,
+                        "output": sanitized_path,
+                    }
+                    _audit_logger.info(json.dumps(audit_record))
+
                 return sanitized_path
             except Exception as e:
                 logger.error(f"Failed to scrub DICOM metadata headers: {e}")
@@ -202,6 +263,18 @@ class PrivacyScrubber:
                 
             cv2.imwrite(output_path, img)
             logger.info(f"Masked {len(boxes)} PHI text regions. Sanitized image saved to {output_path}")
+
+            # Flaw #23 Fix: Audit trail for burned-in text masking
+            audit_record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": os.path.basename(image_path),
+                "operation": "burned_in_text_mask",
+                "regions_masked": len(boxes),
+                "bounding_boxes": [(x, y, w, h) for (x, y, w, h) in boxes],
+                "output": output_path,
+            }
+            _audit_logger.info(json.dumps(audit_record))
+
             return output_path
         except Exception as e:
             logger.error(f"Failed to mask burned-in text: {e}")

@@ -20,6 +20,7 @@ class ModelBenchmark:
         """
         y_true = []
         y_pred = []
+        y_prob = []
         latencies = []
 
         print(f"Starting Benchmark on {len(test_data)} cases...")
@@ -34,6 +35,7 @@ class ModelBenchmark:
                 pred_label = result['diagnosis'].get('top_finding', 'Unknown')
                 y_true.append(case['label'])
                 y_pred.append(pred_label)
+                y_prob.append(result['diagnosis'].get('probabilities', [0.0]*5))
                 
                 latencies.append(time.time() - start_time)
             except Exception as e:
@@ -46,6 +48,15 @@ class ModelBenchmark:
         
         print(classification_report(y_true, y_pred, target_names=[c for c in self.classes if c in set(y_true + y_pred)]))
         
+        ece_val = None
+        try:
+            from src.evaluation.calibration import calculate_ece
+            y_true_indices = [self.classes.index(lbl) if lbl in self.classes else 4 for lbl in y_true]
+            ece_val = calculate_ece(y_true_indices, y_prob)
+            print(f"Expected Calibration Error (ECE): {ece_val:.4f}")
+        except Exception as e:
+            print(f"Failed to calculate ECE: {e}")
+            
         avg_latency = np.mean(latencies)
         p95_latency = np.percentile(latencies, 95)
         
@@ -53,11 +64,14 @@ class ModelBenchmark:
         print(f"P95 Latency: {p95_latency:.2f}s")
         print("="*30)
         
-        return {
+        results_dict = {
             "classification_report": classification_report(y_true, y_pred, output_dict=True),
             "avg_latency": avg_latency,
             "p95_latency": p95_latency
         }
+        if ece_val is not None:
+            results_dict["ece"] = ece_val
+        return results_dict
 
 if __name__ == "__main__":
     # Example usage in a mock test environment

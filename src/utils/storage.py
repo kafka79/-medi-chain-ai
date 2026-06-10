@@ -65,8 +65,13 @@ class S3StorageProvider(StorageProvider):
         from minio import Minio
         # Default fallback to standard docker-compose environment variables or local minio
         self.endpoint = endpoint or os.getenv("S3_ENDPOINT", "localhost:9000")
-        self.access_key = access_key or os.getenv("S3_ACCESS_KEY", "minioadmin")
-        self.secret_key = secret_key or os.getenv("S3_SECRET_KEY", "minioadmin")
+        self.access_key = access_key or os.getenv("S3_ACCESS_KEY")
+        self.secret_key = secret_key or os.getenv("S3_SECRET_KEY")
+        if not self.access_key or not self.secret_key:
+            raise RuntimeError(
+                "S3_ACCESS_KEY and S3_SECRET_KEY environment variables are required. "
+                "Refusing to start with default credentials."
+            )
         self.bucket = bucket
         
         try:
@@ -80,7 +85,7 @@ class S3StorageProvider(StorageProvider):
                 self.endpoint,
                 access_key=self.access_key,
                 secret_key=self.secret_key,
-                secure=False,
+                secure=os.getenv("S3_SECURE", "false").lower() == "true",
                 http_client=http_client
             )
             # Create bucket if it doesn't exist
