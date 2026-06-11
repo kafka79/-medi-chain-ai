@@ -7,6 +7,7 @@ import redis
 import os
 import requests as http_requests
 from datetime import datetime, timezone
+import asyncio
 
 logger = logging.getLogger("drift-detector")
 
@@ -52,6 +53,37 @@ class DriftDetector:
         self.redis_client = None
         self.baseline = None
         self.features_baseline = None
+
+        # Lua script to atomically push elements, set TTL, check count, and conditionally pop both windows
+        self.lua_push_and_check = """
+        local window_key = KEYS[1]
+        local features_key = KEYS[2]
+        local val_probs = ARGV[1]
+        local val_features = ARGV[2]
+        local ttl = tonumber(ARGV[3])
+        local threshold = tonumber(ARGV[4])
+        
+        -- Push probabilities
+        redis.call('RPUSH', window_key, val_probs)
+        redis.call('EXPIRE', window_key, ttl)
+        
+        -- Push features if provided
+        if val_features ~= "" then
+            redis.call('RPUSH', features_key, val_features)
+            redis.call('EXPIRE', features_key, ttl)
+        end
+        
+        -- Check size
+        local count = redis.call('LLEN', window_key)
+        if count >= threshold then
+            local probs = redis.call('LRANGE', window_key, 0, -1)
+            local features = redis.call('LRANGE', features_key, 0, -1)
+            redis.call('DEL', window_key)
+            redis.call('DEL', features_key)
+            return {probs, features}
+        end
+        return nil
+        """
 
         if self.disabled:
             return
@@ -104,49 +136,55 @@ class DriftDetector:
         except Exception as e:
             logger.error(f"Failed to save features baseline to Redis: {e}")
 
-    def add_prediction(self, probs: list, visual_features: list = None):
-        """Adds current prediction probabilities and visual features to persistent distributed windows."""
+    async def add_prediction(self, probs: list, visual_features: list = None):
+        """Adds current prediction probabilities and visual features to persistent distributed windows.
+        Offloads Redis operations and CPU-bound statistical tests to a separate thread pool."""
         if self.disabled:
             return
 
         try:
-            pipe = self.redis_client.pipeline()
-            pipe.rpush(self.window_key, json.dumps(probs))
-            # Flaw #10 Fix: Set TTL on drift window keys to prevent stale data accumulation
-            pipe.expire(self.window_key, DRIFT_KEY_TTL_SECONDS)
-            if visual_features is not None:
-                pipe.rpush(self.features_window_key, json.dumps(visual_features))
-                pipe.expire(self.features_window_key, DRIFT_KEY_TTL_SECONDS)
-            pipe.llen(self.window_key)
-            results = pipe.execute()
+            await asyncio.to_thread(self._add_prediction_sync, probs, visual_features)
+        except Exception as e:
+            logger.error(f"Failed to monitor drift: {e}")
+
+    def _add_prediction_sync(self, probs: list, visual_features: list = None):
+        """Synchronous implementation of add_prediction to be run in asyncio.to_thread."""
+        try:
+            val_probs = json.dumps(probs)
+            val_features = json.dumps(visual_features) if visual_features is not None else ""
             
-            count = results[-1]
-            if count >= 100:  # Window size triggered
-                self.check_prediction_drift()
-                if visual_features is not None:
-                    self.check_covariate_shift()
+            # Execute Lua script to push and conditionally retrieve expired lists atomically
+            result = self.redis_client.eval(
+                self.lua_push_and_check,
+                2,
+                self.window_key,
+                self.features_window_key,
+                val_probs,
+                val_features,
+                DRIFT_KEY_TTL_SECONDS,
+                100
+            )
+            
+            if result:
+                raw_probs, raw_features = result
+                current_probs = [json.loads(p) for p in raw_probs]
+                current_features = [json.loads(f) for f in raw_features] if (raw_features and len(raw_features) > 0) else None
+                
+                # Perform drift calculations sequentially in this background thread
+                self.check_prediction_drift(current_probs)
+                if current_features and len(current_features) > 0:
+                    self.check_covariate_shift(current_features)
                 self.check_performance_drift()
         except redis.ConnectionError as e:
             logger.error(f"Redis connection failed: {e}. Cannot monitor drift.")
+        except Exception as e:
+            logger.error(f"Error executing drift checks: {e}")
 
-    def check_prediction_drift(self):
+    def check_prediction_drift(self, current_probs: list):
         """
         Monitors Prediction Drift / Label Shift P(Y_hat) using Kolmogorov-Smirnov test.
         """
-        if self.disabled:
-            return False
-
-        try:
-            lua_script = """
-            local data = redis.call('LRANGE', KEYS[1], 0, -1)
-            redis.call('DEL', KEYS[1])
-            return data
-            """
-            raw_probs = self.redis_client.eval(lua_script, 1, self.window_key)
-            if not raw_probs:
-                return False
-            current_probs = [json.loads(p) for p in raw_probs]
-        except redis.ConnectionError:
+        if self.disabled or not current_probs:
             return False
 
         if self.baseline is None:
@@ -155,6 +193,16 @@ class DriftDetector:
             return False
 
         current = np.array(current_probs)
+        
+        # Validate prediction dimensions (prevent IndexError on class mismatch)
+        if current.shape[1] != self.baseline.shape[1]:
+            logger.error(
+                f"Prediction class count mismatch: baseline={self.baseline.shape[1]}, "
+                f"current={current.shape[1]}. Resetting baseline to current."
+            )
+            self._save_baseline(current_probs)
+            return False
+
         drift_detected = False
         
         # Compare distributions using Kolmogorov-Smirnov test per class
@@ -167,26 +215,12 @@ class DriftDetector:
         
         return drift_detected
 
-    def check_covariate_shift(self):
+    def check_covariate_shift(self, current_features: list):
         """
         Monitors Covariate Shift P(X) on visual features.
         Compares visual embeddings of the current window against a baseline using cosine similarity.
         """
-        if self.disabled:
-            return False
-
-        try:
-            lua_script = """
-            local data = redis.call('LRANGE', KEYS[1], 0, -1)
-            redis.call('DEL', KEYS[1])
-            return data
-            """
-            raw_features = self.redis_client.eval(lua_script, 1, self.features_window_key)
-            if not raw_features:
-                return False
-            
-            current_features = [json.loads(f) for f in raw_features]
-        except redis.ConnectionError:
+        if self.disabled or not current_features:
             return False
 
         if self.features_baseline is None:

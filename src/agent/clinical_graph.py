@@ -121,47 +121,48 @@ class ClinicalAgent:
         
         # Call inference API. Attempt to use shared volume path first to avoid I/O double-writing
         try:
-            abs_img_path = os.path.abspath(img_to_encode)
-            async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
-                resp = await client.post(
-                    f"{self.inference_api_url}/encode/image_path",
-                    json={"image_path": abs_img_path},
-                    headers={"X-Internal-API-Key": self.internal_api_key},
-                    timeout=10
-                )
-            # If the path endpoint isn't supported or fails, fall back to upload bytes
-            if resp.status_code == 404 or resp.status_code == 400:
-                raise ValueError("Endpoint failed or path not accessible. Falling back to HTTP multipart upload.")
-            resp.raise_for_status()
-            resp_data = resp.json()
-            features = resp_data["features"]
-            heatmap_base64 = resp_data.get("heatmap_base64", "")
-        except Exception:
-            # Fallback to standard multipart upload
             try:
-                with open(img_to_encode, "rb") as f:
-                    files = {"image": ("image.jpg", f, "image/jpeg")}
-                    async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
-                        resp = await client.post(
-                            f"{self.inference_api_url}/encode/image",
-                            files=files,
-                            headers={"X-Internal-API-Key": self.internal_api_key},
-                            timeout=15
-                        )
+                abs_img_path = os.path.abspath(img_to_encode)
+                async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
+                    resp = await client.post(
+                        f"{self.inference_api_url}/encode/image_path",
+                        json={"image_path": abs_img_path},
+                        headers={"X-Internal-API-Key": self.internal_api_key},
+                        timeout=10
+                    )
+                # If the path endpoint isn't supported or fails, fall back to upload bytes
+                if resp.status_code == 404 or resp.status_code == 400:
+                    raise ValueError("Endpoint failed or path not accessible. Falling back to HTTP multipart upload.")
                 resp.raise_for_status()
                 resp_data = resp.json()
                 features = resp_data["features"]
                 heatmap_base64 = resp_data.get("heatmap_base64", "")
-            except Exception as e:
-                logger.error(f"[Clinical Graph] Error calling inference API: {e}")
-                raise RuntimeError(f"Visual encoder failed: {e}")
-        
-        # Clean up the temporary scrubbed image if it was created
-        if success and os.path.exists(img_to_encode) and img_to_encode != orig_img_path:
-            try:
-                os.remove(img_to_encode)
-            except Exception as e:
-                logger.warning(f"[Clinical Graph] Warning: failed to clean up temp scrubbed image: {e}")
+            except Exception:
+                # Fallback to standard multipart upload
+                try:
+                    with open(img_to_encode, "rb") as f:
+                        files = {"image": ("image.jpg", f, "image/jpeg")}
+                        async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
+                            resp = await client.post(
+                                f"{self.inference_api_url}/encode/image",
+                                files=files,
+                                headers={"X-Internal-API-Key": self.internal_api_key},
+                                timeout=15
+                            )
+                    resp.raise_for_status()
+                    resp_data = resp.json()
+                    features = resp_data["features"]
+                    heatmap_base64 = resp_data.get("heatmap_base64", "")
+                except Exception as e:
+                    logger.error(f"[Clinical Graph] Error calling inference API: {e}")
+                    raise RuntimeError(f"Visual encoder failed: {e}")
+        finally:
+            # Clean up the temporary scrubbed image if it was created
+            if success and os.path.exists(img_to_encode) and img_to_encode != orig_img_path:
+                try:
+                    os.remove(img_to_encode)
+                except Exception as e:
+                    logger.warning(f"[Clinical Graph] Warning: failed to clean up temp scrubbed image: {e}")
                 
         return {"visual_features": features, "heatmap_base64": heatmap_base64}
 
