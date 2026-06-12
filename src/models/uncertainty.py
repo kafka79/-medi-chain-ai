@@ -10,6 +10,15 @@ class UncertaintyEstimator:
         Run MC Dropout to estimate prediction mean and standard deviation.
         Keeps model in .eval() to avoid BatchNorm errors with batch size 1,
         but explicitly enables Dropout layers.
+        
+        NOTE ON LIMITATION (Tara's Critique - The MC Dropout Illusion):
+        Because the visual encoder (BiomedCLIP) and text encoder (SapBERT) are run 
+        exactly once during upstream pipeline execution to extract static features, 
+        and because BiomedCLIP's vision tower has a dropout rate of 0.0, this function 
+        only estimates epistemic uncertainty of the fusion/classification head layers 
+        (LateFusionModel). Visual feature extraction uncertainty is NOT captured here. 
+        To make this clear, we return both "std_deviation" (for API compatibility) 
+        and "fusion_head_variance".
         """
         self.model.eval()
         
@@ -55,6 +64,7 @@ class UncertaintyEstimator:
             "prediction": pred,
             "mean_confidence": conf,
             "std_deviation": uncertainties,
+            "fusion_head_variance": uncertainties,  # Clarified classification head variance
             "all_probs": mean_probs
         }
 

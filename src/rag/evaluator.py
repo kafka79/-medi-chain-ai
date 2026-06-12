@@ -1,8 +1,24 @@
 from pymilvus import connections, Collection
 import os
 import logging
+import time
+from datetime import datetime, timezone
+import requests
 
 logger = logging.getLogger("rag-evaluator")
+
+def _send_alert(title: str, message: str):
+    """Send critical system alert to external webhook (Slack, PagerDuty, etc.)."""
+    logger.critical(f"CRITICAL SYSTEM ALERT: {title} — {message}")
+    webhook_url = os.getenv("DRIFT_ALERT_WEBHOOK_URL", "")
+    if webhook_url:
+        try:
+            payload = {
+                "text": f"🚨 *{title}*\n{message}\n_Timestamp: {datetime.now(timezone.utc).isoformat()}_"
+            }
+            requests.post(webhook_url, json=payload, timeout=5)
+        except Exception as e:
+            logger.error(f"Failed to send connection alert webhook: {e}")
 
 class RAGEvaluator:
     def __init__(self, milvus_host="localhost", milvus_port="19530", inference_api_url: str = None):
@@ -32,7 +48,6 @@ class RAGEvaluator:
         if os.getenv("TESTING") == "true":
             return
         
-        import time
         max_attempts = 5
         
         for attempt in range(max_attempts):
@@ -44,16 +59,17 @@ class RAGEvaluator:
                 break
             except Exception as e:
                 if attempt == max_attempts - 1:
-                    print(f"Warning: Could not connect to Milvus/Collection after {max_attempts} attempts: {e}")
+                    msg = f"Could not connect to Milvus/Collection after {max_attempts} attempts: {e}"
+                    print(f"Warning: {msg}")
+                    _send_alert("Milvus Connection Failure", msg)
                 else:
                     time.sleep(1)
 
     def search(self, query, k=5):
-        """Perform search in Milvus."""
+        """Perform search in Milvus. Raises RuntimeError if offline."""
         if not self.collection:
-            return []
+            raise RuntimeError("Milvus RAG collection is offline or uninitialized.")
             
-        import requests
         try:
             resp = requests.post(
                 f"{self.inference_api_url}/encode/text",
@@ -66,7 +82,7 @@ class RAGEvaluator:
             vector = resp.json()["embeddings"][0]
         except Exception as e:
             print(f"[RAGEvaluator] Error calling inference API: {e}")
-            return []
+            raise RuntimeError(f"RAG text encoding failed: {e}")
         
         search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
         results = self.collection.search(

@@ -186,8 +186,12 @@ class ClinicalAgent:
             query = base_query
             
         loop = asyncio.get_running_loop()
-        citations = await loop.run_in_executor(None, self.rag.search, query, 3)
-        return {"pubmed_citations": citations}
+        try:
+            citations = await loop.run_in_executor(None, self.rag.search, query, 3)
+            return {"pubmed_citations": citations}
+        except Exception as e:
+            logger.error(f"[Clinical Graph] RAG retrieval failed: {e}. Forcing human review escalation.")
+            return {"pubmed_citations": [], "escalation_required": True}
 
     async def node_synthesize_diagnosis(self, state: AgentState):
         logger.info("[Node] Synthesizing Diagnosis...")

@@ -99,16 +99,18 @@ if not _api_key and os.getenv("TESTING") != "true" and os.getenv("STORAGE_MODE")
 # Check if Redis is actually responsive before using it for rate limiting
 redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
 use_redis = False
+redis_client = None
 is_production = os.getenv("TESTING") != "true" and os.getenv("STORAGE_MODE") != "local"
 
 if redis_url.startswith("redis://") or redis_url.startswith("rediss://"):
     try:
         import redis
-        r = redis.from_url(redis_url, socket_connect_timeout=1)
-        r.ping()
+        redis_client = redis.from_url(redis_url, socket_connect_timeout=1)
+        redis_client.ping()
         use_redis = True
         logger.info("Successfully connected to Redis for rate limiting.")
     except Exception as e:
+        redis_client = None
         if not is_production:
             logger.warning(f"Redis not responsive ({e}). Falling back to in-memory rate limiting for local dev/testing.")
         else:
@@ -151,7 +153,7 @@ else:
 
 drift_detector = DriftDetector()
 ehr_gateway = EHRGateway()
-feedback_logger = FeedbackLogger()
+feedback_logger = FeedbackLogger(redis_client=redis_client, storage_provider=storage)
 
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
 
@@ -452,6 +454,37 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error(f"Feedback logging failed: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to log feedback: {e}")
+
+    @app.get("/feedback/discrepancies")
+    @limiter.limit("10/minute")
+    async def get_discrepancies(
+        request: Request,
+        api_key: str = Depends(verify_api_key)
+    ):
+        """Retrieves aggregated discrepancy records across all stateless replicas using Redis/S3."""
+        try:
+            records = []
+            if redis_client is not None:
+                # Load from shared Redis list
+                raw_records = redis_client.lrange("medi_chain:feedback:records", 0, -1)
+                for r_raw in raw_records:
+                    rec = json.loads(r_raw)
+                    if rec.get("verdict") in {"disagree", "mismatch"}:
+                        records.append(rec)
+            else:
+                # Fallback to reading the local CSV if Redis isn't configured
+                import csv
+                csv_path = feedback_logger.csv_path
+                if csv_path.exists():
+                    with csv_path.open("r", encoding="utf-8") as handle:
+                        reader = csv.DictReader(handle)
+                        for row in reader:
+                            if row.get("verdict") in {"disagree", "mismatch"}:
+                                records.append(row)
+            return JSONResponse(content={"discrepancies": records})
+        except Exception as e:
+            logger.error(f"Failed to load discrepancies: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load discrepancies: {e}")
 
     @app.get("/health")
     async def health_check(request: Request):

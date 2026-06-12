@@ -1,12 +1,35 @@
 import numpy as np
 import cv2
+import torch
+import torch.nn as nn
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from PIL import Image
 import os
-
 import math
+import logging
+
+logger = logging.getLogger("explainability")
+
+class CLIPClassifierWrapper(nn.Module):
+    """
+    Wraps the visual encoder of BiomedCLIP and computes cosine similarity
+    with the target class text embeddings to output classification-like logits.
+    """
+    def __init__(self, visual_model, text_embeddings):
+        super().__init__()
+        self.visual = visual_model
+        # Register text_embeddings as a buffer so it moves with the module to the correct device
+        self.register_buffer("text_embeddings", text_embeddings)
+        
+    def forward(self, x):
+        image_features = self.visual(x)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        # Output shape: (batch, num_classes)
+        logits = image_features @ self.text_embeddings.T
+        return logits
+
 
 class VisualExplainer:
     def __init__(self, model, preprocess):
@@ -44,13 +67,40 @@ class VisualExplainer:
         if not self.target_layers:
             self.target_layers = [model.visual]
 
+        # Encode diagnostic classes text to compute visual-text similarity for Grad-CAM
+        from src.models.fusion import DIAGNOSTIC_CLASSES
+        import open_clip
+        
+        self.class_embeddings = None
+        if hasattr(model, "encode_text"):
+            try:
+                # Load tokenizer dynamically
+                model_id = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+                tokenizer = open_clip.get_tokenizer(model_id)
+                tokens = tokenizer(DIAGNOSTIC_CLASSES)
+                device = next(model.parameters()).device
+                tokens = tokens.to(device)
+                with torch.no_grad():
+                    text_features = model.encode_text(tokens)
+                    text_features /= text_features.norm(dim=-1, keepdim=True)
+                self.class_embeddings = text_features
+                logger.info("VisualExplainer successfully pre-encoded diagnostic classes text labels.")
+            except Exception as e:
+                logger.warning(f"Could not pre-encode text labels for visual explainer: {e}. Falling back to visual projections.")
+
     def reshape_transform(self, tensor, height=14, width=14):
         # Result of ViT backbone is (Batch, Tokens, Dim)
         # We need to reshape to (Batch, Dim, Height, Width)
         # B/16 uses 224/16 = 14x14 patches + 1 cls token
         seq_len = tensor.size(1) - 1
-        grid_size = int(math.sqrt(seq_len))
+        grid_size = int(round(math.sqrt(seq_len)))
         
+        # Verify shape integrity
+        if grid_size * grid_size != seq_len:
+            # Fallback dynamic calculation if sequence length is unexpected
+            logger.warning(f"Reshape sequence length {seq_len} is not a perfect square. Falling back to default grid dimensions.")
+            grid_size = 14
+            
         result = tensor[:, 1:, :].reshape(tensor.size(0), grid_size, grid_size, tensor.size(2))
         
         # Bring the channels to the first dimension
@@ -62,10 +112,17 @@ class VisualExplainer:
         rgb_img = np.array(Image.open(image_path).convert('RGB')).astype(np.float32) / 255.0
         input_tensor = self.preprocess(Image.open(image_path)).unsqueeze(0).to(next(self.model.parameters()).device)
 
-        # Construct the CAM object with reshape_transform for ViT
-        cam = GradCAM(model=self.model.visual, 
-                      target_layers=self.target_layers, 
-                      reshape_transform=self.reshape_transform)
+        if self.class_embeddings is not None:
+            # Construct similarity-based wrapper so ClassifierOutputTarget targets actual similarity scores
+            wrapper = CLIPClassifierWrapper(self.model.visual, self.class_embeddings)
+            cam = GradCAM(model=wrapper, 
+                          target_layers=self.target_layers, 
+                          reshape_transform=self.reshape_transform)
+        else:
+            # Fallback for mock/test environments
+            cam = GradCAM(model=self.model.visual, 
+                          target_layers=self.target_layers, 
+                          reshape_transform=self.reshape_transform)
 
         # If target_category is None, it targets the highest scoring class
         targets = [ClassifierOutputTarget(target_category)] if target_category is not None else None

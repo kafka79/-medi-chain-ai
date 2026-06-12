@@ -2,6 +2,7 @@ import os
 import pytest
 import numpy as np
 import torch
+import json
 from unittest.mock import MagicMock, patch
 
 from src.vlm.explainability import VisualExplainer
@@ -127,3 +128,69 @@ def test_ehr_gateway_redis_dlq_fallback():
         call_args = mock_redis_client.rpush.call_args[0]
         assert call_args[0] == "medi_chain:dlq"
         assert "DiagnosticReport" in call_args[1]
+
+def test_clip_classifier_wrapper_forward():
+    from src.vlm.explainability import CLIPClassifierWrapper
+    visual_model = MagicMock()
+    # Mock visual tower return (batch, features) -> (2, 2)
+    mock_img_features = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    visual_model.return_value = mock_img_features
+    
+    # Text embeddings of shape (3, 2)
+    text_embeddings = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]], dtype=torch.float32)
+    
+    wrapper = CLIPClassifierWrapper(visual_model, text_embeddings)
+    dummy_input = torch.randn(2, 3, 224, 224)
+    logits = wrapper(dummy_input)
+    
+    # Output should have shape (batch, num_classes) -> (2, 3)
+    assert logits.shape == (2, 3)
+    # The first image (1,0) should have similarity 1.0 with text 1 (1,0) and 0.5 with text 3 (0.5, 0.5)
+    assert torch.allclose(logits[0], torch.tensor([1.0, 0.0, 0.5000]), atol=1e-3)
+
+def test_feedback_logger_redis_sync():
+    from src.utils.feedback_logger import FeedbackLogger
+    mock_redis = MagicMock()
+    mock_storage = MagicMock()
+    
+    logger = FeedbackLogger(redis_client=mock_redis, storage_provider=mock_storage)
+    
+    # Call log_feedback
+    logger.log_feedback(
+        session_id="test-session",
+        verdict="disagree",
+        notes="misidentified tuberculosis",
+        diagnosis={"top_finding": "Pneumonia", "uncertainty_std": 0.05},
+        history_metadata={"patient_id": "pat-1", "occupation": "Teacher"}
+    )
+    
+    # Assert Redis rpush called
+    mock_redis.rpush.assert_called_once()
+    args = mock_redis.rpush.call_args[0]
+    assert args[0] == "medi_chain:feedback:records"
+    record = json.loads(args[1])
+    assert record["verdict"] == "disagree"
+    assert record["notes"] == "misidentified tuberculosis"
+    
+    # Assert S3 save called
+    mock_storage.save.assert_called_once()
+
+def test_rag_evaluator_fails_loud_and_alerts():
+    from src.rag.evaluator import RAGEvaluator
+    
+    with patch("pymilvus.connections.connect", side_effect=ValueError("Milvus down")), \
+         patch("src.rag.evaluator._send_alert") as mock_alert:
+        # Since it's CI, os.environ["TESTING"] is "true", which bypasses connect.
+        # We temporarily patch TESTING environment variable
+        with patch.dict(os.environ, {"TESTING": "false"}):
+            evaluator = RAGEvaluator(inference_api_url="http://test-url:8001")
+            
+            # Assert that collection is None and alert was triggered
+            assert evaluator.collection is None
+            mock_alert.assert_called_once()
+            assert "Milvus Connection Failure" in mock_alert.call_args[0][0]
+            
+            # Assert search raises RuntimeError
+            with pytest.raises(RuntimeError) as exc_info:
+                evaluator.search("test query")
+            assert "Milvus RAG collection is offline" in str(exc_info.value)
