@@ -112,6 +112,7 @@ class ClinicalReportGenerator:
             "differential": differential,
             "confidence": diagnosis_result.get('confidence', 0.0),
             "report_path": pdf_path,
+            "escalation_required": diagnosis_result.get('escalation_required', False),
         }
         report = self.fhir_formatter.create_diagnostic_report(diagnosis_data)
         fhir_path = os.path.splitext(pdf_path)[0] + ".fhir.json"

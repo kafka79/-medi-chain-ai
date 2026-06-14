@@ -13,11 +13,20 @@ class FHIRFormatter:
     def create_diagnostic_report(self, diagnosis_data):
         """
         Create a FHIR-R4 DiagnosticReport from raw diagnosis results.
-        diagnosis_data: dict with keys: patient_id, differential, confidence, findings
+        diagnosis_data: dict with keys: patient_id, differential, confidence, findings, escalation_required
         """
         differential_str = ", ".join([f"{k}: {v:.1%}" for k, v in diagnosis_data.get('differential', {}).items()])
+        status = "preliminary" if diagnosis_data.get('escalation_required', False) else "final"
+        
+        conclusion = (
+            f"Primary finding: {diagnosis_data.get('primary_finding', 'None')}. "
+            f"Differential: {differential_str}"
+        )
+        if diagnosis_data.get('escalation_required', False):
+            conclusion += " [WARNING: High uncertainty / out-of-distribution detected. Escalated for human review.]"
+
         return DiagnosticReport(
-            status="final",
+            status=status,
             identifier=[
                 Identifier(
                     value=f"RPT-{diagnosis_data.get('patient_id', 'UNK')}-{int(datetime.now().timestamp())}"
@@ -45,10 +54,7 @@ class FHIRFormatter:
             ),
             subject=Reference(display=f"Patient {diagnosis_data.get('patient_id', 'Unknown')}"),
             effectiveDateTime=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            conclusion=(
-                f"Primary finding: {diagnosis_data.get('primary_finding', 'None')}. "
-                f"Differential: {differential_str}"
-            ),
+            conclusion=conclusion,
         )
 
     def to_json(self, fhir_resource):
@@ -66,7 +72,7 @@ class EHRGateway:
         self.logger = logging.getLogger("ehr-gateway")
         self.endpoint_url = endpoint_url or os.getenv("EHR_GATEWAY_URL", "https://mock-ehr-gateway.internal/fhir")
 
-    def push_report(self, fhir_json: str):
+    def push_report(self, fhir_json: str, is_retry: bool = False):
         """Pushes the report to a hospital's FHIR server with robust retry logic."""
         from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
         import requests
@@ -108,8 +114,11 @@ class EHRGateway:
         try:
             return _execute_push()
         except Exception as e:
-            self.logger.error(f"[EHR Gateway] All push attempts failed: {e}. Writing to Dead Letter Queue (DLQ).")
-            self._write_to_dlq(fhir_json, e)
+            if not is_retry:
+                self.logger.error(f"[EHR Gateway] All push attempts failed: {e}. Writing to Dead Letter Queue (DLQ).")
+                self._write_to_dlq(fhir_json, e)
+            else:
+                self.logger.error(f"[EHR Gateway] Retry push attempt failed: {e}.")
             return False
 
     def _write_to_dlq(self, fhir_json: str, exception: Exception):

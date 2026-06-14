@@ -192,30 +192,35 @@ def build_agent() -> ClinicalAgent:
         inference_api_url=os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
     )
 
-# Flaw #11 Fix: Circuit breaker — stop cleanup loop after consecutive failures
+# Flaw #11 Fix: Circuit breaker — alert after consecutive failures, but don't terminate loop
 MAX_CLEANUP_FAILURES = 5
 
 async def cleanup_old_temp_files():
     """Background task to clean up storage older than 1 hour.
-    Flaw #11 Fix: Stops after MAX_CLEANUP_FAILURES consecutive errors instead of spinning forever."""
+    Implements exponential backoff on consecutive failures to prevent permanent shutdown
+    if the remote storage (e.g. MinIO) is transiently unavailable."""
     consecutive_failures = 0
+    base_sleep = 600
     while True:
         try:
             await asyncio.to_thread(storage.cleanup, max_age_seconds=3600)
             consecutive_failures = 0  # Reset on success
+            sleep_time = base_sleep
         except Exception as e:
             consecutive_failures += 1
-            logger.error(f"Error in cleanup task ({consecutive_failures}/{MAX_CLEANUP_FAILURES}): {e}")
+            # Exponential backoff: 600s, 1200s, 2400s, maxing out at 3600s (1 hour)
+            sleep_time = min(base_sleep * (2 ** (consecutive_failures - 1)), 3600)
+            logger.error(f"Error in cleanup task ({consecutive_failures} consecutive failures). Retrying in {sleep_time} seconds: {e}")
             if consecutive_failures >= MAX_CLEANUP_FAILURES:
                 logger.critical(
-                    f"Cleanup task circuit breaker tripped after {MAX_CLEANUP_FAILURES} consecutive failures. "
-                    f"Stopping cleanup loop. Manual intervention required."
+                    f"Cleanup task experienced {consecutive_failures} consecutive failures. "
+                    f"Storage cleanup is impaired. System requires manual check/reboot."
                 )
-                return  # Exit the loop permanently
-        await asyncio.sleep(600)
+        await asyncio.sleep(sleep_time)
 
 async def reconcile_dlq_task():
-    """Background task that polls the Redis DLQ 'medi_chain:dlq' and retries pushes to the EHR."""
+    """Background task that polls the Redis DLQ 'medi_chain:dlq' and retries pushes to the EHR.
+    Resolves Flaw #1 by ensuring failed retries are explicitly pushed back to the DLQ tail."""
     if not use_redis:
         logger.info("[DLQ Reconciler] Redis is not enabled. Skipping DLQ reconciliation worker.")
         return
@@ -246,11 +251,15 @@ async def reconcile_dlq_task():
                         
                         logger.info(f"[DLQ Reconciler] Attempting to reconcile report from DLQ...")
                         loop = asyncio.get_running_loop()
-                        success = await loop.run_in_executor(None, ehr_gateway.push_report, fhir_json)
+                        # Pass is_retry=True to avoid duplicate DLQ writes inside push_report
+                        success = await loop.run_in_executor(None, ehr_gateway.push_report, fhir_json, True)
                         if success:
                             logger.info("[DLQ Reconciler] Successfully reconciled report.")
                         else:
-                            logger.warning("[DLQ Reconciler] Re-push failed. Payload rewritten to DLQ.")
+                            logger.warning("[DLQ Reconciler] Re-push failed. Pushing payload back to the tail of the DLQ.")
+                            await loop.run_in_executor(None, r.rpush, "medi_chain:dlq", item_json)
+                            # Wait brief period on push failure before checking queue again to prevent CPU pegging
+                            await asyncio.sleep(5)
                 except Exception as parse_err:
                     logger.error(f"[DLQ Reconciler] Failed to process DLQ item: {parse_err}. Item content: {item_json}")
             else:

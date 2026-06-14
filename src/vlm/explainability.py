@@ -131,9 +131,9 @@ class VisualExplainer:
         grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
         grayscale_cam = grayscale_cam[0, :]
 
-        # Overlay on image (ensure they are the same size)
-        img_resized = cv2.resize(rgb_img, (grayscale_cam.shape[1], grayscale_cam.shape[0]))
-        visualization = show_cam_on_image(img_resized, grayscale_cam, use_rgb=True)
+        # Resize grayscale CAM up to original image dimensions for high-resolution overlay (Fixes Flaw #2)
+        cam_resized = cv2.resize(grayscale_cam, (rgb_img.shape[1], rgb_img.shape[0]))
+        visualization = show_cam_on_image(rgb_img, cam_resized, use_rgb=True)
         
         if output_path:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)

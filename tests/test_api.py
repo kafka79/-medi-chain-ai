@@ -130,13 +130,17 @@ async def test_cleanup_circuit_breaker(monkeypatch):
     sleep_calls = []
     async def mock_sleep(seconds):
         sleep_calls.append(seconds)
-        # return immediately
+        if len(sleep_calls) >= 5:
+            # Raise an error to break the infinite loop once we verify the backoff sequence
+            raise asyncio.CancelledError("Test completed successfully")
         
     monkeypatch.setattr(asyncio, "sleep", mock_sleep)
     
-    # Run the cleanup task, which should terminate due to the circuit breaker
-    await api_main.cleanup_old_temp_files()
-    
-    # It should fail 5 times, then return, sleeping 4 times in between
-    assert len(sleep_calls) == 4
+    # Run the cleanup task, which should run with exponential backoff
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await api_main.cleanup_old_temp_files()
+        
+    assert "Test completed successfully" in str(exc_info.value)
+    # Verify exponential backoff: 600s, 1200s, 2400s, 3600s, 3600s
+    assert sleep_calls == [600, 1200, 2400, 3600, 3600]
 
