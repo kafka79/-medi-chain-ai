@@ -218,9 +218,24 @@ async def cleanup_old_temp_files():
                 )
         await asyncio.sleep(sleep_time)
 
+def _send_system_alert(title: str, message: str):
+    """Send critical system alert to external webhook (Slack, PagerDuty, etc.)."""
+    logger.critical(f"CRITICAL SYSTEM ALERT: {title} — {message}")
+    webhook_url = os.getenv("DRIFT_ALERT_WEBHOOK_URL", "")
+    if webhook_url:
+        try:
+            import requests
+            payload = {
+                "text": f"🚨 *{title}*\n{message}\n_Timestamp: {datetime.now(timezone.utc).isoformat()}_"
+            }
+            requests.post(webhook_url, json=payload, timeout=5)
+        except Exception as e:
+            logger.error(f"Failed to send connection alert webhook: {e}")
+
 async def reconcile_dlq_task():
     """Background task that polls the Redis DLQ 'medi_chain:dlq' and retries pushes to the EHR.
-    Resolves Flaw #1 by ensuring failed retries are explicitly pushed back to the DLQ tail."""
+    Resolves Flaw #1 by ensuring failed retries are explicitly pushed back to the DLQ tail.
+    Routes permanently failing payloads to a poison DLQ after 3 failed attempts to avoid infinite loops."""
     if not use_redis:
         logger.info("[DLQ Reconciler] Redis is not enabled. Skipping DLQ reconciliation worker.")
         return
@@ -256,8 +271,30 @@ async def reconcile_dlq_task():
                         if success:
                             logger.info("[DLQ Reconciler] Successfully reconciled report.")
                         else:
-                            logger.warning("[DLQ Reconciler] Re-push failed. Pushing payload back to the tail of the DLQ.")
-                            await loop.run_in_executor(None, r.rpush, "medi_chain:dlq", item_json)
+                            retry_count = item.get("retry_count", 0) + 1
+                            item["retry_count"] = retry_count
+                            if retry_count >= 3:
+                                logger.critical(f"[DLQ Reconciler] Report push failed {retry_count} times. Routing to POISON DLQ.")
+                                await loop.run_in_executor(None, r.rpush, "medi_chain:dlq:poison", json.dumps(item))
+                                try:
+                                    poison_dir = Path("temp/dlq/poison")
+                                    poison_dir.mkdir(parents=True, exist_ok=True)
+                                    filename = f"poison_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
+                                    local_path = poison_dir / filename
+                                    with open(local_path, "w") as f:
+                                        json.dump(item, f, indent=2)
+                                    logger.info(f"[DLQ Reconciler] Saved poison report locally to {local_path}")
+                                except Exception as local_err:
+                                    logger.error(f"[DLQ Reconciler] Failed to save poison report locally: {local_err}")
+                                
+                                _send_system_alert(
+                                    "DLQ Poison Threshold Exceeded",
+                                    f"Report push failed {retry_count} times and has been escalated to poison DLQ. Error: {item.get('error')}"
+                                )
+                            else:
+                                logger.warning(f"[DLQ Reconciler] Re-push failed. Pushing payload back to the tail of the DLQ (Retry count: {retry_count}).")
+                                await loop.run_in_executor(None, r.rpush, "medi_chain:dlq", json.dumps(item))
+                            
                             # Wait brief period on push failure before checking queue again to prevent CPU pegging
                             await asyncio.sleep(5)
                 except Exception as parse_err:
@@ -364,8 +401,7 @@ def create_app() -> FastAPI:
             with open(local_pdf_path, "wb") as f:
                 shutil.copyfileobj(history.file, f)
             
-            async with inference_semaphore:
-                result = await agent.run(local_img_path, local_pdf_path)
+            result = await agent.run(local_img_path, local_pdf_path)
                 
             # Monitor for drift (prediction drift and covariate shift)
             background_tasks.add_task(drift_detector.add_prediction, result['diagnosis']['probabilities'], result.get('visual_features'))

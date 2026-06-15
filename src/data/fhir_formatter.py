@@ -138,7 +138,8 @@ class EHRGateway:
             payload = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "error": str(exception),
-                "payload": parsed_payload
+                "payload": parsed_payload,
+                "retry_count": 0
             }
             
             # 1. Attempt to write to Redis shared list as the primary tier (replicated DLQ)

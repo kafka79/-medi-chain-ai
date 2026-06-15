@@ -131,9 +131,32 @@ class VisualExplainer:
         grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
         grayscale_cam = grayscale_cam[0, :]
 
-        # Resize grayscale CAM up to original image dimensions for high-resolution overlay (Fixes Flaw #2)
-        cam_resized = cv2.resize(grayscale_cam, (rgb_img.shape[1], rgb_img.shape[0]))
-        visualization = show_cam_on_image(rgb_img, cam_resized, use_rgb=True)
+        # Resize grayscale CAM up to original image dimensions with aspect-ratio preservation (mapping the CenterCrop box)
+        H, W = rgb_img.shape[0], rgb_img.shape[1]
+        cam_full = np.zeros((H, W), dtype=np.float32)
+        
+        # Center-crop mapping (BiomedCLIP standard preprocessor resizes the shortest edge to 224, then center-crops to 224x224)
+        if W < H:
+            # Portrait: cropped to a W x W square in the vertical center of the image
+            box_w = W
+            box_h = W
+            top = (H - W) // 2
+            bottom = top + W
+            left = 0
+            right = W
+        else:
+            # Landscape: cropped to an H x H square in the horizontal center of the image
+            box_w = H
+            box_h = H
+            top = 0
+            bottom = H
+            left = (W - H) // 2
+            right = left + H
+            
+        cam_resized = cv2.resize(grayscale_cam, (box_w, box_h))
+        cam_full[top:bottom, left:right] = cam_resized
+
+        visualization = show_cam_on_image(rgb_img, cam_full, use_rgb=True)
         
         if output_path:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
