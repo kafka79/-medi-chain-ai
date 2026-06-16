@@ -65,3 +65,9 @@ def mock_inference_api():
         }
         mock_post.return_value = mock_response
         yield mock_post
+
+@pytest.fixture(autouse=True)
+def mock_open_clip_tokenizer():
+    """Mock open_clip.get_tokenizer to raise an exception, avoiding network calls during tests."""
+    with patch("open_clip.get_tokenizer", side_effect=RuntimeError("Mock network block for offline testing")):
+        yield

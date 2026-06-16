@@ -63,9 +63,12 @@ class VisualExplainer:
                     if "resblocks" in name:
                         self.target_layers = [module]
                         
-        # Fallback to the model itself if all fails
+        # Raise an exception if layer resolution fails
         if not self.target_layers:
-            self.target_layers = [model.visual]
+            raise RuntimeError(
+                "Failed to dynamically resolve Vision Transformer (ViT) target layers for Grad-CAM. "
+                "Check visual encoder model attributes (e.g. trunk, transformer)."
+            )
 
         # Encode diagnostic classes text to compute visual-text similarity for Grad-CAM
         from src.models.fusion import DIAGNOSTIC_CLASSES
@@ -109,8 +112,9 @@ class VisualExplainer:
 
     def generate_heatmap(self, image_path, target_category=None, output_path=None):
         """Generate Grad-CAM heatmap for an image."""
-        rgb_img = np.array(Image.open(image_path).convert('RGB')).astype(np.float32) / 255.0
-        input_tensor = self.preprocess(Image.open(image_path)).unsqueeze(0).to(next(self.model.parameters()).device)
+        with Image.open(image_path) as pil_img:
+            rgb_img = np.array(pil_img.convert('RGB')).astype(np.float32) / 255.0
+            input_tensor = self.preprocess(pil_img).unsqueeze(0).to(next(self.model.parameters()).device)
 
         if self.class_embeddings is not None:
             # Construct similarity-based wrapper so ClassifierOutputTarget targets actual similarity scores

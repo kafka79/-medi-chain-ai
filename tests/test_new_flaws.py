@@ -76,6 +76,9 @@ def test_check_prediction_drift_class_count_mismatch():
 
 @pytest.mark.asyncio
 async def test_dlq_poison_routing():
+    import shutil
+    shutil.rmtree("temp/dlq", ignore_errors=True)
+    
     mock_redis = MagicMock()
     # First call returns a JSON payload, second returns None
     payload_dict = {

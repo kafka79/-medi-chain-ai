@@ -127,33 +127,37 @@ class EHRGateway:
         import os
         from pathlib import Path
         
+        filename = f"failed_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
+        
         try:
-            filename = f"failed_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
-            
-            try:
-                parsed_payload = json.loads(fhir_json) if isinstance(fhir_json, str) else fhir_json
-            except json.JSONDecodeError:
-                parsed_payload = fhir_json  # Fallback to raw string if invalid JSON
+            parsed_payload = json.loads(fhir_json) if isinstance(fhir_json, str) else fhir_json
+        except json.JSONDecodeError:
+            parsed_payload = fhir_json  # Fallback to raw string if invalid JSON
 
-            payload = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "error": str(exception),
-                "payload": parsed_payload,
-                "retry_count": 0
-            }
-            
-            # 1. Attempt to write to Redis shared list as the primary tier (replicated DLQ)
-            try:
-                import redis
-                redis_host = os.getenv("REDIS_HOST", "redis")
-                redis_port = int(os.getenv("REDIS_PORT", "6379"))
-                r = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True, socket_connect_timeout=1)
-                r.rpush("medi_chain:dlq", json.dumps(payload))
-                self.logger.info("[EHR Gateway] Replicated Redis DLQ Synced: Pushed failed payload to redis list 'medi_chain:dlq'")
-            except Exception as redis_err:
-                self.logger.warning(f"[EHR Gateway] Redis DLQ upload failed: {redis_err}")
-            
-            # 2. Write locally first to a persistent local DLQ folder (secondary backup)
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "error": str(exception),
+            "payload": parsed_payload,
+            "retry_count": 0
+        }
+        
+        redis_success = False
+        local_success = False
+        
+        # 1. Attempt to write to Redis shared list as the primary tier (replicated DLQ)
+        try:
+            import redis
+            redis_host = os.getenv("REDIS_HOST", "redis")
+            redis_port = int(os.getenv("REDIS_PORT", "6379"))
+            r = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True, socket_connect_timeout=1)
+            r.rpush("medi_chain:dlq", json.dumps(payload))
+            self.logger.info("[EHR Gateway] Replicated Redis DLQ Synced: Pushed failed payload to redis list 'medi_chain:dlq'")
+            redis_success = True
+        except Exception as redis_err:
+            self.logger.warning(f"[EHR Gateway] Redis DLQ upload failed: {redis_err}")
+        
+        # 2. Write locally first to a persistent local DLQ folder (secondary backup)
+        try:
             dlq_dir = Path("temp/dlq")
             dlq_dir.mkdir(parents=True, exist_ok=True)
             local_path = dlq_dir / filename
@@ -161,8 +165,12 @@ class EHRGateway:
             with open(local_path, "w") as f:
                 json.dump(payload, f, indent=2)
             self.logger.critical(f"[EHR Gateway] Local DLQ Written: Saved failed FHIR payload locally to {local_path}")
-            
-            # 3. Attempt to backup to remote S3 bucket, but do not raise if it fails (tertiary backup)
+            local_success = True
+        except Exception as local_err:
+            self.logger.error(f"[EHR Gateway] Local DLQ file write failed: {local_err}")
+        
+        # 3. Attempt to backup to remote S3 bucket, but do not raise if it fails (tertiary backup)
+        if local_success:
             try:
                 from src.utils.storage import S3StorageProvider
                 storage = S3StorageProvider(endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"), bucket="dlq")
@@ -173,8 +181,10 @@ class EHRGateway:
             except Exception as s3_err:
                 self.logger.warning(f"[EHR Gateway] S3 DLQ upload failed (expected if network is down): {s3_err}")
                 
-        except Exception as dlq_err:
-            self.logger.error(f"[EHR Gateway] Failed to write to any DLQ: {dlq_err}")
+        if not redis_success and not local_success:
+            raise RuntimeError(
+                f"Failed to persist report to any DLQ. Redis failed, and local disk failed: {exception}"
+            )
 
 if __name__ == "__main__":
     formatter = FHIRFormatter()

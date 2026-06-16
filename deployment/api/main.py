@@ -232,81 +232,184 @@ def _send_system_alert(title: str, message: str):
         except Exception as e:
             logger.error(f"Failed to send connection alert webhook: {e}")
 
-async def reconcile_dlq_task():
-    """Background task that polls the Redis DLQ 'medi_chain:dlq' and retries pushes to the EHR.
-    Resolves Flaw #1 by ensuring failed retries are explicitly pushed back to the DLQ tail.
-    Routes permanently failing payloads to a poison DLQ after 3 failed attempts to avoid infinite loops."""
-    if not use_redis:
-        logger.info("[DLQ Reconciler] Redis is not enabled. Skipping DLQ reconciliation worker.")
-        return
 
-    import redis
-    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+async def reconcile_dlq_task():
+    """Background task that polls the Redis DLQ 'medi_chain:dlq' and the local disk folder 'temp/dlq'
+    and retries pushes to the EHR. Resolves Flaws #4 and #5 by supporting both Redis and local disk DLQs,
+    and running up to 5 concurrent pushes using asyncio task scheduling and semaphores."""
     
-    try:
-        r = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=2)
-    except Exception as e:
-        logger.error(f"[DLQ Reconciler] Failed to connect to Redis: {e}")
-        return
-        
-    logger.info("[DLQ Reconciler] Started background DLQ reconciliation worker.")
+    r = None
+    if use_redis:
+        import redis
+        redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+        try:
+            r = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=2)
+            logger.info("[DLQ Reconciler] Connected to Redis for DLQ reconciliation.")
+        except Exception as e:
+            logger.error(f"[DLQ Reconciler] Failed to connect to Redis: {e}. Falling back to local DLQ only.")
+            
+    logger.info("[DLQ Reconciler] Started background concurrent DLQ reconciliation worker.")
     
+    dlq_semaphore = asyncio.Semaphore(5)
+    loop = asyncio.get_running_loop()
+    active_tasks = set()
+    
+    async def process_reconciliation(item: dict, source_type: str, identifier: Optional[str]):
+        try:
+            payload = item.get("payload")
+            if not payload:
+                return
+            
+            if not isinstance(payload, str):
+                fhir_json = json.dumps(payload)
+            else:
+                fhir_json = payload
+                
+            logger.info(f"[DLQ Reconciler] Attempting to reconcile report from {source_type}...")
+            
+            # Pass is_retry=True to avoid duplicate DLQ writes inside push_report
+            success = await loop.run_in_executor(None, ehr_gateway.push_report, fhir_json, True)
+            
+            if success:
+                logger.info(f"[DLQ Reconciler] Successfully reconciled report from {source_type}.")
+                if source_type == "local" and identifier:
+                    try:
+                        Path(identifier).unlink()
+                    except Exception as e:
+                        logger.error(f"[DLQ Reconciler] Failed to delete resolved local DLQ file {identifier}: {e}")
+            else:
+                retry_count = item.get("retry_count", 0) + 1
+                item["retry_count"] = retry_count
+                
+                if retry_count >= 3:
+                    logger.critical(f"[DLQ Reconciler] Report push failed {retry_count} times. Routing to POISON DLQ.")
+                    
+                    # Escalation path 1: save locally under temp/dlq/poison/
+                    try:
+                        poison_dir = Path("temp/dlq/poison")
+                        poison_dir.mkdir(parents=True, exist_ok=True)
+                        filename = f"poison_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
+                        local_path = poison_dir / filename
+                        with open(local_path, "w") as f:
+                            json.dump(item, f, indent=2)
+                        logger.info(f"[DLQ Reconciler] Saved poison report locally to {local_path}")
+                    except Exception as local_err:
+                        logger.error(f"[DLQ Reconciler] Failed to save poison report locally: {local_err}")
+                    
+                    # Escalation path 2: push to Redis poison DLQ if Redis is enabled
+                    if use_redis and r:
+                        try:
+                            await loop.run_in_executor(None, r.rpush, "medi_chain:dlq:poison", json.dumps(item))
+                        except Exception as redis_err:
+                            logger.error(f"[DLQ Reconciler] Failed to push to Redis poison DLQ: {redis_err}")
+                    
+                    # Escalation path 3: Delete local file if it was a local item
+                    if source_type == "local" and identifier:
+                        try:
+                            Path(identifier).unlink()
+                        except Exception as e:
+                            logger.error(f"[DLQ Reconciler] Failed to delete poisoned local DLQ file {identifier}: {e}")
+                    
+                    _send_system_alert(
+                        "DLQ Poison Threshold Exceeded",
+                        f"Report push failed {retry_count} times and has been escalated to poison DLQ. Error: {item.get('error')}"
+                    )
+                else:
+                    if source_type == "redis" and r:
+                        logger.warning(f"[DLQ Reconciler] Re-push failed. Pushing payload back to the tail of the Redis DLQ (Retry count: {retry_count}).")
+                        try:
+                            await loop.run_in_executor(None, r.rpush, "medi_chain:dlq", json.dumps(item))
+                        except Exception as redis_err:
+                            logger.error(f"[DLQ Reconciler] Failed to re-queue back to Redis DLQ: {redis_err}")
+                    elif source_type == "local" and identifier:
+                        logger.warning(f"[DLQ Reconciler] Local re-push failed. Saving updated retry count to local file {identifier}.")
+                        try:
+                            with open(identifier, "w") as f:
+                                json.dump(item, f, indent=2)
+                            orig_path = Path(identifier).with_suffix("")
+                            Path(identifier).rename(orig_path)
+                        except Exception as local_err:
+                            logger.error(f"[DLQ Reconciler] Failed to write updated local DLQ retry count: {local_err}")
+        except Exception as err:
+            logger.error(f"[DLQ Reconciler] Error processing DLQ item: {err}")
+        finally:
+            dlq_semaphore.release()
+            
     while True:
         try:
-            item_json = r.lpop("medi_chain:dlq")
-            if item_json:
+            # Wait until a semaphore slot is available
+            await dlq_semaphore.acquire()
+            
+            item_found = False
+            
+            # 1. Try to fetch from Redis DLQ if configured
+            if use_redis and r:
                 try:
-                    item = json.loads(item_json)
-                    payload = item.get("payload")
-                    if payload:
-                        if not isinstance(payload, str):
-                            fhir_json = json.dumps(payload)
-                        else:
-                            fhir_json = payload
+                    item_json = await loop.run_in_executor(None, r.lpop, "medi_chain:dlq")
+                    if item_json:
+                        item = json.loads(item_json)
+                        task = asyncio.create_task(process_reconciliation(item, "redis", None))
+                        active_tasks.add(task)
+                        task.add_done_callback(active_tasks.discard)
+                        item_found = True
+                except Exception as redis_err:
+                    logger.error(f"[DLQ Reconciler] Redis pull error: {redis_err}")
+                    
+            # 2. Try to fetch from local DLQ files if no Redis item was found
+            if not item_found:
+                dlq_dir = Path("temp/dlq")
+                if dlq_dir.exists() and dlq_dir.is_dir():
+                    try:
+                        local_files = list(dlq_dir.glob("failed_report_*.json"))
+                    except Exception as glob_err:
+                        logger.error(f"[DLQ Reconciler] Glob error: {glob_err}")
+                        local_files = []
                         
-                        logger.info(f"[DLQ Reconciler] Attempting to reconcile report from DLQ...")
-                        loop = asyncio.get_running_loop()
-                        # Pass is_retry=True to avoid duplicate DLQ writes inside push_report
-                        success = await loop.run_in_executor(None, ehr_gateway.push_report, fhir_json, True)
-                        if success:
-                            logger.info("[DLQ Reconciler] Successfully reconciled report.")
-                        else:
-                            retry_count = item.get("retry_count", 0) + 1
-                            item["retry_count"] = retry_count
-                            if retry_count >= 3:
-                                logger.critical(f"[DLQ Reconciler] Report push failed {retry_count} times. Routing to POISON DLQ.")
-                                await loop.run_in_executor(None, r.rpush, "medi_chain:dlq:poison", json.dumps(item))
+                    for file_path in local_files:
+                        processing_path = file_path.with_suffix(".json.processing")
+                        try:
+                            file_path.rename(processing_path)
+                        except Exception:
+                            # Skip if already locked by another worker
+                            continue
+                        
+                        try:
+                            with open(processing_path, "r") as f:
+                                item = json.load(f)
+                            task = asyncio.create_task(process_reconciliation(item, "local", str(processing_path)))
+                            active_tasks.add(task)
+                            task.add_done_callback(active_tasks.discard)
+                            item_found = True
+                            break
+                        except Exception as e:
+                            logger.error(f"[DLQ Reconciler] Failed to lock/read local DLQ file {file_path.name}: {e}")
+                            if processing_path.exists():
                                 try:
-                                    poison_dir = Path("temp/dlq/poison")
-                                    poison_dir.mkdir(parents=True, exist_ok=True)
-                                    filename = f"poison_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
-                                    local_path = poison_dir / filename
-                                    with open(local_path, "w") as f:
-                                        json.dump(item, f, indent=2)
-                                    logger.info(f"[DLQ Reconciler] Saved poison report locally to {local_path}")
-                                except Exception as local_err:
-                                    logger.error(f"[DLQ Reconciler] Failed to save poison report locally: {local_err}")
-                                
-                                _send_system_alert(
-                                    "DLQ Poison Threshold Exceeded",
-                                    f"Report push failed {retry_count} times and has been escalated to poison DLQ. Error: {item.get('error')}"
-                                )
-                            else:
-                                logger.warning(f"[DLQ Reconciler] Re-push failed. Pushing payload back to the tail of the DLQ (Retry count: {retry_count}).")
-                                await loop.run_in_executor(None, r.rpush, "medi_chain:dlq", json.dumps(item))
-                            
-                            # Wait brief period on push failure before checking queue again to prevent CPU pegging
-                            await asyncio.sleep(5)
-                except Exception as parse_err:
-                    logger.error(f"[DLQ Reconciler] Failed to process DLQ item: {parse_err}. Item content: {item_json}")
-            else:
+                                    processing_path.rename(file_path)
+                                except Exception:
+                                    pass
+                                    
+            if not item_found:
+                # Release semaphore and sleep if no work
+                dlq_semaphore.release()
                 await asyncio.sleep(10)
         except asyncio.CancelledError:
             logger.info("[DLQ Reconciler] DLQ reconciler task cancelled.")
             break
         except Exception as e:
             logger.error(f"[DLQ Reconciler] Error in DLQ reconciliation loop: {e}")
+            if not item_found:
+                try:
+                    dlq_semaphore.release()
+                except ValueError:
+                    pass
             await asyncio.sleep(10)
+
+    # Await any remaining active tasks to ensure graceful shutdown and test synchronization
+    if active_tasks:
+        logger.info(f"[DLQ Reconciler] Awaiting {len(active_tasks)} pending reconciliation tasks...")
+        await asyncio.gather(*active_tasks, return_exceptions=True)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -401,7 +504,8 @@ def create_app() -> FastAPI:
             with open(local_pdf_path, "wb") as f:
                 shutil.copyfileobj(history.file, f)
             
-            result = await agent.run(local_img_path, local_pdf_path)
+            async with inference_semaphore:
+                result = await agent.run(local_img_path, local_pdf_path)
                 
             # Monitor for drift (prediction drift and covariate shift)
             background_tasks.add_task(drift_detector.add_prediction, result['diagnosis']['probabilities'], result.get('visual_features'))

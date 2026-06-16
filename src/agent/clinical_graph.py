@@ -198,9 +198,10 @@ class ClinicalAgent:
         # Get visual features (already list from API)
         v = state['visual_features']
             
-        # Get text features from history
+        # Get text features from history and pubmed citations (incorporating RAG context to update classification input)
         history = state['history_data']
-        text_content = f"{history.get('chief_complaint', '')} {history.get('history_present_illness', '')} {history.get('labs', '')}"
+        citations_text = " ".join([c.get("text", "") for c in state.get("pubmed_citations", []) if c.get("text")])
+        text_content = f"{history.get('chief_complaint', '')} {history.get('history_present_illness', '')} {history.get('labs', '')} {citations_text}".strip()
         
         # Embed text using remote API
         try:

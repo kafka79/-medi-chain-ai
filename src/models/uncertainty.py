@@ -20,11 +20,6 @@ class UncertaintyEstimator:
         To make this clear, we return both "std_deviation" (for API compatibility) 
         and "fusion_head_variance".
         """
-        # Instantiate a feature-level dropout to approximate visual backbone/feature uncertainty
-        # using a first-principles Monte Carlo perturbation approach.
-        feature_dropout = torch.nn.Dropout(p=0.1)
-        feature_dropout.train()
-        
         self.model.eval()
         
         try:
@@ -41,9 +36,7 @@ class UncertaintyEstimator:
             # inference-time uncertainty estimation, which benefits from no-grad memory optimization and speed.
             with torch.no_grad():
                 for _ in range(num_passes):
-                    # Perturb vision embeddings using Monte Carlo dropout to propagate visual feature uncertainty
-                    perturbed_v = feature_dropout(vision_emb)
-                    _, logits = self.model(perturbed_v, text_emb)
+                    _, logits = self.model(vision_emb, text_emb)
                     all_logits.append(torch.softmax(logits, dim=1))
         finally:
             self.model.eval()
