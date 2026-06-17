@@ -3,6 +3,7 @@ from fhir.resources.identifier import Identifier
 from fhir.resources.codeableconcept import CodeableConcept
 from fhir.resources.coding import Coding
 from fhir.resources.reference import Reference
+from fhir.resources.extension import Extension
 import json
 from datetime import datetime, timezone
 
@@ -22,14 +23,24 @@ class FHIRFormatter:
             f"Primary finding: {diagnosis_data.get('primary_finding', 'None')}. "
             f"Differential: {differential_str}"
         )
+        
+        # Structure warning flags as standard FHIR Extensions rather than raw strings in text blocks
+        extensions = []
         if diagnosis_data.get('escalation_required', False):
-            conclusion += " [WARNING: High uncertainty / out-of-distribution detected. Escalated for human review.]"
+            extensions.append(
+                Extension(
+                    url="http://medi-chain.io/fhir/StructureDefinition/escalation-required",
+                    valueBoolean=True
+                )
+            )
 
+        patient_id = diagnosis_data.get('patient_id', 'Unknown')
         return DiagnosticReport(
             status=status,
+            extension=extensions,
             identifier=[
                 Identifier(
-                    value=f"RPT-{diagnosis_data.get('patient_id', 'UNK')}-{int(datetime.now().timestamp())}"
+                    value=f"RPT-{patient_id}-{int(datetime.now().timestamp())}"
                 )
             ],
             category=[
@@ -52,7 +63,10 @@ class FHIRFormatter:
                     )
                 ]
             ),
-            subject=Reference(display=f"Patient {diagnosis_data.get('patient_id', 'Unknown')}"),
+            subject=Reference(
+                reference=f"Patient/{patient_id}",
+                display=f"Patient {patient_id}"
+            ),
             effectiveDateTime=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             conclusion=conclusion,
         )

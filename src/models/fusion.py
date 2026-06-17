@@ -8,8 +8,7 @@ NUM_CLASSES = len(DIAGNOSTIC_CLASSES)
 class AttentionFusion(nn.Module):
     """
     Addresses Flaw #5: Overengineered Multimodal Fusion.
-    Replaces the mathematically excessive sequence-length-2 Self-Attention block
-    with a first-principles projection and cross-modal gating mechanism.
+    Implements a first-principles true cross-modal Multi-Head Attention layer.
     Retains norm1, norm2, and ffn properties for backward compatibility with testing suites.
     """
     def __init__(self, vision_dim=512, text_dim=768, hidden_dim=512, num_classes=NUM_CLASSES):
@@ -19,15 +18,9 @@ class AttentionFusion(nn.Module):
         self.v_proj = nn.Linear(vision_dim, hidden_dim)
         self.t_proj = nn.Linear(text_dim, hidden_dim)
         
-        # Gating networks
-        self.v_gate = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Sigmoid()
-        )
-        self.t_gate = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Sigmoid()
-        )
+        # Cross-modal multi-head attention blocks
+        self.cross_attn_v2t = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
+        self.cross_attn_t2v = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
         
         self.norm1 = nn.LayerNorm(hidden_dim)
         
@@ -54,10 +47,19 @@ class AttentionFusion(nn.Module):
         v = self.v_proj(vision_emb)  # Shape: (batch, hidden_dim)
         t = self.t_proj(text_emb)    # Shape: (batch, hidden_dim)
         
-        # Cross-modal gating:
-        # The visual representations are gated by the context of text, and vice versa
-        gated_v = v * self.t_gate(t)
-        gated_t = t * self.v_gate(v)
+        # Prepare for MultiheadAttention by adding a sequence dimension of length 1
+        # Shape: (batch, 1, hidden_dim)
+        v_seq = v.unsqueeze(1)
+        t_seq = t.unsqueeze(1)
+        
+        # Cross-modal attention:
+        # Vision query attends to Text key/value, and vice-versa
+        attn_v, _ = self.cross_attn_v2t(query=v_seq, key=t_seq, value=t_seq)
+        attn_t, _ = self.cross_attn_t2v(query=t_seq, key=v_seq, value=v_seq)
+        
+        # Squeeze sequence dimension back
+        gated_v = attn_v.squeeze(1)
+        gated_t = attn_t.squeeze(1)
         
         # Additive fusion and first layer norm
         fused = self.norm1(gated_v + gated_t)

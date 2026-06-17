@@ -196,11 +196,11 @@ class DriftDetector:
         
         # Validate prediction dimensions (prevent IndexError on class mismatch)
         if current.shape[1] != self.baseline.shape[1]:
-            logger.error(
+            msg = (
                 f"Prediction class count mismatch: baseline={self.baseline.shape[1]}, "
-                f"current={current.shape[1]}. Resetting baseline to current."
+                f"current={current.shape[1]}. Baseline will NOT be reset. Manual rollback / intervention required."
             )
-            self._save_baseline(current_probs)
+            _send_alert("Model Architecture Mismatch", msg)
             return False
 
         drift_detected = False
@@ -215,10 +215,35 @@ class DriftDetector:
         
         return drift_detected
 
+    def _compute_mmd(self, X: np.ndarray, Y: np.ndarray, gamma: float = None) -> float:
+        """Computes Maximum Mean Discrepancy (MMD) with RBF kernel between two distributions X and Y."""
+        n = X.shape[0]
+        m = Y.shape[0]
+        
+        XX = np.sum(X**2, axis=1, keepdims=True)
+        YY = np.sum(Y**2, axis=1, keepdims=True)
+        XY = np.dot(X, Y.T)
+        
+        dist_XX = XX + XX.T - 2 * np.dot(X, X.T)
+        dist_YY = YY + YY.T - 2 * np.dot(Y, Y.T)
+        dist_XY = XX + YY.T - 2 * XY
+        
+        if gamma is None:
+            all_dists = np.concatenate([dist_XX.ravel(), dist_YY.ravel(), dist_XY.ravel()])
+            median_dist = np.median(all_dists)
+            gamma = 1.0 / (median_dist + 1e-8)
+            
+        K_XX = np.exp(-gamma * dist_XX)
+        K_YY = np.exp(-gamma * dist_YY)
+        K_XY = np.exp(-gamma * dist_XY)
+        
+        mmd = np.sum(K_XX) / (n * n) - 2 * np.sum(K_XY) / (n * m) + np.sum(K_YY) / (m * m)
+        return float(mmd)
+
     def check_covariate_shift(self, current_features: list):
         """
         Monitors Covariate Shift P(X) on visual features.
-        Compares visual embeddings of the current window against a baseline using cosine similarity.
+        Compares visual embeddings of the current window against a baseline using MMD and cosine similarity.
         """
         if self.disabled or not current_features:
             return False
@@ -228,7 +253,7 @@ class DriftDetector:
             self._save_features_baseline(current_features)
             return False
 
-        # Flaw #12 Fix: Validate feature dimensions before creating numpy array
+        # Validate feature dimensions before creating numpy array
         current = np.array(current_features)
         if current.dtype == object:
             logger.error(
@@ -251,25 +276,31 @@ class DriftDetector:
             self._save_features_baseline(current_features)
             return False
             
-        # Compute mean feature embeddings
+        # 1. Compute MMD (Maximum Mean Discrepancy) - First-principles multidimensional feature shift
+        mmd_value = self._compute_mmd(self.features_baseline, current)
+        logger.info(f"Visual covariate shift analysis - Maximum Mean Discrepancy (MMD): {mmd_value:.6f}")
+
+        # 2. Compute Cosine Similarity between baseline and current mean feature vectors
         mean_baseline = np.mean(self.features_baseline, axis=0)
         mean_current = np.mean(current, axis=0)
         
-        # Calculate Cosine Similarity between baseline and current mean feature vectors
         norm_b = np.linalg.norm(mean_baseline)
         norm_c = np.linalg.norm(mean_current)
         
-        if norm_b == 0 or norm_c == 0:
-            return False
-            
-        cosine_sim = np.dot(mean_baseline, mean_current) / (norm_b * norm_c)
-        logger.info(f"Visual covariate shift analysis - Cosine Similarity: {cosine_sim:.4f}")
+        cosine_sim = 1.0
+        if norm_b > 0 and norm_c > 0:
+            cosine_sim = np.dot(mean_baseline, mean_current) / (norm_b * norm_c)
+            logger.info(f"Visual covariate shift analysis - Cosine Similarity: {cosine_sim:.4f}")
         
-        # A drop in cosine similarity indicates visual covariate shift (e.g., scanner change, noise)
-        if cosine_sim < 0.95:
+        # Alert if MMD exceeds threshold (indicating distribution shift) or cosine similarity falls below threshold
+        mmd_threshold = 0.05
+        cosine_threshold = 0.95
+        
+        if mmd_value > mmd_threshold or cosine_sim < cosine_threshold:
             msg = (
                 f"Significant Covariate Shift P(X) detected in visual feature space! "
-                f"Cosine similarity to baseline is {cosine_sim:.4f} (threshold: 0.95)."
+                f"MMD: {mmd_value:.6f} (threshold: {mmd_threshold}), "
+                f"Cosine Similarity: {cosine_sim:.4f} (threshold: {cosine_threshold})."
             )
             _send_alert("Covariate Shift", msg)
             return True

@@ -65,11 +65,11 @@ def test_check_prediction_drift_class_count_mismatch():
     # Send current predictions with 6 classes (mismatch)
     current_probs_mismatch = (np.random.rand(100, 6)).tolist()
     
-    # Call check_prediction_drift, it should reset the baseline and return False instead of raising IndexError
+    # Call check_prediction_drift, it should NOT reset the baseline and return False
     try:
         result = detector.check_prediction_drift(current_probs_mismatch)
         assert result is False
-        detector._save_baseline.assert_called_once_with(current_probs_mismatch)
+        detector._save_baseline.assert_not_called()
     except IndexError:
         pytest.fail("check_prediction_drift threw IndexError on class count mismatch!")
 
@@ -87,7 +87,7 @@ async def test_dlq_poison_routing():
         "payload": {"resourceType": "DiagnosticReport"},
         "retry_count": 2  # Already failed twice
     }
-    mock_redis.lpop.side_effect = [json.dumps(payload_dict), None]
+    mock_redis.rpoplpush.side_effect = [json.dumps(payload_dict), None]
     
     # Mock sleep to raise CancelledError so the infinite loop terminates immediately
     async def mock_sleep(seconds):

@@ -155,10 +155,62 @@ drift_detector = DriftDetector()
 ehr_gateway = EHRGateway()
 feedback_logger = FeedbackLogger(redis_client=redis_client, storage_provider=storage)
 
+class RedisDistributedSemaphore:
+    def __init__(self, r_client, name: str, limit: int):
+        self.redis = r_client
+        self.name = f"medi_chain:semaphore:{name}"
+        self.limit = limit
+        self.local_sem = asyncio.Semaphore(limit)
+        
+    async def __aenter__(self):
+        await self.local_sem.acquire()
+        if self.redis is None:
+            return self
+            
+        acquired = False
+        loop = asyncio.get_running_loop()
+        while not acquired:
+            try:
+                init_script = """
+                local key = KEYS[1]
+                local limit = tonumber(ARGV[1])
+                local exists = redis.call('EXISTS', key)
+                if exists == 0 then
+                    for i = 1, limit do
+                        redis.call('LPUSH', key, 'token')
+                    end
+                    redis.call('EXPIRE', key, 86400)
+                end
+                """
+                await loop.run_in_executor(None, lambda: self.redis.eval(init_script, 1, self.name, self.limit))
+                token = await loop.run_in_executor(None, lambda: self.redis.blpop(self.name, timeout=1))
+                if token:
+                    acquired = True
+            except Exception as e:
+                logger.warning(f"Redis semaphore acquire failed ({e}). Falling back to local lock only.")
+                acquired = True
+                
+            if not acquired:
+                await asyncio.sleep(0.1)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.redis is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: self.redis.rpush(self.name, "token"))
+            except Exception as e:
+                logger.error(f"Redis semaphore release failed: {e}")
+        self.local_sem.release()
+
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
 
-# Global semaphore for model inference
-inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+# Global semaphore for model inference (distributed when Redis is active)
+if use_redis and redis_client:
+    inference_semaphore = RedisDistributedSemaphore(redis_client, "inference", MAX_CONCURRENT_REQUESTS)
+else:
+    inference_semaphore = RedisDistributedSemaphore(None, "inference", MAX_CONCURRENT_REQUESTS)
+
 
 # Flaw #17: Application-level version metadata for audit trail
 APP_VERSION = "1.3.0"
@@ -254,10 +306,12 @@ async def reconcile_dlq_task():
     loop = asyncio.get_running_loop()
     active_tasks = set()
     
-    async def process_reconciliation(item: dict, source_type: str, identifier: Optional[str]):
+    async def process_reconciliation(item: dict, source_type: str, identifier: Optional[str], item_raw_json: Optional[str] = None):
         try:
             payload = item.get("payload")
             if not payload:
+                if source_type == "redis" and r and item_raw_json:
+                    await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
                 return
             
             if not isinstance(payload, str):
@@ -277,6 +331,11 @@ async def reconcile_dlq_task():
                         Path(identifier).unlink()
                     except Exception as e:
                         logger.error(f"[DLQ Reconciler] Failed to delete resolved local DLQ file {identifier}: {e}")
+                elif source_type == "redis" and r and item_raw_json:
+                    try:
+                        await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
+                    except Exception as e:
+                        logger.error(f"[DLQ Reconciler] Failed to remove processed item from Redis processing queue: {e}")
             else:
                 retry_count = item.get("retry_count", 0) + 1
                 item["retry_count"] = retry_count
@@ -300,6 +359,8 @@ async def reconcile_dlq_task():
                     if use_redis and r:
                         try:
                             await loop.run_in_executor(None, r.rpush, "medi_chain:dlq:poison", json.dumps(item))
+                            if item_raw_json:
+                                await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
                         except Exception as redis_err:
                             logger.error(f"[DLQ Reconciler] Failed to push to Redis poison DLQ: {redis_err}")
                     
@@ -319,6 +380,8 @@ async def reconcile_dlq_task():
                         logger.warning(f"[DLQ Reconciler] Re-push failed. Pushing payload back to the tail of the Redis DLQ (Retry count: {retry_count}).")
                         try:
                             await loop.run_in_executor(None, r.rpush, "medi_chain:dlq", json.dumps(item))
+                            if item_raw_json:
+                                await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
                         except Exception as redis_err:
                             logger.error(f"[DLQ Reconciler] Failed to re-queue back to Redis DLQ: {redis_err}")
                     elif source_type == "local" and identifier:
@@ -345,10 +408,10 @@ async def reconcile_dlq_task():
             # 1. Try to fetch from Redis DLQ if configured
             if use_redis and r:
                 try:
-                    item_json = await loop.run_in_executor(None, r.lpop, "medi_chain:dlq")
+                    item_json = await loop.run_in_executor(None, r.rpoplpush, "medi_chain:dlq", "medi_chain:dlq:processing")
                     if item_json:
                         item = json.loads(item_json)
-                        task = asyncio.create_task(process_reconciliation(item, "redis", None))
+                        task = asyncio.create_task(process_reconciliation(item, "redis", None, item_json))
                         active_tasks.add(task)
                         task.add_done_callback(active_tasks.discard)
                         item_found = True
@@ -359,6 +422,20 @@ async def reconcile_dlq_task():
             if not item_found:
                 dlq_dir = Path("temp/dlq")
                 if dlq_dir.exists() and dlq_dir.is_dir():
+                    # Reclaim stale .processing files
+                    try:
+                        processing_files = list(dlq_dir.glob("failed_report_*.json.processing"))
+                        for pf in processing_files:
+                            try:
+                                if time.time() - pf.stat().st_mtime > 300:
+                                    reclaim_path = pf.with_suffix("")
+                                    pf.rename(reclaim_path)
+                                    logger.info(f"[DLQ Reconciler] Reclaimed stale local DLQ file: {pf.name}")
+                            except Exception:
+                                pass
+                    except Exception as reclaim_err:
+                        logger.error(f"[DLQ Reconciler] Stale file reclamation error: {reclaim_err}")
+                        
                     try:
                         local_files = list(dlq_dir.glob("failed_report_*.json"))
                     except Exception as glob_err:

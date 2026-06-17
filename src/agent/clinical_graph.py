@@ -300,13 +300,9 @@ class ClinicalAgent:
             logger.warning("--- OOD escalation already triggered. Ending graph. ---")
             return {"iteration_count": count, "escalation_required": True}
         
-        if is_uncertain and count < MAX_RETRY_ITERATIONS:
-            logger.info("--- Looping back for refined PubMed query ---")
-            return {"iteration_count": count}
-        
-        # Escalation path: uncertainty too high or max iterations reached with uncertainty
+        # Sam's Flaw 6 Fix: Escalate immediately on first-pass low confidence or high uncertainty
         if is_uncertain:
-            logger.warning("!!! Escalation triggered: Insufficient evidence for automated diagnosis.")
+            logger.warning("!!! Escalation triggered immediately: Insufficient evidence for automated diagnosis.")
             return {"iteration_count": count, "escalation_required": True}
             
         return {"iteration_count": count}
