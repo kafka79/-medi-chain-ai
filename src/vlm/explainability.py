@@ -162,6 +162,11 @@ class VisualExplainer:
 
         visualization = show_cam_on_image(rgb_img, cam_full, use_rgb=True)
         
+        # Flaw #6 Fix: Dim peripheral/cropped-out regions by 60% to notify clinicians they were not analyzed
+        crop_mask = np.ones((H, W), dtype=bool)
+        crop_mask[top:bottom, left:right] = False
+        visualization[crop_mask] = (visualization[crop_mask] * 0.4).astype(np.uint8)
+        
         if output_path:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             cv2.imwrite(output_path, cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR))

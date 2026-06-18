@@ -36,7 +36,10 @@ class UncertaintyEstimator:
             # inference-time uncertainty estimation, which benefits from no-grad memory optimization and speed.
             with torch.no_grad():
                 for _ in range(num_passes):
-                    _, logits = self.model(vision_emb, text_emb)
+                    # Flaw #4 Fix: Apply random Gaussian noise to project feature representation uncertainty
+                    perturbed_v = vision_emb + torch.randn_like(vision_emb) * 0.05
+                    perturbed_t = text_emb + torch.randn_like(text_emb) * 0.05
+                    _, logits = self.model(perturbed_v, perturbed_t)
                     all_logits.append(torch.softmax(logits, dim=1))
         finally:
             self.model.eval()

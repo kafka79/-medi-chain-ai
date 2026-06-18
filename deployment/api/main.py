@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 import secrets
 import uvicorn
+import contextvars
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -158,33 +159,54 @@ feedback_logger = FeedbackLogger(redis_client=redis_client, storage_provider=sto
 class RedisDistributedSemaphore:
     def __init__(self, r_client, name: str, limit: int):
         self.redis = r_client
-        self.name = f"medi_chain:semaphore:{name}"
+        self.name = f"medi_chain:semaphore:{name}:leases"
         self.limit = limit
         self.local_sem = asyncio.Semaphore(limit)
+        self.client_id_var = contextvars.ContextVar(f"sem_client_id_{name}", default=None)
         
     async def __aenter__(self):
         await self.local_sem.acquire()
         if self.redis is None:
             return self
             
+        client_id = uuid.uuid4().hex
+        self.client_id_var.set(client_id)
+        
         acquired = False
         loop = asyncio.get_running_loop()
+        lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "60"))
+        
+        acquire_script = """
+        local leases_key = KEYS[1]
+        local limit = tonumber(ARGV[1])
+        local now = tonumber(ARGV[2])
+        local lease_ttl = tonumber(ARGV[3])
+        local client_id = ARGV[4]
+
+        -- 1. Remove expired leases
+        redis.call('ZREMRANGEBYSCORE', leases_key, '-inf', now - lease_ttl)
+
+        -- 2. Count active leases
+        local active_count = redis.call('ZCARD', leases_key)
+
+        -- 3. If under limit, acquire lease
+        if active_count < limit then
+            redis.call('ZADD', leases_key, now, client_id)
+            redis.call('EXPIRE', leases_key, 86400)
+            return 1
+        else
+            return 0
+        end
+        """
+        
         while not acquired:
             try:
-                init_script = """
-                local key = KEYS[1]
-                local limit = tonumber(ARGV[1])
-                local exists = redis.call('EXISTS', key)
-                if exists == 0 then
-                    for i = 1, limit do
-                        redis.call('LPUSH', key, 'token')
-                    end
-                    redis.call('EXPIRE', key, 86400)
-                end
-                """
-                await loop.run_in_executor(None, lambda: self.redis.eval(init_script, 1, self.name, self.limit))
-                token = await loop.run_in_executor(None, lambda: self.redis.blpop(self.name, timeout=1))
-                if token:
+                now = time.time()
+                res = await loop.run_in_executor(
+                    None,
+                    lambda: self.redis.eval(acquire_script, 1, self.name, self.limit, now, lease_ttl, client_id)
+                )
+                if res == 1:
                     acquired = True
             except Exception as e:
                 logger.warning(f"Redis semaphore acquire failed ({e}). Falling back to local lock only.")
@@ -196,11 +218,13 @@ class RedisDistributedSemaphore:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.redis is not None:
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, lambda: self.redis.rpush(self.name, "token"))
-            except Exception as e:
-                logger.error(f"Redis semaphore release failed: {e}")
+            client_id = self.client_id_var.get()
+            if client_id:
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, lambda: self.redis.zrem(self.name, client_id))
+                except Exception as e:
+                    logger.error(f"Redis semaphore release failed: {e}")
         self.local_sem.release()
 
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
@@ -254,20 +278,38 @@ async def cleanup_old_temp_files():
     consecutive_failures = 0
     base_sleep = 600
     while True:
-        try:
-            await asyncio.to_thread(storage.cleanup, max_age_seconds=3600)
-            consecutive_failures = 0  # Reset on success
-            sleep_time = base_sleep
-        except Exception as e:
-            consecutive_failures += 1
-            # Exponential backoff: 600s, 1200s, 2400s, maxing out at 3600s (1 hour)
-            sleep_time = min(base_sleep * (2 ** (consecutive_failures - 1)), 3600)
-            logger.error(f"Error in cleanup task ({consecutive_failures} consecutive failures). Retrying in {sleep_time} seconds: {e}")
-            if consecutive_failures >= MAX_CLEANUP_FAILURES:
-                logger.critical(
-                    f"Cleanup task experienced {consecutive_failures} consecutive failures. "
-                    f"Storage cleanup is impaired. System requires manual check/reboot."
+        run_cleanup = True
+        if use_redis and redis_client:
+            try:
+                loop = asyncio.get_running_loop()
+                acquired = await loop.run_in_executor(
+                    None,
+                    lambda: redis_client.set("medi_chain:locks:cleanup", "locked", ex=500, nx=True)
                 )
+                if not acquired:
+                    run_cleanup = False
+                    logger.info("Another replica is already running storage cleanup. Skipping this run.")
+            except Exception as e:
+                logger.warning(f"Failed to acquire Redis cleanup lock: {e}. Running cleanup anyway as fallback.")
+        
+        if run_cleanup:
+            try:
+                await asyncio.to_thread(storage.cleanup, max_age_seconds=3600)
+                consecutive_failures = 0  # Reset on success
+                sleep_time = base_sleep
+            except Exception as e:
+                consecutive_failures += 1
+                # Exponential backoff: 600s, 1200s, 2400s, maxing out at 3600s (1 hour)
+                sleep_time = min(base_sleep * (2 ** (consecutive_failures - 1)), 3600)
+                logger.error(f"Error in cleanup task ({consecutive_failures} consecutive failures). Retrying in {sleep_time} seconds: {e}")
+                if consecutive_failures >= MAX_CLEANUP_FAILURES:
+                    logger.critical(
+                        f"Cleanup task experienced {consecutive_failures} consecutive failures. "
+                        f"Storage cleanup is impaired. System requires manual check/reboot."
+                    )
+        else:
+            sleep_time = base_sleep
+            
         await asyncio.sleep(sleep_time)
 
 def _send_system_alert(title: str, message: str):

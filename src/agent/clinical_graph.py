@@ -295,14 +295,10 @@ class ClinicalAgent:
         # Flaw #15 Fix: Use configurable thresholds from module-level constants
         is_uncertain = state['confidence'] < CONFIDENCE_THRESHOLD or scaled_std > UNCERTAINTY_THRESHOLD
         
-        # If OOD was already flagged, skip retry and go straight to escalation
-        if state.get('escalation_required', False):
-            logger.warning("--- OOD escalation already triggered. Ending graph. ---")
-            return {"iteration_count": count, "escalation_required": True}
-        
-        # Sam's Flaw 6 Fix: Escalate immediately on first-pass low confidence or high uncertainty
-        if is_uncertain:
-            logger.warning("!!! Escalation triggered immediately: Insufficient evidence for automated diagnosis.")
+        # Flaw #5 Fix: Escalate only if OOD, or if uncertain and we have reached the max retry iterations
+        escalate = state.get('escalation_required', False) or (is_uncertain and count >= MAX_RETRY_ITERATIONS)
+        if escalate:
+            logger.warning(f"--- Escalation required (OOD={state.get('escalation_required', False)}, Uncertain={is_uncertain}, iteration={count}). Ending graph. ---")
             return {"iteration_count": count, "escalation_required": True}
             
         return {"iteration_count": count}

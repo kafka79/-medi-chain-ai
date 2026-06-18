@@ -18,9 +18,8 @@ class AttentionFusion(nn.Module):
         self.v_proj = nn.Linear(vision_dim, hidden_dim)
         self.t_proj = nn.Linear(text_dim, hidden_dim)
         
-        # Cross-modal multi-head attention blocks
-        self.cross_attn_v2t = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
-        self.cross_attn_t2v = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
+        # True self-attention block over the multimodal sequence [v, t]
+        self.self_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
         
         self.norm1 = nn.LayerNorm(hidden_dim)
         
@@ -47,22 +46,17 @@ class AttentionFusion(nn.Module):
         v = self.v_proj(vision_emb)  # Shape: (batch, hidden_dim)
         t = self.t_proj(text_emb)    # Shape: (batch, hidden_dim)
         
-        # Prepare for MultiheadAttention by adding a sequence dimension of length 1
-        # Shape: (batch, 1, hidden_dim)
-        v_seq = v.unsqueeze(1)
-        t_seq = t.unsqueeze(1)
+        # Stack to form a multimodal sequence of length 2: Shape (batch, 2, hidden_dim)
+        fused_seq = torch.stack([v, t], dim=1)
         
-        # Cross-modal attention:
-        # Vision query attends to Text key/value, and vice-versa
-        attn_v, _ = self.cross_attn_v2t(query=v_seq, key=t_seq, value=t_seq)
-        attn_t, _ = self.cross_attn_t2v(query=t_seq, key=v_seq, value=v_seq)
+        # True self-attention where visual and text features attend to each other
+        attn_out, _ = self.self_attn(query=fused_seq, key=fused_seq, value=fused_seq)
         
-        # Squeeze sequence dimension back
-        gated_v = attn_v.squeeze(1)
-        gated_t = attn_t.squeeze(1)
+        # Aggregate the attended tokens back to single representation (average pooling)
+        fused = attn_out.mean(dim=1)  # Shape: (batch, hidden_dim)
         
-        # Additive fusion and first layer norm
-        fused = self.norm1(gated_v + gated_t)
+        # Additive residual connection and first layer norm
+        fused = self.norm1(fused + (v + t) / 2.0)
         
         # Feed-forward refinement and second layer norm (with residual connection)
         fused = self.norm2(fused + self.ffn(fused))

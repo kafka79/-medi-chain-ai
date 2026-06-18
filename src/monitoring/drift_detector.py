@@ -18,8 +18,9 @@ DRIFT_ALERT_WEBHOOK_URL = os.getenv("DRIFT_ALERT_WEBHOOK_URL", "")
 DRIFT_KEY_TTL_SECONDS = int(os.getenv("DRIFT_KEY_TTL_SECONDS", "86400"))
 
 # Configurable minimum cases and threshold for concept/performance drift alerts to prevent alert fatigue
-DRIFT_MIN_CASES = int(os.getenv("DRIFT_MIN_CASES", "100"))
-DRIFT_AGREEMENT_THRESHOLD = float(os.getenv("DRIFT_AGREEMENT_THRESHOLD", "0.80"))
+# Tighter thresholds to safeguard patients and ensure quick alerting upon model performance decay.
+DRIFT_MIN_CASES = int(os.getenv("DRIFT_MIN_CASES", "50"))
+DRIFT_AGREEMENT_THRESHOLD = float(os.getenv("DRIFT_AGREEMENT_THRESHOLD", "0.95"))
 
 
 def _send_alert(title: str, message: str):
