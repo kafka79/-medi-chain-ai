@@ -2,7 +2,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-DIAGNOSTIC_CLASSES = ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
+import os
+import json
+
+def load_diagnostic_classes():
+    # Attempt to load from environment variable first
+    env_classes = os.getenv("DIAGNOSTIC_CLASSES")
+    if env_classes:
+        try:
+            parsed = json.loads(env_classes)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                return [str(c) for c in parsed]
+        except Exception:
+            # If not valid JSON, split by comma
+            return [c.strip() for c in env_classes.split(",") if c.strip()]
+            
+    # Attempt to load from config file config/classes.json
+    config_path = os.getenv("DIAGNOSTIC_CLASSES_PATH", "config/classes.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                parsed = json.load(f)
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    return parsed
+        except Exception as e:
+            print(f"Warning: Failed to load diagnostic classes from {config_path}: {e}")
+
+    # Fallback to defaults
+    return ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
+
+DIAGNOSTIC_CLASSES = load_diagnostic_classes()
 NUM_CLASSES = len(DIAGNOSTIC_CLASSES)
 
 class AttentionFusion(nn.Module):

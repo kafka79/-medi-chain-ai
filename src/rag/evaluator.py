@@ -7,8 +7,12 @@ import requests
 
 logger = logging.getLogger("rag-evaluator")
 
-def _send_alert(title: str, message: str):
-    """Send critical system alert to external webhook (Slack, PagerDuty, etc.)."""
+import concurrent.futures
+import threading
+
+_alert_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag-alert-sender")
+
+def _send_alert_sync(title: str, message: str):
     logger.critical(f"CRITICAL SYSTEM ALERT: {title} — {message}")
     webhook_url = os.getenv("DRIFT_ALERT_WEBHOOK_URL", "")
     if webhook_url:
@@ -20,9 +24,15 @@ def _send_alert(title: str, message: str):
         except Exception as e:
             logger.error(f"Failed to send connection alert webhook: {e}")
 
+def _send_alert(title: str, message: str):
+    """Flaw #2 Fix: Send alerts asynchronously via a thread pool to avoid blocking execution."""
+    _alert_executor.submit(_send_alert_sync, title, message)
+
 class RAGEvaluator:
     def __init__(self, milvus_host="localhost", milvus_port="19530", inference_api_url: str = None):
         self.collection_name = "pubmed_abstracts"
+        self.milvus_host = milvus_host
+        self.milvus_port = milvus_port
         self.inference_api_url = inference_api_url or os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
         self.internal_api_key = os.getenv("INTERNAL_API_KEY", "")
         if not self.internal_api_key and os.getenv("TESTING") != "true":
@@ -45,30 +55,46 @@ class RAGEvaluator:
             self.ssl_cert = None
 
         self.collection = None
+        self._conn_lock = threading.Lock()
+        
         if os.getenv("TESTING") == "true":
             return
         
-        max_attempts = 5
-        
-        for attempt in range(max_attempts):
+        # Flaw #4 Fix: Eager connection check on startup, but swallow connection errors to prevent startup crash/blocking
+        try:
+            connections.connect("default", host=self.milvus_host, port=self.milvus_port)
+            self.collection = Collection(self.collection_name)
+            self.collection.load()
+            logger.info("Successfully established eager connection to Milvus.")
+        except Exception as e:
+            msg = f"Eager Milvus connection failed during RAGEvaluator init: {e}. Will attempt lazy reconnection on query."
+            logger.warning(msg)
+            _send_alert("Milvus Connection Failure", msg)
+
+    def _ensure_connected(self):
+        """Flaw #4 Fix: Thread-safe lazy initialization check."""
+        if self.collection is not None:
+            return
+            
+        with self._conn_lock:
+            if self.collection is not None:
+                return
             try:
-                # Add retry loop to give Milvus database time to spin up in Docker Compose
-                connections.connect("default", host=milvus_host, port=milvus_port)
+                logger.info(f"Attempting lazy Milvus connection to {self.milvus_host}:{self.milvus_port}...")
+                connections.connect("default", host=self.milvus_host, port=self.milvus_port)
                 self.collection = Collection(self.collection_name)
                 self.collection.load()
-                break
+                logger.info("Lazily loaded Milvus RAG collection successfully.")
             except Exception as e:
-                if attempt == max_attempts - 1:
-                    msg = f"Could not connect to Milvus/Collection after {max_attempts} attempts: {e}"
-                    print(f"Warning: {msg}")
-                    _send_alert("Milvus Connection Failure", msg)
-                else:
-                    time.sleep(1)
+                msg = f"Milvus lazy connection failed: {e}"
+                logger.error(msg)
+                # Send non-blocking alert on connection failure
+                _send_alert("Milvus Connection Failure", msg)
+                raise RuntimeError("Milvus RAG collection is offline or uninitialized.")
 
     def search(self, query, k=5):
         """Perform search in Milvus. Raises RuntimeError if offline."""
-        if not self.collection:
-            raise RuntimeError("Milvus RAG collection is offline or uninitialized.")
+        self._ensure_connected()
             
         try:
             resp = requests.post(

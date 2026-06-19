@@ -22,9 +22,10 @@ DRIFT_KEY_TTL_SECONDS = int(os.getenv("DRIFT_KEY_TTL_SECONDS", "86400"))
 DRIFT_MIN_CASES = int(os.getenv("DRIFT_MIN_CASES", "50"))
 DRIFT_AGREEMENT_THRESHOLD = float(os.getenv("DRIFT_AGREEMENT_THRESHOLD", "0.95"))
 
+import concurrent.futures
+_alert_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="drift-alert-sender")
 
-def _send_alert(title: str, message: str):
-    """Flaw #16 Fix: Send drift alert to external webhook (Slack, PagerDuty, etc.)."""
+def _send_alert_sync(title: str, message: str):
     logger.critical(f"DRIFT ALERT: {title} — {message}")
     if DRIFT_ALERT_WEBHOOK_URL:
         try:
@@ -34,6 +35,10 @@ def _send_alert(title: str, message: str):
             http_requests.post(DRIFT_ALERT_WEBHOOK_URL, json=payload, timeout=5)
         except Exception as e:
             logger.error(f"Failed to send drift alert webhook: {e}")
+
+def _send_alert(title: str, message: str):
+    """Flaw #2 Fix: Send drift alert asynchronously via a thread pool to avoid blocking execution."""
+    _alert_executor.submit(_send_alert_sync, title, message)
 
 
 class DriftDetector:

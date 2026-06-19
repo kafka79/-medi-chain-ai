@@ -1,7 +1,9 @@
 class XAIExplainer:
     """
     Addresses 'User-Led Explanation'.
-    Generates dynamic clinical rationales for AI predictions to improve clinician trust.
+    Generates dynamic clinical rationales for AI predictions to improve clinician trust
+    by synthesizing patient demographics, occupational exposure, labs, active symptoms,
+    and supporting medical literature.
     """
     def __init__(self):
         pass
@@ -16,6 +18,8 @@ class XAIExplainer:
         occupation = metadata.get("occupation", "Unknown")
         exposure_years = metadata.get("exposure_years", "0")
         chief_complaint = history_data.get("chief_complaint", "respiratory symptoms")
+        hpi = history_data.get("history_present_illness", "")
+        labs = history_data.get("labs", "")
         
         if chief_complaint.lower() == "not found":
             chief_complaint = "respiratory distress"
@@ -25,7 +29,7 @@ class XAIExplainer:
         except ImportError:
             DIAGNOSTIC_CLASSES = ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
 
-        # Calculate confidence gap to next diagnostic class
+        # 1. Differential Diagnosis & Confidence Gap analysis
         gap_info = ""
         if probabilities and len(probabilities) == len(DIAGNOSTIC_CLASSES):
             indexed_probs = list(enumerate(probabilities))
@@ -78,6 +82,23 @@ class XAIExplainer:
         import os
         uncertainty_threshold = float(os.getenv("UNCERTAINTY_THRESHOLD", "0.15"))
         
+        # 2. Dynamic clinical text synthesis from HPI and Labs
+        clinical_evidence = []
+        if hpi:
+            symptoms = []
+            for sym in ["cough", "dyspnea", "fever", "sputum", "weight loss", "night sweats", "chest pain", "shortness of breath"]:
+                if sym in hpi.lower() or sym in chief_complaint.lower():
+                    symptoms.append(sym)
+            if symptoms:
+                clinical_evidence.append(f"clinical symptoms of {', '.join(symptoms)}")
+        if labs and labs.lower() not in ["none", "unknown", ""]:
+            clinical_evidence.append(f"labs: {labs.strip()}")
+            
+        evidence_synthesis = ""
+        if clinical_evidence:
+            evidence_synthesis = " Patient history corroborates this with " + " and ".join(clinical_evidence) + "."
+
+        # 3. Dynamic RAG/PubMed Literature context
         citation_info = ""
         if pubmed_citations:
             citations_list = []
@@ -89,9 +110,9 @@ class XAIExplainer:
                 citation_info = " Supporting PubMed Literature: " + "; ".join(citations_list) + "."
 
         if diagnosis == "Out-of-Distribution":
-            return f"CAUTION: {dyn_text}{gap_info} {base_reason} Unknown pathology detected. Immediate manual clinical review is required.{citation_info}"
+            return f"CAUTION: {dyn_text}{gap_info} {base_reason} Unknown pathology detected. Immediate manual clinical review is required.{evidence_synthesis}{citation_info}"
             
         if uncertainty > uncertainty_threshold:
-            return f"CAUTION: {dyn_text}{gap_info} {base_reason} High predictive uncertainty suggests a non-standard presentation. Manual review of priors is advised.{citation_info}"
+            return f"CAUTION: {dyn_text}{gap_info} {base_reason} High predictive uncertainty suggests a non-standard presentation. Manual review of priors is advised.{evidence_synthesis}{citation_info}"
         
-        return f"Rationale: {dyn_text}{gap_info} {base_reason}{citation_info}"
+        return f"Rationale: {dyn_text}{gap_info} {base_reason}{evidence_synthesis}{citation_info}"

@@ -5,7 +5,7 @@ class UncertaintyEstimator:
     def __init__(self, model):
         self.model = model
 
-    def estimate_uncertainty(self, vision_emb, text_emb, num_passes=20):
+    def estimate_uncertainty(self, vision_emb, text_emb, num_passes=20, visual_std=None):
         """
         Run MC Dropout to estimate prediction mean and standard deviation.
         Keeps model in .eval() to avoid BatchNorm errors with batch size 1,
@@ -36,8 +36,12 @@ class UncertaintyEstimator:
             # inference-time uncertainty estimation, which benefits from no-grad memory optimization and speed.
             with torch.no_grad():
                 for _ in range(num_passes):
-                    # Flaw #4 Fix: Apply random Gaussian noise to project feature representation uncertainty
-                    perturbed_v = vision_emb + torch.randn_like(vision_emb) * 0.05
+                    # Flaw #1 Fix: Use computed visual standard deviation if available, fallback to 0.05
+                    if visual_std is not None:
+                        perturbed_v = vision_emb + torch.randn_like(vision_emb) * visual_std
+                    else:
+                        perturbed_v = vision_emb + torch.randn_like(vision_emb) * 0.05
+                        
                     perturbed_t = text_emb + torch.randn_like(text_emb) * 0.05
                     _, logits = self.model(perturbed_v, perturbed_t)
                     all_logits.append(torch.softmax(logits, dim=1))

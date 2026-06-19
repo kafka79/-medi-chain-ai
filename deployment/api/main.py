@@ -312,8 +312,10 @@ async def cleanup_old_temp_files():
             
         await asyncio.sleep(sleep_time)
 
-def _send_system_alert(title: str, message: str):
-    """Send critical system alert to external webhook (Slack, PagerDuty, etc.)."""
+import concurrent.futures
+_alert_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="system-alert-sender")
+
+def _send_system_alert_sync(title: str, message: str):
     logger.critical(f"CRITICAL SYSTEM ALERT: {title} — {message}")
     webhook_url = os.getenv("DRIFT_ALERT_WEBHOOK_URL", "")
     if webhook_url:
@@ -325,6 +327,10 @@ def _send_system_alert(title: str, message: str):
             requests.post(webhook_url, json=payload, timeout=5)
         except Exception as e:
             logger.error(f"Failed to send connection alert webhook: {e}")
+
+def _send_system_alert(title: str, message: str):
+    """Flaw #2 Fix: Send system alert asynchronously via a thread pool to avoid blocking execution."""
+    _alert_executor.submit(_send_system_alert_sync, title, message)
 
 
 async def reconcile_dlq_task():

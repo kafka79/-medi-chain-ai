@@ -31,6 +31,7 @@ class AgentState(TypedDict):
     image_path: str
     patient_pdf_path: str
     visual_features: Any
+    visual_std: Any
     history_data: Dict[str, Any]
     pubmed_citations: List[Dict[str, Any]]
     diagnosis: Dict[str, Any]
@@ -136,6 +137,7 @@ class ClinicalAgent:
                 resp.raise_for_status()
                 resp_data = resp.json()
                 features = resp_data["features"]
+                visual_std = resp_data.get("visual_std", None)
                 heatmap_base64 = resp_data.get("heatmap_base64", "")
             except Exception:
                 # Fallback to standard multipart upload
@@ -152,6 +154,7 @@ class ClinicalAgent:
                     resp.raise_for_status()
                     resp_data = resp.json()
                     features = resp_data["features"]
+                    visual_std = resp_data.get("visual_std", None)
                     heatmap_base64 = resp_data.get("heatmap_base64", "")
                 except Exception as e:
                     logger.error(f"[Clinical Graph] Error calling inference API: {e}")
@@ -164,7 +167,7 @@ class ClinicalAgent:
                 except Exception as e:
                     logger.warning(f"[Clinical Graph] Warning: failed to clean up temp scrubbed image: {e}")
                 
-        return {"visual_features": features, "heatmap_base64": heatmap_base64}
+        return {"visual_features": features, "visual_std": visual_std, "heatmap_base64": heatmap_base64}
 
     async def node_parse_history(self, state: AgentState):
         logger.info("[Node] Parsing Patient History...")
@@ -224,6 +227,7 @@ class ClinicalAgent:
                     f"{self.inference_api_url}/estimate",
                     json={
                         "visual_features": v,
+                        "visual_std": state.get("visual_std"),
                         "text_features": t,
                         "num_passes": 20
                     },
@@ -326,6 +330,7 @@ class ClinicalAgent:
             "escalation_required": False,
             "pubmed_citations": [],
             "visual_features": None,
+            "visual_std": None,
             "history_data": {},
             "diagnosis": {},
             "confidence": 0.0,

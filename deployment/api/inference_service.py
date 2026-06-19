@@ -65,7 +65,33 @@ class InferenceService:
 
     def run_visual_inference_sync(self, img_path: str):
         """Helper to run visual encoding and Grad-CAM generation synchronously inside a thread pool."""
-        features = self.encoder.encode_image(img_path)
+        from PIL import Image, ImageEnhance
+        
+        try:
+            with Image.open(img_path) as pil_img:
+                perturbed_imgs = []
+                for i in range(5):
+                    if i == 0:
+                        perturbed_imgs.append(pil_img.convert("RGB"))
+                    elif i == 1:
+                        perturbed_imgs.append(pil_img.rotate(3).convert("RGB"))
+                    elif i == 2:
+                        perturbed_imgs.append(pil_img.rotate(-3).convert("RGB"))
+                    elif i == 3:
+                        perturbed_imgs.append(pil_img.transform(pil_img.size, Image.Transform.AFFINE, (1, 0, 4, 0, 1, 4)).convert("RGB"))
+                    elif i == 4:
+                        enhancer = ImageEnhance.Brightness(pil_img)
+                        perturbed_imgs.append(enhancer.enhance(0.95).convert("RGB"))
+                
+                features_batch = self.encoder.encode_image(perturbed_imgs)
+                # Keep original features as main prediction features
+                features = features_batch[0]
+                # Compute visual standard deviation across perturbed inputs
+                visual_std = torch.std(features_batch, dim=0)
+        except Exception as e:
+            print(f"TTA visual encoding failed ({e}). Falling back to standard encoding.")
+            features = self.encoder.encode_image(img_path)[0]
+            visual_std = torch.zeros_like(features)
         
         # Generate heatmap
         heatmap_base64 = ""
@@ -77,7 +103,7 @@ class InferenceService:
         except Exception as e:
             print(f"Failed to generate heatmap: {e}")
             
-        return features.tolist(), heatmap_base64
+        return features.tolist(), visual_std.tolist(), heatmap_base64
 
 service = None
 
@@ -169,6 +195,7 @@ class ImagePathPayload(BaseModel):
 
 class EstimatePayload(BaseModel):
     visual_features: Any
+    visual_std: Optional[List[float]] = None
     text_features: Any
     num_passes: int = 20
 
@@ -199,12 +226,13 @@ async def encode_image(
     try:
         # Flaw #8 Fix: Submit to explicit single-worker executor instead of semaphore + to_thread
         loop = asyncio.get_running_loop()
-        features_list, heatmap_base64 = await loop.run_in_executor(
+        features_list, visual_std_list, heatmap_base64 = await loop.run_in_executor(
             _inference_executor, active_service.run_visual_inference_sync, tmp_path
         )
                 
         return {
             "features": features_list,
+            "visual_std": visual_std_list,
             "heatmap_base64": heatmap_base64
         }
     finally:
@@ -226,12 +254,13 @@ async def encode_image_path(
         
     # Flaw #8 Fix: Submit to explicit single-worker executor
     loop = asyncio.get_running_loop()
-    features_list, heatmap_base64 = await loop.run_in_executor(
+    features_list, visual_std_list, heatmap_base64 = await loop.run_in_executor(
         _inference_executor, active_service.run_visual_inference_sync, img_path
     )
         
     return {
         "features": features_list,
+        "visual_std": visual_std_list,
         "heatmap_base64": heatmap_base64
     }
 
@@ -267,10 +296,14 @@ async def estimate_uncertainty(
     if t.ndim == 1:
         t = t.unsqueeze(0)
     
+    visual_std = None
+    if payload.visual_std is not None:
+        visual_std = torch.tensor(payload.visual_std, dtype=torch.float32, device=active_service.encoder.device)
+        
     # Flaw #8 Fix: Submit to explicit single-worker executor
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(
-        _inference_executor, active_service.uncertainty.estimate_uncertainty, v, t, payload.num_passes
+        _inference_executor, active_service.uncertainty.estimate_uncertainty, v, t, payload.num_passes, visual_std
     )
         
     # Convert numpy/torch arrays to lists for JSON
