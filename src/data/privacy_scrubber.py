@@ -106,8 +106,29 @@ class PrivacyScrubber:
             if ner_redacted:
                 redaction_log.append({"type": "ner", "entities": ner_redacted})
         except Exception as e:
-            logger.error(f"NER scrubbing failed: {e}")
-            raise RuntimeError(f"Critical HIPAA Risk: NER scrubbing failed at runtime. Aborting. Error: {e}")
+            logger.error(f"NER scrubbing failed: {e}. Falling back to aggressive regex de-identification.")
+            # Aggressive fallback: mask any token that looks like a potential proper noun (capitalized)
+            # while protecting common medical terms or pronouns to maintain availability and readable context.
+            words = scrubbed.split()
+            fallback_words = []
+            protected_words = {"the", "a", "an", "this", "that", "it", "patient", "history", "labs", "complaint", "clinical", "findings", "silicosis", "pneumonia", "tuberculosis", "asbestosis", "normal"}
+            for w in words:
+                clean_w = w.strip(".,;:?!\"'()")
+                # If word is capitalized and not a common lowercase/medical word, redact it
+                if clean_w and clean_w[0].isupper() and clean_w.lower() not in protected_words:
+                    redacted_term = "[FALLBACK_PER_ORG_REDACTED]"
+                    # Retain punctuation
+                    idx = w.find(clean_w)
+                    if idx != -1:
+                        prefix = w[:idx]
+                        suffix = w[idx+len(clean_w):]
+                        fallback_words.append(f"{prefix}{redacted_term}{suffix}")
+                    else:
+                        fallback_words.append(w)
+                else:
+                    fallback_words.append(w)
+            scrubbed = " ".join(fallback_words)
+            redaction_log.append({"type": "ner_fallback_triggered", "error": str(e)})
         
         # Flaw #23 Fix: Write audit record
         if redaction_log:

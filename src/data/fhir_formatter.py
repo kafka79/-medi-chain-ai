@@ -40,7 +40,7 @@ class FHIRFormatter:
             extension=extensions,
             identifier=[
                 Identifier(
-                    value=f"RPT-{patient_id}-{int(datetime.now().timestamp())}"
+                    value=f"RPT-{patient_id}-{int(datetime.now(timezone.utc).timestamp())}"
                 )
             ],
             category=[
@@ -175,9 +175,12 @@ class EHRGateway:
             dlq_dir = Path("temp/dlq")
             dlq_dir.mkdir(parents=True, exist_ok=True)
             local_path = dlq_dir / filename
-            
-            with open(local_path, "w") as f:
-                json.dump(payload, f, indent=2)
+            lock_path = local_path.with_suffix(".lock")
+            from filelock import FileLock
+            lock = FileLock(str(lock_path))
+            with lock:
+                with open(local_path, "w") as f:
+                    json.dump(payload, f, indent=2)
             self.logger.critical(f"[EHR Gateway] Local DLQ Written: Saved failed FHIR payload locally to {local_path}")
             local_success = True
         except Exception as local_err:

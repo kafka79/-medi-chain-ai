@@ -191,6 +191,7 @@ def test_rag_evaluator_fails_loud_and_alerts():
             assert "Milvus Connection Failure" in mock_alert.call_args[0][0]
             
             # Assert search raises RuntimeError
+            import asyncio
             with pytest.raises(RuntimeError) as exc_info:
-                evaluator.search("test query")
+                asyncio.run(evaluator.search("test query"))
             assert "Milvus RAG collection is offline" in str(exc_info.value)

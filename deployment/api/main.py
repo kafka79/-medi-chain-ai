@@ -11,7 +11,8 @@ import uuid
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
+import re
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, BackgroundTasks, Security, Depends
 from fastapi.responses import JSONResponse
@@ -290,7 +291,8 @@ async def cleanup_old_temp_files():
                     run_cleanup = False
                     logger.info("Another replica is already running storage cleanup. Skipping this run.")
             except Exception as e:
-                logger.warning(f"Failed to acquire Redis cleanup lock: {e}. Running cleanup anyway as fallback.")
+                logger.critical(f"Failed to acquire Redis cleanup lock: {e}. Skipping cleanup task as fallback to avoid concurrent write races on shared volumes.")
+                run_cleanup = False
         
         if run_cleanup:
             try:
@@ -354,7 +356,7 @@ async def reconcile_dlq_task():
     loop = asyncio.get_running_loop()
     active_tasks = set()
     
-    async def process_reconciliation(item: dict, source_type: str, identifier: Optional[str], item_raw_json: Optional[str] = None):
+    async def process_reconciliation(item: dict, source_type: str, identifier: Optional[str], item_raw_json: Optional[str] = None, lock: Optional[Any] = None):
         try:
             payload = item.get("payload")
             if not payload:
@@ -376,7 +378,13 @@ async def reconcile_dlq_task():
                 logger.info(f"[DLQ Reconciler] Successfully reconciled report from {source_type}.")
                 if source_type == "local" and identifier:
                     try:
-                        Path(identifier).unlink()
+                        file_path = Path(identifier)
+                        if file_path.exists():
+                            file_path.unlink()
+                        # Clean up lock file
+                        lock_path = file_path.with_suffix(".lock")
+                        if lock_path.exists():
+                            lock_path.unlink()
                     except Exception as e:
                         logger.error(f"[DLQ Reconciler] Failed to delete resolved local DLQ file {identifier}: {e}")
                 elif source_type == "redis" and r and item_raw_json:
@@ -415,7 +423,13 @@ async def reconcile_dlq_task():
                     # Escalation path 3: Delete local file if it was a local item
                     if source_type == "local" and identifier:
                         try:
-                            Path(identifier).unlink()
+                            file_path = Path(identifier)
+                            if file_path.exists():
+                                file_path.unlink()
+                            # Clean up lock file
+                            lock_path = file_path.with_suffix(".lock")
+                            if lock_path.exists():
+                                lock_path.unlink()
                         except Exception as e:
                             logger.error(f"[DLQ Reconciler] Failed to delete poisoned local DLQ file {identifier}: {e}")
                     
@@ -437,13 +451,21 @@ async def reconcile_dlq_task():
                         try:
                             with open(identifier, "w") as f:
                                 json.dump(item, f, indent=2)
-                            orig_path = Path(identifier).with_suffix("")
-                            Path(identifier).rename(orig_path)
                         except Exception as local_err:
                             logger.error(f"[DLQ Reconciler] Failed to write updated local DLQ retry count: {local_err}")
         except Exception as err:
             logger.error(f"[DLQ Reconciler] Error processing DLQ item: {err}")
         finally:
+            if lock:
+                try:
+                    lock.release()
+                    # Clean up the lock file after release if the main file was deleted
+                    if source_type == "local" and identifier:
+                        lock_path = Path(identifier).with_suffix(".lock")
+                        if not Path(identifier).exists() and lock_path.exists():
+                            lock_path.unlink()
+                except Exception as le:
+                    logger.error(f"[DLQ Reconciler] Failed to release lock: {le}")
             dlq_semaphore.release()
             
     while True:
@@ -470,49 +492,40 @@ async def reconcile_dlq_task():
             if not item_found:
                 dlq_dir = Path("temp/dlq")
                 if dlq_dir.exists() and dlq_dir.is_dir():
-                    # Reclaim stale .processing files
                     try:
-                        processing_files = list(dlq_dir.glob("failed_report_*.json.processing"))
-                        for pf in processing_files:
-                            try:
-                                if time.time() - pf.stat().st_mtime > 300:
-                                    reclaim_path = pf.with_suffix("")
-                                    pf.rename(reclaim_path)
-                                    logger.info(f"[DLQ Reconciler] Reclaimed stale local DLQ file: {pf.name}")
-                            except Exception:
-                                pass
-                    except Exception as reclaim_err:
-                        logger.error(f"[DLQ Reconciler] Stale file reclamation error: {reclaim_err}")
-                        
-                    try:
-                        local_files = list(dlq_dir.glob("failed_report_*.json"))
+                        local_files = [f for f in dlq_dir.glob("failed_report_*.json") if not f.name.endswith(".lock")]
                     except Exception as glob_err:
                         logger.error(f"[DLQ Reconciler] Glob error: {glob_err}")
                         local_files = []
                         
                     for file_path in local_files:
-                        processing_path = file_path.with_suffix(".json.processing")
+                        lock_path = file_path.with_suffix(".lock")
+                        from filelock import FileLock, Timeout
+                        lock = FileLock(str(lock_path), timeout=0.1)
                         try:
-                            file_path.rename(processing_path)
-                        except Exception:
-                            # Skip if already locked by another worker
+                            # Non-blocking lock acquisition
+                            lock.acquire(timeout=0.01)
+                        except Timeout:
+                            # Locked by another process/thread
                             continue
                         
                         try:
-                            with open(processing_path, "r") as f:
+                            if not file_path.exists():
+                                lock.release()
+                                continue
+                            with open(file_path, "r") as f:
                                 item = json.load(f)
-                            task = asyncio.create_task(process_reconciliation(item, "local", str(processing_path)))
+                            task = asyncio.create_task(process_reconciliation(item, "local", str(file_path), lock=lock))
                             active_tasks.add(task)
                             task.add_done_callback(active_tasks.discard)
                             item_found = True
                             break
                         except Exception as e:
-                            logger.error(f"[DLQ Reconciler] Failed to lock/read local DLQ file {file_path.name}: {e}")
-                            if processing_path.exists():
-                                try:
-                                    processing_path.rename(file_path)
-                                except Exception:
-                                    pass
+                            logger.error(f"[DLQ Reconciler] Failed to read local DLQ file {file_path.name}: {e}")
+                            try:
+                                lock.release()
+                            except Exception:
+                                pass
                                     
             if not item_found:
                 # Release semaphore and sleep if no work
@@ -692,9 +705,18 @@ def create_app() -> FastAPI:
         @field_validator("doctor_id")
         @classmethod
         def doctor_id_must_use_doctor_prefix(cls, value: str) -> str:
-            if not value.startswith("dr-") or not all(ch.isalnum() or ch in "-_." for ch in value):
-                raise ValueError("doctor_id must start with 'dr-'")
-            return value
+            # Flaw #6 Fix: Allow doctor prefix 'dr-', UUIDs, hospital emails, or NPI numbers
+            value_stripped = value.strip()
+            # Allow email address format, standard UUID format, or numeric NPI (10 digits), or standard dr- prefix
+            is_valid = (
+                value_stripped.startswith("dr-") or
+                "@" in value_stripped or
+                re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", value_stripped) is not None or
+                (value_stripped.isdigit() and len(value_stripped) == 10)
+            )
+            if not is_valid:
+                raise ValueError("doctor_id must start with 'dr-', or be a valid email/UUID/NPI.")
+            return value_stripped
 
     @app.post("/feedback")
     @limiter.limit("30/minute")  # Flaw #4 Fix: Rate limit feedback endpoint to prevent spam/poisoning

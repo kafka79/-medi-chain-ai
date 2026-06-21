@@ -51,7 +51,7 @@ class ClinicalAgent:
             raise RuntimeError("INTERNAL_API_KEY environment variable is required.")
         
         # Configure SSL / TLS settings
-        self.ssl_verify = os.getenv("INTERNAL_SSL_VERIFY", "false")
+        self.ssl_verify = os.getenv("INTERNAL_SSL_VERIFY", "true")
         if self.ssl_verify.lower() == "true":
             self.ssl_verify = True
         elif self.ssl_verify.lower() == "false":
@@ -188,9 +188,8 @@ class ClinicalAgent:
         else:
             query = base_query
             
-        loop = asyncio.get_running_loop()
         try:
-            citations = await loop.run_in_executor(None, self.rag.search, query, 3)
+            citations = await self.rag.search(query, 3)
             return {"pubmed_citations": citations}
         except Exception as e:
             logger.error(f"[Clinical Graph] RAG retrieval failed: {e}. Forcing human review escalation.")

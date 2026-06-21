@@ -39,7 +39,7 @@ class RAGEvaluator:
             raise RuntimeError("INTERNAL_API_KEY environment variable is required.")
 
         # Configure SSL / TLS settings
-        self.ssl_verify = os.getenv("INTERNAL_SSL_VERIFY", "false")
+        self.ssl_verify = os.getenv("INTERNAL_SSL_VERIFY", "true")
         if self.ssl_verify.lower() == "true":
             self.ssl_verify = True
         elif self.ssl_verify.lower() == "false":
@@ -92,31 +92,37 @@ class RAGEvaluator:
                 _send_alert("Milvus Connection Failure", msg)
                 raise RuntimeError("Milvus RAG collection is offline or uninitialized.")
 
-    def search(self, query, k=5):
+    async def search(self, query, k=5):
         """Perform search in Milvus. Raises RuntimeError if offline."""
         self._ensure_connected()
-            
+        
+        import httpx
         try:
-            resp = requests.post(
-                f"{self.inference_api_url}/encode/text",
-                json={"text": query},
-                headers={"X-Internal-API-Key": self.internal_api_key},
-                verify=self.ssl_verify,
-                cert=self.ssl_cert
-            )
+            async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
+                resp = await client.post(
+                    f"{self.inference_api_url}/encode/text",
+                    json={"text": query},
+                    headers={"X-Internal-API-Key": self.internal_api_key},
+                    timeout=10
+                )
             resp.raise_for_status()
             vector = resp.json()["embeddings"][0]
         except Exception as e:
             print(f"[RAGEvaluator] Error calling inference API: {e}")
             raise RuntimeError(f"RAG text encoding failed: {e}")
         
+        import asyncio
         search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
-        results = self.collection.search(
-            data=[vector],
-            anns_field="vector",
-            param=search_params,
-            limit=k,
-            output_fields=["pmid", "text", "title"]
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None,
+            lambda: self.collection.search(
+                data=[vector],
+                anns_field="vector",
+                param=search_params,
+                limit=k,
+                output_fields=["pmid", "text", "title"]
+            )
         )
         
         parsed_results = []
@@ -128,7 +134,7 @@ class RAGEvaluator:
             })
         return parsed_results
 
-    def evaluate_hit_rate(self, test_cases):
+    async def evaluate_hit_rate(self, test_cases):
         """
         Evaluate Hit-Rate@5.
         test_cases: List of dicts {'query': str, 'expected_pmid': str}
@@ -138,7 +144,7 @@ class RAGEvaluator:
         
         print(f"Evaluating Hit-Rate@5 on {total} cases...")
         for case in test_cases:
-            results = self.search(case['query'], k=5)
+            results = await self.search(case['query'], k=5)
             # Check if expected_pmid is in results
             pmids = [res.get('pmid') for res in results]
             if case['expected_pmid'] in pmids:
@@ -149,6 +155,7 @@ class RAGEvaluator:
         return hit_rate
 
 if __name__ == "__main__":
+    import asyncio
     # Hand-labelled gold standard queries (Example)
     test_queries = [
         {"query": "What are the common radiological findings in silicosis?", "expected_pmid": "123456"},
@@ -157,4 +164,4 @@ if __name__ == "__main__":
     ]
     
     evaluator = RAGEvaluator()
-    evaluator.evaluate_hit_rate(test_queries)
+    asyncio.run(evaluator.evaluate_hit_rate(test_queries))
