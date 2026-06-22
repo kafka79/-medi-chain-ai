@@ -21,10 +21,30 @@ OOD_CONFIDENCE_THRESHOLD = float(os.getenv("OOD_CONFIDENCE_THRESHOLD", "0.4"))
 # These thresholds control the self-verification loop and escalation.
 # CALIBRATION NOTE: These values should be validated against a held-out clinical dataset
 # using ROC analysis. Current values are engineering defaults pending clinical validation.
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.6"))
-UNCERTAINTY_THRESHOLD = float(os.getenv("UNCERTAINTY_THRESHOLD", "0.15"))
+_DEFAULT_CONFIDENCE = 0.6
+_DEFAULT_UNCERTAINTY = 0.15
+_DEFAULT_CALIBRATION = 1.0
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", str(_DEFAULT_CONFIDENCE)))
+UNCERTAINTY_THRESHOLD = float(os.getenv("UNCERTAINTY_THRESHOLD", str(_DEFAULT_UNCERTAINTY)))
 MAX_RETRY_ITERATIONS = int(os.getenv("MAX_RETRY_ITERATIONS", "3"))
-UNCERTAINTY_CALIBRATION_FACTOR = float(os.getenv("UNCERTAINTY_CALIBRATION_FACTOR", "1.0"))
+UNCERTAINTY_CALIBRATION_FACTOR = float(os.getenv("UNCERTAINTY_CALIBRATION_FACTOR", str(_DEFAULT_CALIBRATION)))
+
+# Flaw #8-structural Fix: Warn loudly at import time if thresholds are still uncalibrated defaults
+_USING_DEFAULT_THRESHOLDS = (
+    CONFIDENCE_THRESHOLD == _DEFAULT_CONFIDENCE
+    and UNCERTAINTY_THRESHOLD == _DEFAULT_UNCERTAINTY
+    and UNCERTAINTY_CALIBRATION_FACTOR == _DEFAULT_CALIBRATION
+)
+if _USING_DEFAULT_THRESHOLDS and os.getenv("TESTING") != "true":
+    logger.critical(
+        "SAFETY WARNING: All clinical decision thresholds (CONFIDENCE_THRESHOLD, "
+        "UNCERTAINTY_THRESHOLD, UNCERTAINTY_CALIBRATION_FACTOR) are at uncalibrated "
+        "engineering defaults. These MUST be tuned against a held-out clinical dataset "
+        "using ROC/PR analysis before any patient-facing deployment. Set "
+        "THRESHOLDS_VALIDATED=true in your environment after calibration to suppress this warning."
+    )
+    if os.getenv("THRESHOLDS_VALIDATED", "").lower() != "true":
+        logger.critical("Set THRESHOLDS_VALIDATED=true after clinical calibration to acknowledge.")
 
 
 class AgentState(TypedDict):
@@ -66,6 +86,17 @@ class ClinicalAgent:
         else:
             self.ssl_cert = None
         
+        # Flaw #5-structural Fix: Create ONE persistent httpx.AsyncClient to reuse
+        # across all node calls, instead of creating/destroying one per request.
+        # This eliminates TCP connection churn and potential socket leaks.
+        self._http_client = httpx.AsyncClient(
+            verify=self.ssl_verify,
+            cert=self.ssl_cert,
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            headers={"X-Internal-API-Key": self.internal_api_key},
+        )
+        
         from ..data.privacy_scrubber import PrivacyScrubber
         self.scrubber = PrivacyScrubber()
 
@@ -82,6 +113,10 @@ class ClinicalAgent:
         
         self.workflow = StateGraph(AgentState)
         self._build_graph()
+
+    async def close(self):
+        """Gracefully close the persistent HTTP client. Call on shutdown."""
+        await self._http_client.aclose()
 
     def _build_graph(self):
         # Define Nodes
@@ -120,45 +155,26 @@ class ClinicalAgent:
         img_to_encode = self.scrubber.mask_burned_in_text(orig_img_path)
         success = (img_to_encode != orig_img_path)
         
-        # Call inference API. Attempt to use shared volume path first to avoid I/O double-writing
+        # Flaw #6-structural Fix: Always use multipart upload. The previous approach
+        # tried to send a file *path* first, which silently breaks in multi-container
+        # deployments where the inference service can't access the API container's
+        # filesystem. Multipart upload works regardless of deployment topology.
         try:
-            try:
-                abs_img_path = os.path.abspath(img_to_encode)
-                async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
-                    resp = await client.post(
-                        f"{self.inference_api_url}/encode/image_path",
-                        json={"image_path": abs_img_path},
-                        headers={"X-Internal-API-Key": self.internal_api_key},
-                        timeout=10
-                    )
-                # If the path endpoint isn't supported or fails, fall back to upload bytes
-                if resp.status_code == 404 or resp.status_code == 400:
-                    raise ValueError("Endpoint failed or path not accessible. Falling back to HTTP multipart upload.")
-                resp.raise_for_status()
-                resp_data = resp.json()
-                features = resp_data["features"]
-                visual_std = resp_data.get("visual_std", None)
-                heatmap_base64 = resp_data.get("heatmap_base64", "")
-            except Exception:
-                # Fallback to standard multipart upload
-                try:
-                    with open(img_to_encode, "rb") as f:
-                        files = {"image": ("image.jpg", f, "image/jpeg")}
-                        async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
-                            resp = await client.post(
-                                f"{self.inference_api_url}/encode/image",
-                                files=files,
-                                headers={"X-Internal-API-Key": self.internal_api_key},
-                                timeout=15
-                            )
-                    resp.raise_for_status()
-                    resp_data = resp.json()
-                    features = resp_data["features"]
-                    visual_std = resp_data.get("visual_std", None)
-                    heatmap_base64 = resp_data.get("heatmap_base64", "")
-                except Exception as e:
-                    logger.error(f"[Clinical Graph] Error calling inference API: {e}")
-                    raise RuntimeError(f"Visual encoder failed: {e}")
+            with open(img_to_encode, "rb") as f:
+                files = {"image": ("scan.jpg", f, "image/jpeg")}
+                resp = await self._http_client.post(
+                    f"{self.inference_api_url}/encode/image",
+                    files=files,
+                    timeout=15
+                )
+            resp.raise_for_status()
+            resp_data = resp.json()
+            features = resp_data["features"]
+            visual_std = resp_data.get("visual_std", None)
+            heatmap_base64 = resp_data.get("heatmap_base64", "")
+        except Exception as e:
+            logger.error(f"[Clinical Graph] Error calling inference API: {e}")
+            raise RuntimeError(f"Visual encoder failed: {e}")
         finally:
             # Clean up the temporary scrubbed image if it was created
             if success and os.path.exists(img_to_encode) and img_to_encode != orig_img_path:
@@ -205,14 +221,12 @@ class ClinicalAgent:
         citations_text = " ".join([c.get("text", "") for c in state.get("pubmed_citations", []) if c.get("text")])
         text_content = f"{history.get('chief_complaint', '')} {history.get('history_present_illness', '')} {history.get('labs', '')} {citations_text}".strip()
         
-        # Embed text using remote API
+        # Embed text using remote API (Flaw #5-structural: uses persistent self._http_client)
         try:
-            async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
-                resp = await client.post(
-                    f"{self.inference_api_url}/encode/text",
-                    json={"text": text_content},
-                    headers={"X-Internal-API-Key": self.internal_api_key}
-                )
+            resp = await self._http_client.post(
+                f"{self.inference_api_url}/encode/text",
+                json={"text": text_content},
+            )
             resp.raise_for_status()
             t = resp.json()["embeddings"]
         except Exception as e:
@@ -221,17 +235,15 @@ class ClinicalAgent:
         
         # Run uncertainty estimation via remote API
         try:
-            async with httpx.AsyncClient(verify=self.ssl_verify, cert=self.ssl_cert) as client:
-                resp = await client.post(
-                    f"{self.inference_api_url}/estimate",
-                    json={
-                        "visual_features": v,
-                        "visual_std": state.get("visual_std"),
-                        "text_features": t,
-                        "num_passes": 20
-                    },
-                    headers={"X-Internal-API-Key": self.internal_api_key}
-                )
+            resp = await self._http_client.post(
+                f"{self.inference_api_url}/estimate",
+                json={
+                    "visual_features": v,
+                    "visual_std": state.get("visual_std"),
+                    "text_features": t,
+                    "num_passes": 20
+                },
+            )
             resp.raise_for_status()
             results = resp.json()
         except Exception as e:

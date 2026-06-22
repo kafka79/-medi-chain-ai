@@ -152,14 +152,8 @@ class TestNodeSelfVerify:
 class TestNodeSynthesizeDiagnosis:
     """Tests for the synthesize_diagnosis node with mocked inference API."""
     
-    @patch("src.agent.clinical_graph.httpx.AsyncClient")
-    async def test_normal_prediction(self, mock_async_client_cls):
+    async def test_normal_prediction(self):
         agent = _make_agent()
-        
-        mock_client = MagicMock()
-        mock_async_client_cls.return_value = mock_client
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=None)
         
         # Mock text encoding response
         text_resp = MagicMock()
@@ -178,7 +172,8 @@ class TestNodeSynthesizeDiagnosis:
         }
         est_resp.raise_for_status = MagicMock()
         
-        mock_client.post = AsyncMock(side_effect=[text_resp, est_resp])
+        # Flaw #5-structural: patch the persistent _http_client.post instead of AsyncClient context manager
+        agent._http_client.post = AsyncMock(side_effect=[text_resp, est_resp])
         
         state = {
             "visual_features": [[0.1] * 512],
@@ -190,15 +185,9 @@ class TestNodeSynthesizeDiagnosis:
         assert result["diagnosis"]["ood_detected"] is False
         assert result["confidence"] == 0.92
     
-    @patch("src.agent.clinical_graph.httpx.AsyncClient")
-    async def test_ood_detection_triggers_escalation(self, mock_async_client_cls):
+    async def test_ood_detection_triggers_escalation(self):
         """Flaw #6: When max(softmax) < OOD_CONFIDENCE_THRESHOLD, should flag OOD."""
         agent = _make_agent()
-        
-        mock_client = MagicMock()
-        mock_async_client_cls.return_value = mock_client
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=None)
         
         text_resp = MagicMock()
         text_resp.json.return_value = {"embeddings": [[0.1] * 768]}
@@ -214,7 +203,8 @@ class TestNodeSynthesizeDiagnosis:
         }
         est_resp.raise_for_status = MagicMock()
         
-        mock_client.post = AsyncMock(side_effect=[text_resp, est_resp])
+        # Flaw #5-structural: patch the persistent _http_client.post instead of AsyncClient context manager
+        agent._http_client.post = AsyncMock(side_effect=[text_resp, est_resp])
         
         state = {
             "visual_features": [[0.1] * 512],

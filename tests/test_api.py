@@ -54,6 +54,8 @@ class DummyStorageProvider:
 def test_health_is_lazy(monkeypatch):
     monkeypatch.setattr(api_main, "build_agent", lambda: DummyAgent())
     monkeypatch.setattr(api_main, "storage", DummyStorageProvider())
+    # Flaw #3-structural Fix: Isolate from host .env to prevent MAX_CONCURRENT_REQUESTS leakage
+    monkeypatch.setattr(api_main, "MAX_CONCURRENT_REQUESTS", 2)
     app = api_main.create_app()
 
     with TestClient(app) as client:

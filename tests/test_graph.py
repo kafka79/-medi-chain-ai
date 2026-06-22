@@ -20,11 +20,6 @@ async def test_agent_loop_protection():
     agent.scrubber.mask_burned_in_text.return_value = "dummy_image.png"
     agent.scrubber.scrub_history_data.side_effect = lambda x: x
     
-    # Mock httpx.AsyncClient
-    mock_client = MagicMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=None)
-    
     mock_logits = torch.tensor([[1.1, 1.1, 1.1, 1.1, 1.1]])
     all_probs = torch.softmax(mock_logits, dim=1)[0].tolist()
 
@@ -45,22 +40,22 @@ async def test_agent_loop_protection():
             }
         return mock_resp
         
-    mock_client.post = AsyncMock(side_effect=side_effect)
+    agent._http_client.post = AsyncMock(side_effect=side_effect)
     
-    with patch("httpx.AsyncClient", return_value=mock_client):
-        # Create dummy files
-        with open("dummy_image.png", "wb") as f:
-            f.write(b"fake image data")
-        with open("dummy_history.pdf", "wb") as f:
-            f.write(b"fake pdf data")
-            
-        try:
-            result = await agent.run("dummy_image.png", "dummy_history.pdf")
-        finally:
-            if os.path.exists("dummy_image.png"):
-                os.remove("dummy_image.png")
-            if os.path.exists("dummy_history.pdf"):
-                os.remove("dummy_history.pdf")
+    # Create dummy files
+    with open("dummy_image.png", "wb") as f:
+        f.write(b"fake image data")
+    with open("dummy_history.pdf", "wb") as f:
+        f.write(b"fake pdf data")
+        
+    try:
+        result = await agent.run("dummy_image.png", "dummy_history.pdf")
+    finally:
+        await agent.close()
+        if os.path.exists("dummy_image.png"):
+            os.remove("dummy_image.png")
+        if os.path.exists("dummy_history.pdf"):
+            os.remove("dummy_history.pdf")
         
         assert result['iteration_count'] <= 3
         assert result['escalation_required'] is True

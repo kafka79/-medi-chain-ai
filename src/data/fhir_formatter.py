@@ -139,6 +139,7 @@ class EHRGateway:
         import uuid
         import time
         import os
+        import tempfile
         from pathlib import Path
         
         filename = f"failed_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
@@ -155,48 +156,60 @@ class EHRGateway:
             "retry_count": 0
         }
         
+        payload_json = json.dumps(payload, indent=2)
         redis_success = False
         local_success = False
         
-        # 1. Attempt to write to Redis shared list as the primary tier (replicated DLQ)
+        # Flaw #7-structural Fix: Redis is the PRIMARY DLQ tier (shared across replicas).
+        # Previous code used local files with filelock as secondary — but filelock is
+        # process-local and does not coordinate across containers/replicas.
+        # Now: Redis first, local disk as emergency-only (no lock needed — atomic rename).
+        
+        # 1. Primary: Redis shared list (replicated across all API replicas)
         try:
             import redis
             redis_host = os.getenv("REDIS_HOST", "redis")
             redis_port = int(os.getenv("REDIS_PORT", "6379"))
             r = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True, socket_connect_timeout=1)
-            r.rpush("medi_chain:dlq", json.dumps(payload))
-            self.logger.info("[EHR Gateway] Replicated Redis DLQ Synced: Pushed failed payload to redis list 'medi_chain:dlq'")
+            r.rpush("medi_chain:dlq", payload_json)
+            self.logger.info("[EHR Gateway] Redis DLQ: Pushed failed payload to 'medi_chain:dlq'")
             redis_success = True
         except Exception as redis_err:
-            self.logger.warning(f"[EHR Gateway] Redis DLQ upload failed: {redis_err}")
+            self.logger.warning(f"[EHR Gateway] Redis DLQ failed: {redis_err}")
         
-        # 2. Write locally first to a persistent local DLQ folder (secondary backup)
+        # 2. Tertiary backup: S3 (attempt regardless of local success)
         try:
-            dlq_dir = Path("temp/dlq")
-            dlq_dir.mkdir(parents=True, exist_ok=True)
-            local_path = dlq_dir / filename
-            lock_path = local_path.with_suffix(".lock")
-            from filelock import FileLock
-            lock = FileLock(str(lock_path))
-            with lock:
-                with open(local_path, "w") as f:
-                    json.dump(payload, f, indent=2)
-            self.logger.critical(f"[EHR Gateway] Local DLQ Written: Saved failed FHIR payload locally to {local_path}")
-            local_success = True
-        except Exception as local_err:
-            self.logger.error(f"[EHR Gateway] Local DLQ file write failed: {local_err}")
+            from src.utils.storage import S3StorageProvider
+            storage = S3StorageProvider(endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"), bucket="dlq")
+            if storage.client:
+                import io
+                storage.save(io.BytesIO(payload_json.encode("utf-8")), filename)
+                self.logger.info(f"[EHR Gateway] S3 DLQ: Uploaded {filename} to MinIO bucket 'dlq'")
+        except Exception as s3_err:
+            self.logger.warning(f"[EHR Gateway] S3 DLQ upload failed: {s3_err}")
         
-        # 3. Attempt to backup to remote S3 bucket, but do not raise if it fails (tertiary backup)
-        if local_success:
+        # 3. Emergency local fallback: atomic write-then-rename (no filelock needed)
+        # This is per-replica and NOT shared, but prevents data loss if Redis AND S3 are both down.
+        if not redis_success:
             try:
-                from src.utils.storage import S3StorageProvider
-                storage = S3StorageProvider(endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"), bucket="dlq")
-                if storage.client:
-                    with open(local_path, "rb") as f:
-                        storage.save(f, filename)
-                    self.logger.info(f"[EHR Gateway] Remote DLQ Synced: Uploaded {filename} to MinIO bucket 'dlq'")
-            except Exception as s3_err:
-                self.logger.warning(f"[EHR Gateway] S3 DLQ upload failed (expected if network is down): {s3_err}")
+                dlq_dir = Path("temp/dlq")
+                dlq_dir.mkdir(parents=True, exist_ok=True)
+                local_path = dlq_dir / filename
+                # Atomic: write to temp file, then rename (rename is atomic on POSIX)
+                fd, tmp_path = tempfile.mkstemp(dir=str(dlq_dir), suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        f.write(payload_json)
+                    os.replace(tmp_path, str(local_path))
+                except Exception:
+                    # Clean up temp file on failure
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
+                self.logger.critical(f"[EHR Gateway] Emergency local DLQ: Saved to {local_path}")
+                local_success = True
+            except Exception as local_err:
+                self.logger.error(f"[EHR Gateway] Local DLQ write failed: {local_err}")
                 
         if not redis_success and not local_success:
             raise RuntimeError(

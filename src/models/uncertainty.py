@@ -11,14 +11,15 @@ class UncertaintyEstimator:
         Keeps model in .eval() to avoid BatchNorm errors with batch size 1,
         but explicitly enables Dropout layers.
         
-        NOTE ON LIMITATION (Tara's Critique - The MC Dropout Illusion):
-        Because the visual encoder (BiomedCLIP) and text encoder (SapBERT) are run 
-        exactly once during upstream pipeline execution to extract static features, 
-        and because BiomedCLIP's vision tower has a dropout rate of 0.0, this function 
-        only estimates epistemic uncertainty of the fusion/classification head layers 
-        (LateFusionModel). Visual feature extraction uncertainty is NOT captured here. 
-        To make this clear, we return both "std_deviation" (for API compatibility) 
-        and "fusion_head_variance".
+        Flaw #2-structural Fix (MC Dropout Illusion):
+        We now compute and return THREE separate uncertainty metrics:
+        1. fusion_head_variance — epistemic uncertainty from the classification head only.
+        2. visual_uncertainty_score — input-space uncertainty from TTA visual_std.
+        3. combined_uncertainty — geometric mean of (1) and (2), factoring in both
+           visual feature instability AND classification head variance.
+        
+        This makes it explicit that fusion_head_variance alone does NOT capture
+        visual encoder uncertainty (BiomedCLIP has dropout=0.0).
         """
         self.model.eval()
         
@@ -32,11 +33,9 @@ class UncertaintyEstimator:
                     m.eval()
             
             all_logits = []
-            # CRITICAL CONSTRAINT (Tara's T1): We use torch.no_grad() here because MC Dropout is strictly for
-            # inference-time uncertainty estimation, which benefits from no-grad memory optimization and speed.
             with torch.no_grad():
                 for _ in range(num_passes):
-                    # Flaw #1 Fix: Use computed visual standard deviation if available, fallback to 0.05
+                    # Use TTA-derived visual_std for perturbation magnitude
                     if visual_std is not None:
                         perturbed_v = vision_emb + torch.randn_like(vision_emb) * visual_std
                     else:
@@ -58,17 +57,38 @@ class UncertaintyEstimator:
         # Prediction is the class with highest mean probability
         conf, pred = torch.max(mean_probs, dim=1)
         
-        # Flaw #14 Fix: Return std_deviation as a tensor instead of a Python list.
-        # Consumers call .tolist() on the full results dict via the API serialization layer,
-        # ensuring consistent type handling throughout the pipeline.
         batch_size = vision_emb.shape[0]
-        uncertainties = torch.tensor([std_probs[i, pred[i]].item() for i in range(batch_size)])
+        fusion_uncertainties = torch.tensor([std_probs[i, pred[i]].item() for i in range(batch_size)])
+        
+        # Flaw #2-structural Fix: Compute visual uncertainty score from TTA std
+        # visual_std is the per-dimension std across TTA augmented images.
+        # We collapse it to a scalar per sample via L2 norm / sqrt(dim).
+        if visual_std is not None:
+            if isinstance(visual_std, list):
+                visual_std_t = torch.tensor(visual_std, dtype=torch.float32)
+            else:
+                visual_std_t = visual_std
+            # Normalized L2 norm gives a scale-invariant instability score
+            visual_uncertainty = visual_std_t.norm(dim=-1) / (visual_std_t.shape[-1] ** 0.5)
+        else:
+            # No TTA data available — report as unknown (NaN) rather than zero
+            visual_uncertainty = torch.full((batch_size,), float('nan'))
+        
+        # Combined uncertainty: geometric mean of fusion-head and visual uncertainty
+        # If visual_uncertainty is NaN (no TTA), combined falls back to fusion_uncertainties
+        combined = torch.where(
+            torch.isnan(visual_uncertainty),
+            fusion_uncertainties,
+            (fusion_uncertainties * visual_uncertainty).sqrt()
+        )
         
         return {
             "prediction": pred,
             "mean_confidence": conf,
-            "std_deviation": uncertainties,
-            "fusion_head_variance": uncertainties,  # Clarified classification head variance
+            "std_deviation": combined,  # API-compatible field now uses combined metric
+            "fusion_head_variance": fusion_uncertainties,
+            "visual_uncertainty_score": visual_uncertainty,
+            "combined_uncertainty": combined,
             "all_probs": mean_probs
         }
 

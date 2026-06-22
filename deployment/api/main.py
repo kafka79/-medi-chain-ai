@@ -210,8 +210,16 @@ class RedisDistributedSemaphore:
                 if res == 1:
                     acquired = True
             except Exception as e:
-                logger.warning(f"Redis semaphore acquire failed ({e}). Falling back to local lock only.")
-                acquired = True
+                # Flaw #4-structural Fix: Do NOT silently fall back to local-only.
+                # In a multi-replica deployment, allowing local-only locks means
+                # each replica independently grants MAX_CONCURRENT slots, leading
+                # to N × MAX_CONCURRENT total GPU requests (memory exhaustion).
+                # Instead, release the local sem and propagate the failure.
+                self.local_sem.release()
+                raise RuntimeError(
+                    f"Redis semaphore unavailable ({e}). Rejecting request to "
+                    f"prevent distributed lock mismatch across replicas."
+                )
                 
             if not acquired:
                 await asyncio.sleep(0.1)
@@ -560,6 +568,12 @@ async def lifespan(app: FastAPI):
     yield
     cleanup_task.cancel()
     dlq_task.cancel()
+    # Flaw #5-structural Fix: Gracefully close the agent's persistent httpx client
+    if app.state.agent and hasattr(app.state.agent, 'close'):
+        try:
+            await app.state.agent.close()
+        except Exception as e:
+            logger.warning(f"Error closing agent HTTP client: {e}")
     app.state.agent = None
 
 def create_app() -> FastAPI:

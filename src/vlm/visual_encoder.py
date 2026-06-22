@@ -34,6 +34,10 @@ class BiomedVisualEncoder:
         """
         Encodes one or more images into embeddings.
         
+        Flaw #1-structural Fix: Images are letterbox-padded to a square before
+        the BiomedCLIP preprocessor runs. This means the standard center-crop
+        only removes black padding — never real patient anatomy.
+        
         Args:
             image: A PIL Image, a path to an image, or a list of either.
             
@@ -49,6 +53,8 @@ class BiomedVisualEncoder:
         for img in images:
             if isinstance(img, str):
                 img = Image.open(img).convert("RGB")
+            # Letterbox-pad to square so center-crop only trims black borders
+            img = self._letterbox_pad(img)
             processed_images.append(self.preprocess(img))
 
         image_input = torch.stack(processed_images).to(self.device)
@@ -60,6 +66,17 @@ class BiomedVisualEncoder:
         embeddings /= embeddings.norm(dim=-1, keepdim=True)
         
         return embeddings
+
+    @staticmethod
+    def _letterbox_pad(pil_img: Image.Image) -> Image.Image:
+        """Pad an image to a square with black borders, preserving all content."""
+        w, h = pil_img.size
+        if w == h:
+            return pil_img
+        max_dim = max(w, h)
+        padded = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
+        padded.paste(pil_img.convert("RGB"), ((max_dim - w) // 2, (max_dim - h) // 2))
+        return padded
 
     def benchmark(self, dummy_image_path: Optional[str] = None, iterations: int = 10):
         """

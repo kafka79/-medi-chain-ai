@@ -111,10 +111,19 @@ class VisualExplainer:
         return result
 
     def generate_heatmap(self, image_path, target_category=None, output_path=None):
-        """Generate Grad-CAM heatmap for an image."""
+        """Generate Grad-CAM heatmap for an image.
+        
+        Flaw #1-structural Fix: Uses letterbox-padding-aware preprocessing
+        instead of center-crop. The full image is padded to a square, then
+        resized to 224×224, ensuring NO peripheral regions are discarded.
+        The heatmap reverse-mapping strips the padding to overlay correctly.
+        """
         with Image.open(image_path) as pil_img:
             rgb_img = np.array(pil_img.convert('RGB')).astype(np.float32) / 255.0
-            input_tensor = self.preprocess(pil_img).unsqueeze(0).to(next(self.model.parameters()).device)
+            
+            # Letterbox-pad the image to a square before preprocessing
+            padded_pil, pad_info = self._letterbox_pad(pil_img)
+            input_tensor = self.preprocess(padded_pil).unsqueeze(0).to(next(self.model.parameters()).device)
 
         if self.class_embeddings is not None:
             # Construct similarity-based wrapper so ClassifierOutputTarget targets actual similarity scores
@@ -131,41 +140,26 @@ class VisualExplainer:
         # If target_category is None, it targets the highest scoring class
         targets = [ClassifierOutputTarget(target_category)] if target_category is not None else None
 
-        # Generate grayscale CAM
+        # Generate grayscale CAM (on the padded square input)
         grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
         grayscale_cam = grayscale_cam[0, :]
 
-        # Resize grayscale CAM up to original image dimensions with aspect-ratio preservation (mapping the CenterCrop box)
+        # Reverse the letterbox transform: resize CAM to the padded square size,
+        # then crop out the padding to get the CAM at original image dimensions.
         H, W = rgb_img.shape[0], rgb_img.shape[1]
-        cam_full = np.zeros((H, W), dtype=np.float32)
+        pad_top, pad_left, padded_size = pad_info["pad_top"], pad_info["pad_left"], pad_info["padded_size"]
         
-        # Center-crop mapping (BiomedCLIP standard preprocessor resizes the shortest edge to 224, then center-crops to 224x224)
-        if W < H:
-            # Portrait: cropped to a W x W square in the vertical center of the image
-            box_w = W
-            box_h = W
-            top = (H - W) // 2
-            bottom = top + W
-            left = 0
-            right = W
-        else:
-            # Landscape: cropped to an H x H square in the horizontal center of the image
-            box_w = H
-            box_h = H
-            top = 0
-            bottom = H
-            left = (W - H) // 2
-            right = left + H
-            
-        cam_resized = cv2.resize(grayscale_cam, (box_w, box_h))
-        cam_full[top:bottom, left:right] = cam_resized
+        # Resize CAM to the padded square dimensions
+        cam_padded = cv2.resize(grayscale_cam, (padded_size, padded_size))
+        
+        # Crop out padding to recover original aspect ratio
+        cam_original = cam_padded[pad_top:pad_top + H, pad_left:pad_left + W]
+        
+        # Safety: ensure exact match (rounding can cause ±1px)
+        if cam_original.shape != (H, W):
+            cam_original = cv2.resize(cam_original, (W, H))
 
-        visualization = show_cam_on_image(rgb_img, cam_full, use_rgb=True)
-        
-        # Flaw #6 Fix: Dim peripheral/cropped-out regions by 60% to notify clinicians they were not analyzed
-        crop_mask = np.ones((H, W), dtype=bool)
-        crop_mask[top:bottom, left:right] = False
-        visualization[crop_mask] = (visualization[crop_mask] * 0.4).astype(np.uint8)
+        visualization = show_cam_on_image(rgb_img, cam_original, use_rgb=True)
         
         if output_path:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -173,6 +167,26 @@ class VisualExplainer:
             print(f"Saved heatmap to {output_path}")
             
         return visualization
+
+    @staticmethod
+    def _letterbox_pad(pil_img: Image.Image) -> tuple:
+        """Pad an image to a square with black borders, preserving all content.
+        
+        Returns:
+            (padded_image, pad_info) where pad_info contains pad_top, pad_left, padded_size
+        """
+        w, h = pil_img.size
+        max_dim = max(w, h)
+        
+        # Create a black square canvas
+        padded = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
+        
+        # Paste original image centered on the canvas
+        pad_left = (max_dim - w) // 2
+        pad_top = (max_dim - h) // 2
+        padded.paste(pil_img.convert("RGB"), (pad_left, pad_top))
+        
+        return padded, {"pad_top": pad_top, "pad_left": pad_left, "padded_size": max_dim}
 
 if __name__ == "__main__":
     import open_clip

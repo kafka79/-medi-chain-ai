@@ -117,6 +117,7 @@ async def test_dlq_poison_routing():
 
 def test_grad_cam_aspect_ratio_alignment():
     from src.vlm.explainability import VisualExplainer
+    from PIL import Image
     
     model = MagicMock()
     preprocess = MagicMock()
@@ -124,8 +125,8 @@ def test_grad_cam_aspect_ratio_alignment():
     explainer = VisualExplainer(model, preprocess)
     
     # Create a real numpy array of size 200x100 (W=200, H=100) -> landscape (W > H)
-    # So crop box is H x H -> 100 x 100
     mock_img = np.zeros((100, 200, 3), dtype=np.uint8)
+    real_pil_img = Image.fromarray(mock_img)
     
     # Mock cv2 and pytorch_grad_cam functions
     with patch("PIL.Image.open") as mock_open, \
@@ -133,22 +134,18 @@ def test_grad_cam_aspect_ratio_alignment():
          patch("pytorch_grad_cam.GradCAM.__call__") as mock_cam_call, \
          patch("src.vlm.explainability.show_cam_on_image") as mock_show:
          
-        # Make Image.open return a mock image object that can be converted to numpy array
-        mock_pil_img = MagicMock()
-        mock_open.return_value = mock_pil_img
+        mock_open.return_value = real_pil_img
         
-        # Patch np.array(Image.open(...)) to return our mock_img array
-        with patch("numpy.array", return_value=mock_img):
-            mock_cam_call.return_value = np.zeros((1, 14, 14), dtype=np.float32)
-            mock_resize.return_value = np.zeros((100, 100), dtype=np.float32)
-            mock_show.return_value = np.zeros((100, 200, 3), dtype=np.uint8)
-            
-            explainer.generate_heatmap("fake_xray.png")
-            
-            # Check cv2.resize call arguments. It should resize 14x14 grid to (box_w, box_h) -> (100, 100)
-            mock_resize.assert_called_once()
-            resize_args = mock_resize.call_args[0]
-            assert resize_args[1] == (100, 100)
+        mock_cam_call.return_value = np.zeros((1, 14, 14), dtype=np.float32)
+        mock_resize.return_value = np.zeros((200, 200), dtype=np.float32)
+        mock_show.return_value = np.zeros((100, 200, 3), dtype=np.uint8)
+        
+        explainer.generate_heatmap("fake_xray.png")
+        
+        # Check cv2.resize call arguments. It should resize 14x14 grid to (padded_size, padded_size) -> (200, 200)
+        mock_resize.assert_called_once()
+        resize_args = mock_resize.call_args[0]
+        assert resize_args[1] == (200, 200)
 
 
 def test_mc_dropout_feature_perturbation():
