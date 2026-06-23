@@ -222,29 +222,55 @@ class DriftDetector:
         return drift_detected
 
     def _compute_mmd(self, X: np.ndarray, Y: np.ndarray, gamma: float = None) -> float:
-        """Computes Maximum Mean Discrepancy (MMD) with RBF kernel between two distributions X and Y."""
-        n = X.shape[0]
-        m = Y.shape[0]
-        
-        XX = np.sum(X**2, axis=1, keepdims=True)
-        YY = np.sum(Y**2, axis=1, keepdims=True)
-        XY = np.dot(X, Y.T)
-        
-        dist_XX = XX + XX.T - 2 * np.dot(X, X.T)
-        dist_YY = YY + YY.T - 2 * np.dot(Y, Y.T)
-        dist_XY = XX + YY.T - 2 * XY
-        
+        """Linear-time unbiased MMD² estimator (Gretton et al. 2012, Section 6).
+
+        Panel Flaw #5 Fix: The previous O(N²) implementation computed full
+        pairwise distance matrices (N×N, N×M, M×M) which blocked the Python
+        GIL for the entire computation, freezing concurrent async workers.
+
+        This estimator pairs samples 1:1 and computes kernel differences in
+        O(N) time using the h-statistic:
+            h_i = k(x_{2i}, x_{2i+1}) + k(y_{2i}, y_{2i+1})
+                - k(x_{2i}, y_{2i+1}) - k(x_{2i+1}, y_{2i})
+            MMD² ≈ (1/m) Σ h_i   where m = floor(N/2)
+
+        This is unbiased and consistent, with variance O(1/N) vs O(1/N²) for
+        the quadratic estimator — a modest statistical trade-off for a massive
+        computational speedup under production traffic.
+        """
+        n = min(X.shape[0], Y.shape[0])
+        if n < 4:
+            return 0.0
+
+        # Truncate to equal length and shuffle for unbiased pairing
+        X, Y = X[:n], Y[:n]
+        perm = np.random.permutation(n)
+        X, Y = X[perm], Y[perm]
+
+        # Use only even number of samples for clean pairing
+        m = n // 2
+        X_even, X_odd = X[:m], X[m:2*m]
+        Y_even, Y_odd = Y[:m], Y[m:2*m]
+
+        # Estimate gamma from a small subsample if not provided
         if gamma is None:
-            all_dists = np.concatenate([dist_XX.ravel(), dist_YY.ravel(), dist_XY.ravel()])
-            median_dist = np.median(all_dists)
+            subsample_size = min(m, 50)
+            dists = np.sum((X_even[:subsample_size] - Y_even[:subsample_size]) ** 2, axis=1)
+            median_dist = np.median(dists)
             gamma = 1.0 / (median_dist + 1e-8)
-            
-        K_XX = np.exp(-gamma * dist_XX)
-        K_YY = np.exp(-gamma * dist_YY)
-        K_XY = np.exp(-gamma * dist_XY)
-        
-        mmd = np.sum(K_XX) / (n * n) - 2 * np.sum(K_XY) / (n * m) + np.sum(K_YY) / (m * m)
-        return float(mmd)
+
+        def rbf_kernel(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+            """Vectorized RBF kernel for paired rows: k(a_i, b_i) for all i."""
+            sq_dists = np.sum((a - b) ** 2, axis=1)
+            return np.exp(-gamma * sq_dists)
+
+        # h_i = k(x_even, x_odd) + k(y_even, y_odd) - k(x_even, y_odd) - k(x_odd, y_even)
+        h = (rbf_kernel(X_even, X_odd)
+             + rbf_kernel(Y_even, Y_odd)
+             - rbf_kernel(X_even, Y_odd)
+             - rbf_kernel(X_odd, Y_even))
+
+        return float(np.mean(h))
 
     def check_covariate_shift(self, current_features: list):
         """

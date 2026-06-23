@@ -74,12 +74,17 @@ class UncertaintyEstimator:
             # No TTA data available — report as unknown (NaN) rather than zero
             visual_uncertainty = torch.full((batch_size,), float('nan'))
         
-        # Combined uncertainty: geometric mean of fusion-head and visual uncertainty
-        # If visual_uncertainty is NaN (no TTA), combined falls back to fusion_uncertainties
+        # Panel Flaw #6 Fix: Law of total variance under independence.
+        # Var(Y) = E[Var(Y|X)] + Var(E[Y|X])
+        # The previous geometric mean sqrt(a * b) had no Bayesian justification.
+        # Under the assumption that visual encoder noise and classifier head
+        # noise are independent uncertainty sources, total variance is their
+        # sum. This is mathematically grounded in the Bayesian deep learning
+        # literature (Kendall & Gal, 2017 — "What Uncertainties Do We Need").
         combined = torch.where(
             torch.isnan(visual_uncertainty),
             fusion_uncertainties,
-            (fusion_uncertainties * visual_uncertainty).sqrt()
+            fusion_uncertainties + visual_uncertainty
         )
         
         return {

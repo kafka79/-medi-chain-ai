@@ -69,14 +69,31 @@ class BiomedVisualEncoder:
 
     @staticmethod
     def _letterbox_pad(pil_img: Image.Image) -> Image.Image:
-        """Pad an image to a square with black borders, preserving all content."""
+        """Pad an image to a square using reflect-padding, preserving all content.
+
+        Panel Flaw #4 Fix: Replaced solid black (0,0,0) padding with reflect
+        padding. Black borders create high-contrast artificial edges that
+        attract ViT self-attention to the padding boundary instead of the
+        actual pathology. Reflect-padding mirrors edge pixels seamlessly.
+        """
         w, h = pil_img.size
         if w == h:
             return pil_img
         max_dim = max(w, h)
-        padded = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
-        padded.paste(pil_img.convert("RGB"), ((max_dim - w) // 2, (max_dim - h) // 2))
-        return padded
+
+        import numpy as np
+        pad_left = (max_dim - w) // 2
+        pad_right = max_dim - w - pad_left
+        pad_top = (max_dim - h) // 2
+        pad_bottom = max_dim - h - pad_top
+
+        img_array = np.array(pil_img.convert("RGB"))
+        padded_array = np.pad(
+            img_array,
+            ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode='reflect'
+        )
+        return Image.fromarray(padded_array)
 
     def benchmark(self, dummy_image_path: Optional[str] = None, iterations: int = 10):
         """

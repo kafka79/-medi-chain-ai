@@ -158,9 +158,22 @@ ehr_gateway = EHRGateway()
 feedback_logger = FeedbackLogger(redis_client=redis_client, storage_provider=storage)
 
 class RedisDistributedSemaphore:
+    """Distributed semaphore backed by Redis sorted-set leases.
+
+    Panel Flaw #2 Fix: The previous implementation used a spinlock that polled
+    Redis every 100ms (``while not acquired: await asyncio.sleep(0.1)``).
+    Under high concurrency this generated a storm of network round-trips.
+
+    This version replaces the spinlock with Redis BLPOP on a notification key.
+    When a lease is released in ``__aexit__``, the releaser pushes a token to
+    the notification list.  Waiters call ``BLPOP`` which is a Redis-native
+    blocking operation — the connection idles until a token arrives, consuming
+    zero CPU and zero network bandwidth while waiting.
+    """
     def __init__(self, r_client, name: str, limit: int):
         self.redis = r_client
         self.name = f"medi_chain:semaphore:{name}:leases"
+        self.notify_key = f"medi_chain:semaphore:{name}:notify"
         self.limit = limit
         self.local_sem = asyncio.Semaphore(limit)
         self.client_id_var = contextvars.ContextVar(f"sem_client_id_{name}", default=None)
@@ -176,6 +189,7 @@ class RedisDistributedSemaphore:
         acquired = False
         loop = asyncio.get_running_loop()
         lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "60"))
+        blpop_timeout = int(os.getenv("SEMAPHORE_BLPOP_TIMEOUT", "5"))
         
         acquire_script = """
         local leases_key = KEYS[1]
@@ -200,8 +214,32 @@ class RedisDistributedSemaphore:
         end
         """
         
+        # First attempt — optimistic acquisition without blocking
+        try:
+            now = time.time()
+            res = await loop.run_in_executor(
+                None,
+                lambda: self.redis.eval(acquire_script, 1, self.name, self.limit, now, lease_ttl, client_id)
+            )
+            if res == 1:
+                acquired = True
+        except Exception as e:
+            self.local_sem.release()
+            raise RuntimeError(
+                f"Redis semaphore unavailable ({e}). Rejecting request to "
+                f"prevent distributed lock mismatch across replicas."
+            )
+        
+        # If not acquired, block on BLPOP notifications instead of polling
         while not acquired:
             try:
+                # BLPOP blocks the Redis connection until a notification arrives
+                # or the timeout expires — zero CPU, zero network chatter while waiting
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.redis.blpop(self.notify_key, timeout=blpop_timeout)
+                )
+                # A notification arrived (or timeout expired) — try to acquire again
                 now = time.time()
                 res = await loop.run_in_executor(
                     None,
@@ -210,19 +248,11 @@ class RedisDistributedSemaphore:
                 if res == 1:
                     acquired = True
             except Exception as e:
-                # Flaw #4-structural Fix: Do NOT silently fall back to local-only.
-                # In a multi-replica deployment, allowing local-only locks means
-                # each replica independently grants MAX_CONCURRENT slots, leading
-                # to N × MAX_CONCURRENT total GPU requests (memory exhaustion).
-                # Instead, release the local sem and propagate the failure.
                 self.local_sem.release()
                 raise RuntimeError(
                     f"Redis semaphore unavailable ({e}). Rejecting request to "
                     f"prevent distributed lock mismatch across replicas."
                 )
-                
-            if not acquired:
-                await asyncio.sleep(0.1)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -232,6 +262,16 @@ class RedisDistributedSemaphore:
                 try:
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, lambda: self.redis.zrem(self.name, client_id))
+                    # Panel Flaw #2 Fix: Notify one blocked waiter that a slot is now available.
+                    # LPUSH + LTRIM keeps the notification list bounded to prevent unbounded growth
+                    # if no waiters are listening (e.g., low-traffic periods).
+                    await loop.run_in_executor(
+                        None,
+                        lambda: (
+                            self.redis.lpush(self.notify_key, "1"),
+                            self.redis.ltrim(self.notify_key, 0, self.limit * 2)
+                        )
+                    )
                 except Exception as e:
                     logger.error(f"Redis semaphore release failed: {e}")
         self.local_sem.release()

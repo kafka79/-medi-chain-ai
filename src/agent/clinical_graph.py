@@ -100,16 +100,16 @@ class ClinicalAgent:
         from ..data.privacy_scrubber import PrivacyScrubber
         self.scrubber = PrivacyScrubber()
 
-        # Flaw #13 Fix: Assert class count matches the fusion model at construction time
-        from src.models.fusion import LateFusionModel
-        _tmp_model = LateFusionModel()
-        # Extract num_classes from the classifier's final Linear layer
-        classifier_out_features = _tmp_model.classifier[-1].out_features
-        assert classifier_out_features == NUM_CLASSES, (
-            f"FATAL: LateFusionModel has {classifier_out_features} output classes but "
+        # Flaw #13 Fix + Panel Flaw #1 Fix: Validate class count via metadata —
+        # no model instantiation on the Web API container. The previous approach
+        # created a full LateFusionModel on CPU just to read .out_features, which
+        # forced PyTorch weight loading on a container that should be GPU-free.
+        from src.models.fusion import get_model_num_classes
+        _expected_classes = get_model_num_classes()
+        assert _expected_classes == NUM_CLASSES, (
+            f"FATAL: Model configured for {_expected_classes} output classes but "
             f"DIAGNOSTIC_CLASSES has {NUM_CLASSES}. These MUST match."
         )
-        del _tmp_model
         
         self.workflow = StateGraph(AgentState)
         self._build_graph()

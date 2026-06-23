@@ -74,6 +74,11 @@ class S3StorageProvider(StorageProvider):
             )
         self.bucket = bucket
         
+        # Panel Flaw #3 Fix: Track all temp files created by load() downloads.
+        # Without this, callers that forget to delete downloaded files cause
+        # silent disk exhaustion on the host.
+        self._downloaded_temp_files: set = set()
+        
         try:
             import urllib3
             # Set connection timeout to 2.0 seconds to prevent blocking threads when MinIO is down
@@ -145,6 +150,8 @@ class S3StorageProvider(StorageProvider):
             tmp.close()
             
             self.client.fget_object(self.bucket, relative_path, tmp_close_name)
+            # Panel Flaw #3 Fix: Register this temp file so cleanup_downloads() can reclaim it
+            self._downloaded_temp_files.add(tmp_close_name)
             logger.info(f"Downloaded s3://{self.bucket}/{relative_path} to {tmp_close_name}")
             return tmp_close_name
         except Exception as e:
@@ -166,10 +173,31 @@ class S3StorageProvider(StorageProvider):
         except Exception as e:
             logger.error(f"Failed to delete file from S3: {e}")
 
+    def cleanup_downloads(self):
+        """Panel Flaw #3 Fix: Remove all temp files created by load() that still exist on disk.
+
+        Without this, if callers forget to delete downloaded files (e.g. due to
+        exceptions), the temp files accumulate silently and eventually exhaust
+        the host's disk space.
+        """
+        reclaimed = set()
+        for path in self._downloaded_temp_files:
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+                    logger.info(f"Cleaned up orphaned S3 download temp file: {path}")
+                reclaimed.add(path)
+            except Exception as e:
+                logger.error(f"Failed to clean up downloaded temp file {path}: {e}")
+        self._downloaded_temp_files -= reclaimed
+
     def cleanup(self, max_age_seconds: int):
         if not self.client:
             return
-            
+
+        # Panel Flaw #3 Fix: Also reclaim orphaned download temp files
+        self.cleanup_downloads()
+
         try:
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc)

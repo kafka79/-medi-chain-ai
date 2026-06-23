@@ -170,22 +170,34 @@ class VisualExplainer:
 
     @staticmethod
     def _letterbox_pad(pil_img: Image.Image) -> tuple:
-        """Pad an image to a square with black borders, preserving all content.
-        
+        """Pad an image to a square using reflect-padding, preserving all content.
+
+        Panel Flaw #4 Fix: Replaced solid black (0,0,0) padding with reflect
+        padding. Black borders create high-contrast artificial edges that
+        attract ViT self-attention to the padding boundary instead of the
+        actual pathology, distorting both predictions and Grad-CAM heatmaps.
+        Reflect-padding mirrors edge pixels, producing smooth continuations
+        that are invisible to the attention mechanism.
+
         Returns:
             (padded_image, pad_info) where pad_info contains pad_top, pad_left, padded_size
         """
         w, h = pil_img.size
         max_dim = max(w, h)
-        
-        # Create a black square canvas
-        padded = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
-        
-        # Paste original image centered on the canvas
+
         pad_left = (max_dim - w) // 2
+        pad_right = max_dim - w - pad_left
         pad_top = (max_dim - h) // 2
-        padded.paste(pil_img.convert("RGB"), (pad_left, pad_top))
-        
+        pad_bottom = max_dim - h - pad_top
+
+        img_array = np.array(pil_img.convert("RGB"))
+        padded_array = np.pad(
+            img_array,
+            ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode='reflect'
+        )
+        padded = Image.fromarray(padded_array)
+
         return padded, {"pad_top": pad_top, "pad_left": pad_left, "padded_size": max_dim}
 
 if __name__ == "__main__":

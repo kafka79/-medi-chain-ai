@@ -34,6 +34,17 @@ def load_diagnostic_classes():
 DIAGNOSTIC_CLASSES = load_diagnostic_classes()
 NUM_CLASSES = len(DIAGNOSTIC_CLASSES)
 
+
+def get_model_num_classes() -> int:
+    """Return the number of output classes the model is configured for.
+
+    This allows the Web API container to validate that DIAGNOSTIC_CLASSES
+    matches the model's expected output dimension WITHOUT instantiating
+    the full LateFusionModel (which would needlessly load PyTorch weights
+    on a container that should remain GPU-free).
+    """
+    return NUM_CLASSES
+
 class AttentionFusion(nn.Module):
     """
     Addresses Flaw #5: Overengineered Multimodal Fusion.

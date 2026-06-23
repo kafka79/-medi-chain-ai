@@ -8,20 +8,13 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
 # Mock the PrivacyScrubber at its source module before clinical_graph imports it
-_mock_linear = MagicMock()
-_mock_linear.out_features = 5
 
 
 @pytest.fixture(autouse=True)
 def mock_dependencies():
     """Mock all external dependencies so tests run without GPU, Milvus, or inference API."""
     with patch("src.data.privacy_scrubber.PrivacyScrubber") as mock_scrubber_cls, \
-         patch("src.models.fusion.LateFusionModel") as mock_fusion_cls:
-        
-        # Mock the fusion model's classifier for the startup assertion
-        mock_model_instance = MagicMock()
-        mock_model_instance.classifier.__getitem__ = MagicMock(return_value=_mock_linear)
-        mock_fusion_cls.return_value = mock_model_instance
+         patch("src.models.fusion.get_model_num_classes", return_value=5):
         
         # Mock the scrubber
         mock_scrubber_cls.return_value = MagicMock()
