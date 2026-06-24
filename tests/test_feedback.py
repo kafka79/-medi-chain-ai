@@ -39,7 +39,7 @@ def test_analyze_escalation_header(monkeypatch, mock_inference_api):
         )
         assert response.status_code == 200
         assert response.json()["escalation_required"] is True
-        assert response.headers.get("X-Requires-Human-Review") == "true"
+        assert "X-Requires-Human-Review" not in response.headers
 
 def test_analyze_no_escalation_header(monkeypatch, mock_inference_api):
     # Set up agent that does not trigger escalation

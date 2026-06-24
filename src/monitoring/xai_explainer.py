@@ -29,8 +29,10 @@ class XAIExplainer:
         except ImportError:
             DIAGNOSTIC_CLASSES = ["Silicosis", "Pneumonia", "Tuberculosis", "Asbestosis", "Normal"]
 
-        # 1. Differential Diagnosis & Confidence Gap analysis
-        gap_info = ""
+        # Dynamically build base reasoning based on feature synthesis rather than rigid rule mapping
+        evidence_points = []
+        
+        # Factor 1: Probabilities and Confidence
         if probabilities and len(probabilities) == len(DIAGNOSTIC_CLASSES):
             indexed_probs = list(enumerate(probabilities))
             sorted_probs = sorted(indexed_probs, key=lambda x: x[1], reverse=True)
@@ -38,46 +40,24 @@ class XAIExplainer:
                 top_idx, top_prob = sorted_probs[0]
                 sec_idx, sec_prob = sorted_probs[1]
                 gap = top_prob - sec_prob
-                gap_info = f" (Confidence gap of {gap:.2f} to next class '{DIAGNOSTIC_CLASSES[sec_idx]}')"
+                evidence_points.append(f"Model classified '{DIAGNOSTIC_CLASSES[top_idx]}' with {top_prob:.1%} probability (Margin of {gap:.1%} over '{DIAGNOSTIC_CLASSES[sec_idx]}').")
+        
+        # Factor 2: Patient Demographics & Exposure
+        demo_str = []
+        if age != "Unknown": demo_str.append(f"{age}-year-old")
+        if gender != "Unknown": demo_str.append(f"{gender}")
+        demo_text = " ".join(demo_str) if demo_str else "Patient"
+        
+        if occupation != "Unknown" or exposure_years != "0":
+            evidence_points.append(f"{demo_text} has an occupational history as a {occupation} with {exposure_years} years of exposure.")
+            
+        # Factor 3: Clinical Presentation
+        if chief_complaint and chief_complaint.lower() != "not found":
+            evidence_points.append(f"Primary presentation is '{chief_complaint}'.")
 
-        # Dynamically build base reasoning based on specific patient demographics & symptoms
-        if diagnosis == "Silicosis":
-            base_reason = (
-                f"Visual features indicate upper lobe nodular opacities. This pattern is highly "
-                f"correlated with the patient's {exposure_years} years of exposure history as a {occupation} "
-                f"presenting with '{chief_complaint}'."
-            )
-        elif diagnosis == "Pneumonia":
-            base_reason = (
-                f"Visual features show localized consolidation patterns (typically lower lobe). "
-                f"This matches the acute symptoms of '{chief_complaint}' in this {age}-year-old {gender} patient."
-            )
-        elif diagnosis == "Tuberculosis":
-            base_reason = (
-                f"Visual features highlight apical cavitary lesions. This presentation is clinically "
-                f"consistent with the chief complaint of '{chief_complaint}'."
-            )
-        elif diagnosis == "Asbestosis":
-            base_reason = (
-                f"Visual features show pleural thickening and subpleural reticular lines in the lower zones. "
-                f"This matches the patient's occupational history as a {occupation} with {exposure_years} years of dust exposure."
-            )
-        elif diagnosis == "Normal":
-            base_reason = (
-                f"Visual features indicate clear lung fields, sharp costophrenic angles, and normal lung volume. "
-                f"There are no visual indicators to match the complaint of '{chief_complaint}'."
-            )
-        elif diagnosis == "Out-of-Distribution":
-            base_reason = (
-                f"Visual features suggest a pathology outside the system's known diagnostic classes. "
-                f"This Out-of-Distribution case requires manual diagnostic assessment."
-            )
-        else:
-            base_reason = f"Atypical presentation detected for '{chief_complaint}'."
-
-        dyn_text = f"Diagnosis of {diagnosis} with {confidence:.1%} confidence (±{uncertainty:.3f} std dev from MC Dropout)."
-        if probabilities:
-            dyn_text += f" Raw class probabilities: {[f'{p:.2f}' for p in probabilities]}."
+        base_reason = " ".join(evidence_points)
+        
+        dyn_text = f"Diagnosis of {diagnosis} with {confidence:.1%} overall confidence (±{uncertainty:.3f} std dev from MC Dropout)."
             
         import os
         uncertainty_threshold = float(os.getenv("UNCERTAINTY_THRESHOLD", "0.15"))
@@ -110,9 +90,9 @@ class XAIExplainer:
                 citation_info = " Supporting PubMed Literature: " + "; ".join(citations_list) + "."
 
         if diagnosis == "Out-of-Distribution":
-            return f"CAUTION: {dyn_text}{gap_info} {base_reason} Unknown pathology detected. Immediate manual clinical review is required.{evidence_synthesis}{citation_info}"
+            return f"CAUTION: {dyn_text} {base_reason} Unknown pathology detected. Immediate manual clinical review is required.{evidence_synthesis}{citation_info}"
             
         if uncertainty > uncertainty_threshold:
-            return f"CAUTION: {dyn_text}{gap_info} {base_reason} High predictive uncertainty suggests a non-standard presentation. Manual review of priors is advised.{evidence_synthesis}{citation_info}"
+            return f"CAUTION: {dyn_text} {base_reason} High predictive uncertainty suggests a non-standard presentation. Manual review of priors is advised.{evidence_synthesis}{citation_info}"
         
-        return f"Rationale: {dyn_text}{gap_info} {base_reason}{evidence_synthesis}{citation_info}"
+        return f"Rationale: {dyn_text} {base_reason}{evidence_synthesis}{citation_info}"

@@ -404,7 +404,7 @@ async def reconcile_dlq_task():
     loop = asyncio.get_running_loop()
     active_tasks = set()
     
-    async def process_reconciliation(item: dict, source_type: str, identifier: Optional[str], item_raw_json: Optional[str] = None, lock: Optional[Any] = None):
+    async def process_reconciliation(item: dict, source_type: str, identifier: Optional[str], item_raw_json: Optional[str] = None):
         try:
             payload = item.get("payload")
             if not payload:
@@ -429,10 +429,6 @@ async def reconcile_dlq_task():
                         file_path = Path(identifier)
                         if file_path.exists():
                             file_path.unlink()
-                        # Clean up lock file
-                        lock_path = file_path.with_suffix(".lock")
-                        if lock_path.exists():
-                            lock_path.unlink()
                     except Exception as e:
                         logger.error(f"[DLQ Reconciler] Failed to delete resolved local DLQ file {identifier}: {e}")
                 elif source_type == "redis" and r and item_raw_json:
@@ -474,10 +470,6 @@ async def reconcile_dlq_task():
                             file_path = Path(identifier)
                             if file_path.exists():
                                 file_path.unlink()
-                            # Clean up lock file
-                            lock_path = file_path.with_suffix(".lock")
-                            if lock_path.exists():
-                                lock_path.unlink()
                         except Exception as e:
                             logger.error(f"[DLQ Reconciler] Failed to delete poisoned local DLQ file {identifier}: {e}")
                     
@@ -499,21 +491,14 @@ async def reconcile_dlq_task():
                         try:
                             with open(identifier, "w") as f:
                                 json.dump(item, f, indent=2)
+                            # Rename back to .json so it can be picked up again
+                            orig_path = Path(identifier).with_suffix(".json")
+                            Path(identifier).rename(orig_path)
                         except Exception as local_err:
                             logger.error(f"[DLQ Reconciler] Failed to write updated local DLQ retry count: {local_err}")
         except Exception as err:
             logger.error(f"[DLQ Reconciler] Error processing DLQ item: {err}")
         finally:
-            if lock:
-                try:
-                    lock.release()
-                    # Clean up the lock file after release if the main file was deleted
-                    if source_type == "local" and identifier:
-                        lock_path = Path(identifier).with_suffix(".lock")
-                        if not Path(identifier).exists() and lock_path.exists():
-                            lock_path.unlink()
-                except Exception as le:
-                    logger.error(f"[DLQ Reconciler] Failed to release lock: {le}")
             dlq_semaphore.release()
             
     while True:
@@ -541,37 +526,38 @@ async def reconcile_dlq_task():
                 dlq_dir = Path("temp/dlq")
                 if dlq_dir.exists() and dlq_dir.is_dir():
                     try:
-                        local_files = [f for f in dlq_dir.glob("failed_report_*.json") if not f.name.endswith(".lock")]
+                        from itertools import islice
+                        # Limit to 50 files per iteration to avoid globbing thousands of files
+                        local_files = [f for f in islice(dlq_dir.glob("failed_report_*.json"), 50)]
                     except Exception as glob_err:
                         logger.error(f"[DLQ Reconciler] Glob error: {glob_err}")
                         local_files = []
                         
                     for file_path in local_files:
-                        lock_path = file_path.with_suffix(".lock")
-                        from filelock import FileLock, Timeout
-                        lock = FileLock(str(lock_path), timeout=0.1)
+                        processing_path = file_path.with_suffix(".processing")
                         try:
-                            # Non-blocking lock acquisition
-                            lock.acquire(timeout=0.01)
-                        except Timeout:
-                            # Locked by another process/thread
+                            # Atomic rename to claim the file without OS locks
+                            file_path.rename(processing_path)
+                        except FileNotFoundError:
+                            # Another process/thread claimed it or it was deleted
+                            continue
+                        except Exception as e:
+                            logger.error(f"[DLQ Reconciler] Failed to rename local DLQ file {file_path.name}: {e}")
                             continue
                         
                         try:
-                            if not file_path.exists():
-                                lock.release()
-                                continue
-                            with open(file_path, "r") as f:
+                            with open(processing_path, "r") as f:
                                 item = json.load(f)
-                            task = asyncio.create_task(process_reconciliation(item, "local", str(file_path), lock=lock))
+                            task = asyncio.create_task(process_reconciliation(item, "local", str(processing_path)))
                             active_tasks.add(task)
                             task.add_done_callback(active_tasks.discard)
                             item_found = True
                             break
                         except Exception as e:
-                            logger.error(f"[DLQ Reconciler] Failed to read local DLQ file {file_path.name}: {e}")
+                            logger.error(f"[DLQ Reconciler] Failed to read local DLQ file {processing_path.name}: {e}")
                             try:
-                                lock.release()
+                                # Revert rename on failure to read
+                                processing_path.rename(file_path)
                             except Exception:
                                 pass
                                     
@@ -717,10 +703,10 @@ def create_app() -> FastAPI:
                 "model_metadata": get_model_metadata(),
             }
 
-            # Flaw #5 Fix: Set explicit HTTP header when human review is required
+            # Flaw #5 Fix: Remove the X-Requires-Human-Review HTTP header setting.
+            # Escalation is now a first-class field in the JSON response payload.
             headers = {}
             if escalation:
-                headers["X-Requires-Human-Review"] = "true"
                 logger.warning(f"[{request_id}] Escalation triggered — insufficient evidence for automated diagnosis.")
 
             return JSONResponse(content=response_payload, headers=headers)

@@ -57,7 +57,7 @@ def test_xai_explainer_dynamic_synthesis():
     assert "labs: Elevated WBC count" in rationale
     assert "Silica dust hazards" in rationale
     assert "PMID: 999888" in rationale
-    assert "Confidence gap of 0.83" in rationale
+    assert "Margin of 83.0%" in rationale
 
 def test_evaluator_lazy_connection():
     with patch("pymilvus.connections.connect") as mock_connect, \

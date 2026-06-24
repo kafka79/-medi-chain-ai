@@ -47,8 +47,8 @@ def get_model_num_classes() -> int:
 
 class AttentionFusion(nn.Module):
     """
-    Addresses Flaw #5: Overengineered Multimodal Fusion.
-    Implements a first-principles true cross-modal Multi-Head Attention layer.
+    Addresses Flaw #5 (and #2 from panel): Overengineered Multimodal Fusion.
+    Replaced the "Attention Illusion" with a highly efficient Gated MLP fusion mechanism.
     Retains norm1, norm2, and ffn properties for backward compatibility with testing suites.
     """
     def __init__(self, vision_dim=512, text_dim=768, hidden_dim=512, num_classes=NUM_CLASSES):
@@ -58,8 +58,11 @@ class AttentionFusion(nn.Module):
         self.v_proj = nn.Linear(vision_dim, hidden_dim)
         self.t_proj = nn.Linear(text_dim, hidden_dim)
         
-        # True self-attention block over the multimodal sequence [v, t]
-        self.self_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
+        # Gated fusion to learn dynamic modality weighting
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Sigmoid()
+        )
         
         self.norm1 = nn.LayerNorm(hidden_dim)
         
@@ -86,14 +89,9 @@ class AttentionFusion(nn.Module):
         v = self.v_proj(vision_emb)  # Shape: (batch, hidden_dim)
         t = self.t_proj(text_emb)    # Shape: (batch, hidden_dim)
         
-        # Stack to form a multimodal sequence of length 2: Shape (batch, 2, hidden_dim)
-        fused_seq = torch.stack([v, t], dim=1)
-        
-        # True self-attention where visual and text features attend to each other
-        attn_out, _ = self.self_attn(query=fused_seq, key=fused_seq, value=fused_seq)
-        
-        # Aggregate the attended tokens back to single representation (average pooling)
-        fused = attn_out.mean(dim=1)  # Shape: (batch, hidden_dim)
+        # Gated MLP Fusion
+        gate = self.fusion_gate(torch.cat([v, t], dim=1))
+        fused = v * gate + t * (1 - gate)  # Shape: (batch, hidden_dim)
         
         # Additive residual connection and first layer norm
         fused = self.norm1(fused + (v + t) / 2.0)
