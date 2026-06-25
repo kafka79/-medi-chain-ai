@@ -155,7 +155,14 @@ def test_local_first_dlq_fallback():
     assert len(files) == 1
     
     with open(files[0], "r") as f:
-        stored = json.load(f)
+        wrapper = json.load(f)
+        
+    if isinstance(wrapper, dict) and wrapper.get("encrypted"):
+        from src.utils.security import decrypt_payload
+        decrypted = decrypt_payload(wrapper["data"])
+        stored = json.loads(decrypted)
+    else:
+        stored = wrapper
         
     assert stored["payload"]["resourceType"] == "DiagnosticReport"
     assert "payload" in stored

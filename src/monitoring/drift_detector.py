@@ -8,6 +8,8 @@ import os
 import requests as http_requests
 from datetime import datetime, timezone
 import asyncio
+import tempfile
+from typing import Any, Optional
 
 logger = logging.getLogger("drift-detector")
 
@@ -91,6 +93,8 @@ class DriftDetector:
         return nil
         """
 
+        self.cache_dir = Path(os.getenv("DRIFT_CACHE_DIR", "temp/drift"))
+
         if self.disabled:
             return
 
@@ -108,39 +112,107 @@ class DriftDetector:
         self.baseline = self._load_baseline()
         self.features_baseline = self._load_features_baseline()
 
-    def _load_baseline(self):
+    def _write_local_cache(self, filename: str, data: Any):
         try:
-            data = self.redis_client.get(self.baseline_key)
-            if data:
-                return np.array(json.loads(data))
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            # Use NamedTemporaryFile to perform an atomic write-then-rename swap
+            temp_file = tempfile.NamedTemporaryFile(dir=str(self.cache_dir), delete=False, mode="w", suffix=".tmp")
+            try:
+                json.dump(data, temp_file, indent=2)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+                temp_file.close()
+                
+                target_path = self.cache_dir / filename
+                os.replace(temp_file.name, target_path)
+                logger.info(f"Successfully cached drift baseline locally to {target_path}")
+            except Exception as e:
+                try:
+                    os.unlink(temp_file.name)
+                except Exception:
+                    pass
+                raise e
         except Exception as e:
-            logger.error(f"Failed to load prediction baseline from Redis: {e}")
+            logger.error(f"Failed to write local drift cache {filename}: {e}")
+
+    def _read_local_cache(self, filename: str) -> Optional[Any]:
+        target_path = self.cache_dir / filename
+        if not target_path.exists():
+            return None
+        try:
+            with open(target_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to read local drift cache {target_path}: {e}")
+            return None
+
+    def _load_baseline(self):
+        data = None
+        if self.redis_client is not None:
+            try:
+                data = self.redis_client.get(self.baseline_key)
+            except Exception as e:
+                logger.error(f"Failed to load prediction baseline from Redis: {e}")
+        
+        if data:
+            try:
+                parsed = json.loads(data)
+                self._write_local_cache("prediction_baseline_cache.json", parsed)
+                return np.array(parsed)
+            except Exception as e:
+                logger.error(f"Failed to process Redis prediction baseline: {e}")
+        
+        logger.warning("Attempting local cache backup fallback for prediction baseline.")
+        cached_data = self._read_local_cache("prediction_baseline_cache.json")
+        if cached_data:
+            logger.info("Successfully loaded prediction baseline from local cache backup.")
+            return np.array(cached_data)
         return None
 
     def _save_baseline(self, probs: list):
-        try:
-            self.redis_client.set(self.baseline_key, json.dumps(probs))
-            self.baseline = np.array(probs)
-            logger.info("Saved new global drift prediction baseline to Redis.")
-        except Exception as e:
-            logger.error(f"Failed to save prediction baseline to Redis: {e}")
+        if self.redis_client is not None:
+            try:
+                self.redis_client.set(self.baseline_key, json.dumps(probs))
+                logger.info("Saved new global drift prediction baseline to Redis.")
+            except Exception as e:
+                logger.error(f"Failed to save prediction baseline to Redis: {e}")
+        
+        self._write_local_cache("prediction_baseline_cache.json", probs)
+        self.baseline = np.array(probs)
 
     def _load_features_baseline(self):
-        try:
-            data = self.redis_client.get(self.features_baseline_key)
-            if data:
-                return np.array(json.loads(data))
-        except Exception as e:
-            logger.error(f"Failed to load features baseline from Redis: {e}")
+        data = None
+        if self.redis_client is not None:
+            try:
+                data = self.redis_client.get(self.features_baseline_key)
+            except Exception as e:
+                logger.error(f"Failed to load features baseline from Redis: {e}")
+                
+        if data:
+            try:
+                parsed = json.loads(data)
+                self._write_local_cache("features_baseline_cache.json", parsed)
+                return np.array(parsed)
+            except Exception as e:
+                logger.error(f"Failed to process Redis features baseline: {e}")
+                
+        logger.warning("Attempting local cache backup fallback for features baseline.")
+        cached_data = self._read_local_cache("features_baseline_cache.json")
+        if cached_data:
+            logger.info("Successfully loaded features baseline from local cache backup.")
+            return np.array(cached_data)
         return None
 
     def _save_features_baseline(self, features: list):
-        try:
-            self.redis_client.set(self.features_baseline_key, json.dumps(features))
-            self.features_baseline = np.array(features)
-            logger.info("Saved new global features baseline (covariate shift) to Redis.")
-        except Exception as e:
-            logger.error(f"Failed to save features baseline to Redis: {e}")
+        if self.redis_client is not None:
+            try:
+                self.redis_client.set(self.features_baseline_key, json.dumps(features))
+                logger.info("Saved new global features baseline (covariate shift) to Redis.")
+            except Exception as e:
+                logger.error(f"Failed to save features baseline to Redis: {e}")
+                
+        self._write_local_cache("features_baseline_cache.json", features)
+        self.features_baseline = np.array(features)
 
     async def add_prediction(self, probs: list, visual_features: list = None):
         """Adds current prediction probabilities and visual features to persistent distributed windows.

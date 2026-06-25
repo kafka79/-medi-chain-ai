@@ -4,8 +4,27 @@ from fhir.resources.codeableconcept import CodeableConcept
 from fhir.resources.coding import Coding
 from fhir.resources.reference import Reference
 from fhir.resources.extension import Extension
+from fhir.resources.observation import Observation
+from fhir.resources.quantity import Quantity
 import json
 from datetime import datetime, timezone
+
+SNOMED_CODES = {
+    "silicosis": ("50751000", "Silicosis"),
+    "asbestosis": ("284594005", "Asbestosis"),
+    "pneumonia": ("233604007", "Pneumonia"),
+    "tuberculosis": ("56717001", "Tuberculosis"),
+    "normal": ("17621005", "Normal"),
+}
+
+def get_snomed_coding(condition_name: str) -> Coding:
+    key = condition_name.lower().strip()
+    code, display = SNOMED_CODES.get(key, ("unknown", condition_name))
+    return Coding(
+        system="http://snomed.info/sct",
+        code=code,
+        display=display
+    )
 
 class FHIRFormatter:
     def __init__(self):
@@ -35,12 +54,44 @@ class FHIRFormatter:
             )
 
         patient_id = diagnosis_data.get('patient_id', 'Unknown')
+        
+        # Generate contained Observation resources for differential diagnosis
+        contained_observations = []
+        result_references = []
+        
+        import uuid
+        timestamp = int(datetime.now(timezone.utc).timestamp())
+        
+        for condition, prob in diagnosis_data.get('differential', {}).items():
+            obs_id = f"obs-{condition.lower().replace(' ', '-')}-{uuid.uuid4().hex[:6]}"
+            coding = get_snomed_coding(condition)
+            
+            obs = Observation(
+                id=obs_id,
+                status=status,
+                code=CodeableConcept(
+                    coding=[coding]
+                ),
+                subject=Reference(
+                    reference=f"Patient/{patient_id}",
+                    display=f"Patient {patient_id}"
+                ),
+                valueQuantity=Quantity(
+                    value=float(prob),
+                    unit="%",
+                    system="http://unitsofmeasure.org",
+                    code="%"
+                )
+            )
+            contained_observations.append(obs)
+            result_references.append(Reference(reference=f"#{obs_id}"))
+
         return DiagnosticReport(
             status=status,
             extension=extensions,
             identifier=[
                 Identifier(
-                    value=f"RPT-{patient_id}-{int(datetime.now(timezone.utc).timestamp())}"
+                    value=f"RPT-{patient_id}-{timestamp}"
                 )
             ],
             category=[
@@ -69,6 +120,8 @@ class FHIRFormatter:
             ),
             effectiveDateTime=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             conclusion=conclusion,
+            contained=contained_observations if contained_observations else None,
+            result=result_references if result_references else None,
         )
 
     def to_json(self, fhir_resource):
@@ -192,15 +245,38 @@ class EHRGateway:
         # This is per-replica and NOT shared, but prevents data loss if Redis AND S3 are both down.
         if not redis_success:
             try:
-                dlq_dir = Path("temp/dlq")
+                dlq_dir = Path(os.getenv("DLQ_DIR", "temp/dlq"))
                 dlq_dir.mkdir(parents=True, exist_ok=True)
                 local_path = dlq_dir / filename
+                
+                # Encrypt the payload string before persisting to local disk fallback
+                from src.utils.security import encrypt_payload
+                encrypted_payload = encrypt_payload(payload_json)
+                wrapper = {
+                    "encrypted": True,
+                    "data": encrypted_payload
+                }
+                wrapper_json = json.dumps(wrapper, indent=2)
+                
                 # Atomic: write to temp file, then rename (rename is atomic on POSIX)
                 fd, tmp_path = tempfile.mkstemp(dir=str(dlq_dir), suffix=".tmp")
                 try:
                     with os.fdopen(fd, "w") as f:
-                        f.write(payload_json)
+                        f.write(wrapper_json)
+                        f.flush()
+                        os.fsync(f.fileno())
                     os.replace(tmp_path, str(local_path))
+                    
+                    # Sync parent directory to ensure directory metadata changes are durable (POSIX)
+                    if os.name != "nt":
+                        try:
+                            dir_fd = os.open(str(dlq_dir), os.O_RDONLY)
+                            try:
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
+                        except Exception as dir_sync_err:
+                            self.logger.warning(f"[EHR Gateway] Parent directory sync failed: {dir_sync_err}")
                 except Exception:
                     # Clean up temp file on failure
                     if os.path.exists(tmp_path):

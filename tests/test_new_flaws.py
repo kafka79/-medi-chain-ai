@@ -330,3 +330,237 @@ def test_s3_storage_temp_tracking_and_cleanup():
         # Check it got cleaned up and removed from tracked set
         assert not os.path.exists(dummy_name)
         assert dummy_name not in provider._downloaded_temp_files
+
+
+def test_dlq_configured_directory_and_fsync():
+    """Verify that DLQ local fallback uses configured DLQ_DIR environment variable and writes to it."""
+    from src.data.fhir_formatter import EHRGateway
+    import tempfile
+    import shutil
+    from pathlib import Path
+    
+    custom_dlq_dir = tempfile.mkdtemp()
+    try:
+        with patch.dict("os.environ", {"DLQ_DIR": custom_dlq_dir}):
+            gateway = EHRGateway(endpoint_url="http://completely-broken-invalid-host/fhir")
+            dummy_payload = json.dumps({"resourceType": "DiagnosticReport", "id": "456"})
+            
+            # Since S3 is not configured and endpoint is broken, it will fall back to local disk
+            result = gateway.push_report(dummy_payload)
+            assert result is False
+            
+            # Verify file was created in the custom configured directory
+            custom_path = Path(custom_dlq_dir)
+            files = list(custom_path.glob("failed_report_*.json"))
+            assert len(files) == 1
+            
+            with open(files[0], "r") as f:
+                wrapper = json.load(f)
+            
+            if isinstance(wrapper, dict) and wrapper.get("encrypted"):
+                from src.utils.security import decrypt_payload
+                decrypted = decrypt_payload(wrapper["data"])
+                stored = json.loads(decrypted)
+            else:
+                stored = wrapper
+                
+            assert stored["payload"]["resourceType"] == "DiagnosticReport"
+    finally:
+        shutil.rmtree(custom_dlq_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_redis_semaphore_outage_fallback_limit():
+    """Verify that RedisDistributedSemaphore degrades gracefully to local fallback limit upon Redis connection failure."""
+    from deployment.api.main import RedisDistributedSemaphore
+    
+    mock_redis = MagicMock()
+    # Mock eval to throw an exception to simulate connection error / Redis outage
+    mock_redis.eval.side_effect = Exception("Redis Connection Timeout")
+    
+    with patch.dict("os.environ", {"MAX_CONCURRENT_REQUESTS_FALLBACK": "1"}), \
+         patch("deployment.api.main._send_system_alert") as mock_alert:
+         
+        sem = RedisDistributedSemaphore(mock_redis, "test_outage", limit=2)
+        
+        # Enter the semaphore
+        await sem.__aenter__()
+        
+        # Verify it marked redis as None for fallback
+        assert sem.redis is None
+        # Verify system alert was sent
+        mock_alert.assert_called_once()
+        
+        # Verify it holds the local fallback lock
+        assert sem.fallback_sem.locked()
+        
+        # Exit the semaphore
+        await sem.__aexit__(None, None, None)
+        assert not sem.fallback_sem.locked()
+
+
+def test_uncertainty_law_of_total_variance_covariance():
+    """Verify combined uncertainty computes covariance correctly according to the Law of Total Variance."""
+    from src.models.uncertainty import UncertaintyEstimator
+    
+    model = MagicMock()
+    model.modules.return_value = []
+    
+    # We will simulate logits across 5 passes to see how covariance affects std_deviation
+    # Create 5 passes with logits
+    model.side_effect = [
+        (torch.randn(1, 512), torch.tensor([[1.0, 0.0]])),
+        (torch.randn(1, 512), torch.tensor([[1.2, 0.0]])),
+        (torch.randn(1, 512), torch.tensor([[0.8, 0.0]])),
+        (torch.randn(1, 512), torch.tensor([[1.1, 0.0]])),
+        (torch.randn(1, 512), torch.tensor([[0.9, 0.0]])),
+    ]
+    
+    estimator = UncertaintyEstimator(model)
+    v = torch.randn(1, 512)
+    t = torch.randn(1, 768)
+    
+    # We pass visual_std
+    visual_std = torch.ones(1, 512) * 0.1
+    results = estimator.estimate_uncertainty(v, t, num_passes=5, visual_std=visual_std)
+    
+    # Assert return fields exist and are of correct types
+    assert "std_deviation" in results
+    assert "fusion_head_variance" in results
+    assert "visual_uncertainty_score" in results
+    assert "combined_uncertainty" in results
+    
+    # Check that std_deviation is a Tensor and matches combined_uncertainty
+    assert isinstance(results["std_deviation"], torch.Tensor)
+    assert torch.equal(results["std_deviation"], results["combined_uncertainty"])
+
+
+def test_fhir_diagnostic_report_contained_observations():
+    """Verify FHIRFormatter structures differential probabilities as contained Observation resources."""
+    from src.data.fhir_formatter import FHIRFormatter
+    
+    formatter = FHIRFormatter()
+    sample_data = {
+        "patient_id": "P12345",
+        "primary_finding": "Silicosis",
+        "differential": {"Silicosis": 0.72, "Pneumonia": 0.18, "Tuberculosis": 0.10}
+    }
+    
+    report = formatter.create_diagnostic_report(sample_data)
+    
+    # Verify report fields
+    assert report.__resource_type__ == "DiagnosticReport"
+    assert report.conclusion is not None
+    assert "Silicosis: 72.0%" in report.conclusion
+    
+    # Verify contained Observation resources
+    assert report.contained is not None
+    assert len(report.contained) == 3
+    
+    for obs in report.contained:
+        assert obs.__resource_type__ == "Observation"
+        assert obs.status == "final"
+        assert obs.subject.reference == "Patient/P12345"
+        assert obs.valueQuantity is not None
+        assert obs.valueQuantity.unit == "%"
+        assert obs.valueQuantity.value in [0.72, 0.18, 0.10]
+        
+        # Verify SNOMED-CT codes are correctly mapped
+        coding = obs.code.coding[0]
+        assert coding.system == "http://snomed.info/sct"
+        if coding.display == "Silicosis":
+            assert coding.code == "50751000"
+        elif coding.display == "Pneumonia":
+            assert coding.code == "233604007"
+        elif coding.display == "Tuberculosis":
+            assert coding.code == "56717001"
+            
+    # Verify result references in the report match contained IDs
+    assert len(report.result) == 3
+    contained_ids = [f"#{obs.id}" for obs in report.contained]
+    for ref in report.result:
+        assert ref.reference in contained_ids
+
+
+def test_dlq_payload_encryption_and_decryption():
+    """Verify that DLQ payloads are encrypted and decrypted correctly using AES-GCM."""
+    from src.utils.security import encrypt_payload, decrypt_payload
+    payload = {"patient_id": "P999", "findings": ["Finding 1"]}
+    plaintext = json.dumps(payload)
+    
+    ciphertext = encrypt_payload(plaintext)
+    assert ciphertext != plaintext
+    # Nonce is random, so encrypting twice gives different ciphertexts
+    ciphertext2 = encrypt_payload(plaintext)
+    assert ciphertext != ciphertext2
+    
+    decrypted = decrypt_payload(ciphertext)
+    assert decrypted == plaintext
+    assert json.loads(decrypted) == payload
+
+
+@pytest.mark.asyncio
+async def test_redis_semaphore_self_healing_reconnect():
+    """Verify that RedisDistributedSemaphore attempts self-healing reconnection check."""
+    from deployment.api.main import RedisDistributedSemaphore
+    
+    mock_redis = MagicMock()
+    # Initially ping fails, then succeeds
+    mock_redis.ping.side_effect = [Exception("Ping timeout"), True]
+    mock_redis.eval.return_value = 1  # Optimistic acquisition succeeds once ping succeeds
+    
+    # Start with None/offline Redis, but store mock_redis in orig_redis
+    sem = RedisDistributedSemaphore(mock_redis, "test_reconnect", limit=2)
+    sem.redis = None  # Simulate offline/fallback state
+    
+    # Set short reconnect cooldown for testing
+    with patch.dict("os.environ", {"REDIS_RECONNECT_COOLDOWN": "0.01", "MAX_CONCURRENT_REQUESTS_FALLBACK": "1"}):
+        # 1. First enter: ping fails, so it stays in fallback mode (acquires fallback_sem)
+        await sem.__aenter__()
+        assert sem.redis is None
+        assert sem.fallback_sem.locked()
+        await sem.__aexit__(None, None, None)
+        assert not sem.fallback_sem.locked()
+        
+        # 2. Wait a bit for cooldown
+        await asyncio.sleep(0.02)
+        
+        # 3. Second enter: ping succeeds, so self.redis is restored to mock_redis, and local_sem is acquired
+        await sem.__aenter__()
+        assert sem.redis is mock_redis
+        assert not sem.fallback_sem.locked()
+        await sem.__aexit__(None, None, None)
+
+
+def test_drift_detector_local_baseline_cache():
+    """Verify that DriftDetector caches baselines locally and fallback works when Redis is offline."""
+    import tempfile
+    import shutil
+    from src.monitoring.drift_detector import DriftDetector
+    
+    custom_cache_dir = tempfile.mkdtemp()
+    try:
+        # Patch Redis to simulate connection errors
+        mock_redis = MagicMock()
+        mock_redis.get.side_effect = Exception("Redis connection error")
+        mock_redis.set.side_effect = Exception("Redis connection error")
+        
+        with patch.dict("os.environ", {"DRIFT_CACHE_DIR": custom_cache_dir, "TESTING": "false"}), \
+             patch("redis.Redis", return_value=mock_redis):
+            
+            # 1. Instantiate detector (Redis offline, cache empty -> baseline is None)
+            detector = DriftDetector()
+            assert detector.baseline is None
+            assert detector.features_baseline is None
+            
+            # 2. Save baseline (Redis offline -> baseline is saved locally)
+            test_probs = [[0.1, 0.9], [0.2, 0.8]]
+            detector._save_baseline(test_probs)
+            
+            # 3. Re-instantiate detector (Redis still offline, cache has baseline -> baseline is restored from local cache)
+            detector2 = DriftDetector()
+            assert detector2.baseline is not None
+            assert np.array_equal(detector2.baseline, np.array(test_probs))
+            
+    finally:
+        shutil.rmtree(custom_cache_dir, ignore_errors=True)

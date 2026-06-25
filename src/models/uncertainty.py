@@ -15,11 +15,8 @@ class UncertaintyEstimator:
         We now compute and return THREE separate uncertainty metrics:
         1. fusion_head_variance — epistemic uncertainty from the classification head only.
         2. visual_uncertainty_score — input-space uncertainty from TTA visual_std.
-        3. combined_uncertainty — geometric mean of (1) and (2), factoring in both
-           visual feature instability AND classification head variance.
-        
-        This makes it explicit that fusion_head_variance alone does NOT capture
-        visual encoder uncertainty (BiomedCLIP has dropout=0.0).
+        3. combined_uncertainty — computed via the Law of Total Variance factoring in covariance
+           between the visual input noise and classification output variation.
         """
         self.model.eval()
         
@@ -33,59 +30,74 @@ class UncertaintyEstimator:
                     m.eval()
             
             all_logits = []
+            all_visual_noises = []
             with torch.no_grad():
                 for _ in range(num_passes):
                     # Use TTA-derived visual_std for perturbation magnitude
                     if visual_std is not None:
-                        perturbed_v = vision_emb + torch.randn_like(vision_emb) * visual_std
+                        if isinstance(visual_std, list):
+                            visual_std_t = torch.tensor(visual_std, dtype=torch.float32, device=vision_emb.device)
+                        else:
+                            visual_std_t = visual_std.to(vision_emb.device)
+                        noise = torch.randn_like(vision_emb) * visual_std_t
                     else:
-                        perturbed_v = vision_emb + torch.randn_like(vision_emb) * 0.05
+                        noise = torch.randn_like(vision_emb) * 0.05
                         
+                    perturbed_v = vision_emb + noise
                     perturbed_t = text_emb + torch.randn_like(text_emb) * 0.05
                     _, logits = self.model(perturbed_v, perturbed_t)
                     all_logits.append(torch.softmax(logits, dim=1))
+                    
+                    # Compute the normalized L2 norm of the noise vector for this pass (batch_size,)
+                    noise_norm = noise.norm(dim=-1) / (noise.shape[-1] ** 0.5)
+                    all_visual_noises.append(noise_norm)
         finally:
             self.model.eval()
         
         # Stack results (num_passes, batch, num_classes)
         stacked_probs = torch.stack(all_logits)
+        stacked_noises = torch.stack(all_visual_noises)  # (num_passes, batch)
         
-        # Compute mean and standard deviation
+        # Compute mean of probabilities
         mean_probs = torch.mean(stacked_probs, dim=0)
-        std_probs = torch.std(stacked_probs, dim=0)
         
         # Prediction is the class with highest mean probability
         conf, pred = torch.max(mean_probs, dim=1)
         
         batch_size = vision_emb.shape[0]
-        fusion_uncertainties = torch.tensor([std_probs[i, pred[i]].item() for i in range(batch_size)])
+        
+        # Extract prediction probabilities across passes for covariance
+        Y = torch.stack([stacked_probs[t, torch.arange(batch_size), pred] for t in range(num_passes)])  # (num_passes, batch)
+        X = stacked_noises  # (num_passes, batch)
+        
+        mean_Y = Y.mean(dim=0)
+        mean_X = X.mean(dim=0)
+        
+        var_Y = Y.var(dim=0, unbiased=True)
+        var_X = X.var(dim=0, unbiased=True)
+        
+        # Sample covariance
+        cov_XY = torch.sum((X - mean_X) * (Y - mean_Y), dim=0) / (num_passes - 1)
+        
+        fusion_uncertainties = var_Y.sqrt()
         
         # Flaw #2-structural Fix: Compute visual uncertainty score from TTA std
         # visual_std is the per-dimension std across TTA augmented images.
-        # We collapse it to a scalar per sample via L2 norm / sqrt(dim).
         if visual_std is not None:
             if isinstance(visual_std, list):
-                visual_std_t = torch.tensor(visual_std, dtype=torch.float32)
+                visual_std_t = torch.tensor(visual_std, dtype=torch.float32, device=vision_emb.device)
             else:
-                visual_std_t = visual_std
-            # Normalized L2 norm gives a scale-invariant instability score
+                visual_std_t = visual_std.to(vision_emb.device)
             visual_uncertainty = visual_std_t.norm(dim=-1) / (visual_std_t.shape[-1] ** 0.5)
+            
+            # Panel Flaw #6 Fix: Law of total variance with covariance.
+            # Var(Y) = Var_fusion + Var_visual + 2 * Cov(fusion, visual)
+            combined_var = var_Y + var_X + 2.0 * cov_XY
+            combined = torch.sqrt(torch.clamp(combined_var, min=0.0))
         else:
             # No TTA data available — report as unknown (NaN) rather than zero
-            visual_uncertainty = torch.full((batch_size,), float('nan'))
-        
-        # Panel Flaw #6 Fix: Law of total variance under independence.
-        # Var(Y) = E[Var(Y|X)] + Var(E[Y|X])
-        # The previous geometric mean sqrt(a * b) had no Bayesian justification.
-        # Under the assumption that visual encoder noise and classifier head
-        # noise are independent uncertainty sources, total variance is their
-        # sum. This is mathematically grounded in the Bayesian deep learning
-        # literature (Kendall & Gal, 2017 — "What Uncertainties Do We Need").
-        combined = torch.where(
-            torch.isnan(visual_uncertainty),
-            fusion_uncertainties,
-            fusion_uncertainties + visual_uncertainty
-        )
+            visual_uncertainty = torch.full((batch_size,), float('nan'), device=vision_emb.device)
+            combined = fusion_uncertainties
         
         return {
             "prediction": pred,

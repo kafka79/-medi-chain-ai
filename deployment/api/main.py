@@ -156,7 +156,6 @@ else:
 drift_detector = DriftDetector()
 ehr_gateway = EHRGateway()
 feedback_logger = FeedbackLogger(redis_client=redis_client, storage_provider=storage)
-
 class RedisDistributedSemaphore:
     """Distributed semaphore backed by Redis sorted-set leases.
 
@@ -169,20 +168,45 @@ class RedisDistributedSemaphore:
     the notification list.  Waiters call ``BLPOP`` which is a Redis-native
     blocking operation — the connection idles until a token arrives, consuming
     zero CPU and zero network bandwidth while waiting.
+    
+    Model Server Concurrency Storm Outage Fallback:
+    If Redis goes down or is None, we degrade gracefully to a process-local limit of 1
+    (via MAX_CONCURRENT_REQUESTS_FALLBACK) instead of silently falling back to the full limit.
     """
     def __init__(self, r_client, name: str, limit: int):
+        self.orig_redis = r_client
         self.redis = r_client
         self.name = f"medi_chain:semaphore:{name}:leases"
         self.notify_key = f"medi_chain:semaphore:{name}:notify"
         self.limit = limit
         self.local_sem = asyncio.Semaphore(limit)
+        fallback_limit = int(os.getenv("MAX_CONCURRENT_REQUESTS_FALLBACK", "1"))
+        self.fallback_sem = asyncio.Semaphore(fallback_limit)
         self.client_id_var = contextvars.ContextVar(f"sem_client_id_{name}", default=None)
-        
+        self.last_reconnect_attempt = 0.0
+
     async def __aenter__(self):
-        await self.local_sem.acquire()
+        # Attempt self-healing reconnection check
+        if self.redis is None and self.orig_redis is not None:
+            now = time.time()
+            reconnect_cooldown = float(os.getenv("REDIS_RECONNECT_COOLDOWN", "10.0"))
+            if now - self.last_reconnect_attempt >= reconnect_cooldown:
+                self.last_reconnect_attempt = now
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self.orig_redis.ping)
+                    self.redis = self.orig_redis
+                    logger.info("Redis connectivity restored. Recovering distributed capacity.")
+                except Exception as e:
+                    logger.warning(f"Redis reconnection attempt failed: {e}")
+
+        # Local fallback mode
         if self.redis is None:
+            await self.fallback_sem.acquire()
             return self
-            
+
+        # Normal distributed mode
+        await self.local_sem.acquire()
         client_id = uuid.uuid4().hex
         self.client_id_var.set(client_id)
         
@@ -224,22 +248,22 @@ class RedisDistributedSemaphore:
             if res == 1:
                 acquired = True
         except Exception as e:
+            logger.error(f"Redis acquisition failed, degrading to local fallback semaphore: {e}")
+            self.client_id_var.set(None)
             self.local_sem.release()
-            raise RuntimeError(
-                f"Redis semaphore unavailable ({e}). Rejecting request to "
-                f"prevent distributed lock mismatch across replicas."
-            )
+            self.redis = None
+            self.last_reconnect_attempt = time.time()
+            _send_system_alert("Redis Semaphore Outage", f"Degrading to local fallback. Error: {e}")
+            await self.fallback_sem.acquire()
+            return self
         
         # If not acquired, block on BLPOP notifications instead of polling
         while not acquired:
             try:
-                # BLPOP blocks the Redis connection until a notification arrives
-                # or the timeout expires — zero CPU, zero network chatter while waiting
                 await loop.run_in_executor(
                     None,
                     lambda: self.redis.blpop(self.notify_key, timeout=blpop_timeout)
                 )
-                # A notification arrived (or timeout expired) — try to acquire again
                 now = time.time()
                 res = await loop.run_in_executor(
                     None,
@@ -248,23 +272,24 @@ class RedisDistributedSemaphore:
                 if res == 1:
                     acquired = True
             except Exception as e:
+                logger.error(f"Redis execution failed during blpop/retry, degrading to local fallback: {e}")
+                self.client_id_var.set(None)
                 self.local_sem.release()
-                raise RuntimeError(
-                    f"Redis semaphore unavailable ({e}). Rejecting request to "
-                    f"prevent distributed lock mismatch across replicas."
-                )
+                self.redis = None
+                self.last_reconnect_attempt = time.time()
+                _send_system_alert("Redis Semaphore Outage", f"Degrading to local fallback during wait. Error: {e}")
+                await self.fallback_sem.acquire()
+                return self
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.redis is not None:
-            client_id = self.client_id_var.get()
-            if client_id:
+        client_id = self.client_id_var.get()
+        if client_id:
+            self.client_id_var.set(None)
+            if self.redis is not None:
                 try:
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, lambda: self.redis.zrem(self.name, client_id))
-                    # Panel Flaw #2 Fix: Notify one blocked waiter that a slot is now available.
-                    # LPUSH + LTRIM keeps the notification list bounded to prevent unbounded growth
-                    # if no waiters are listening (e.g., low-traffic periods).
                     await loop.run_in_executor(
                         None,
                         lambda: (
@@ -274,7 +299,11 @@ class RedisDistributedSemaphore:
                     )
                 except Exception as e:
                     logger.error(f"Redis semaphore release failed: {e}")
-        self.local_sem.release()
+            self.local_sem.release()
+        else:
+            self.fallback_sem.release()
+
+
 
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
 
@@ -445,12 +474,20 @@ async def reconcile_dlq_task():
                     
                     # Escalation path 1: save locally under temp/dlq/poison/
                     try:
-                        poison_dir = Path("temp/dlq/poison")
+                        dlq_base = os.getenv("DLQ_DIR", "temp/dlq")
+                        poison_dir = Path(dlq_base) / "poison"
                         poison_dir.mkdir(parents=True, exist_ok=True)
                         filename = f"poison_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
                         local_path = poison_dir / filename
+                        from src.utils.security import encrypt_payload
+                        payload_json = json.dumps(item, indent=2)
+                        encrypted_payload = encrypt_payload(payload_json)
+                        wrapper = {
+                            "encrypted": True,
+                            "data": encrypted_payload
+                        }
                         with open(local_path, "w") as f:
-                            json.dump(item, f, indent=2)
+                            json.dump(wrapper, f, indent=2)
                         logger.info(f"[DLQ Reconciler] Saved poison report locally to {local_path}")
                     except Exception as local_err:
                         logger.error(f"[DLQ Reconciler] Failed to save poison report locally: {local_err}")
@@ -489,8 +526,15 @@ async def reconcile_dlq_task():
                     elif source_type == "local" and identifier:
                         logger.warning(f"[DLQ Reconciler] Local re-push failed. Saving updated retry count to local file {identifier}.")
                         try:
+                            from src.utils.security import encrypt_payload
+                            payload_json = json.dumps(item, indent=2)
+                            encrypted_payload = encrypt_payload(payload_json)
+                            wrapper = {
+                                "encrypted": True,
+                                "data": encrypted_payload
+                            }
                             with open(identifier, "w") as f:
-                                json.dump(item, f, indent=2)
+                                json.dump(wrapper, f, indent=2)
                             # Rename back to .json so it can be picked up again
                             orig_path = Path(identifier).with_suffix(".json")
                             Path(identifier).rename(orig_path)
@@ -523,7 +567,7 @@ async def reconcile_dlq_task():
                     
             # 2. Try to fetch from local DLQ files if no Redis item was found
             if not item_found:
-                dlq_dir = Path("temp/dlq")
+                dlq_dir = Path(os.getenv("DLQ_DIR", "temp/dlq"))
                 if dlq_dir.exists() and dlq_dir.is_dir():
                     try:
                         from itertools import islice
@@ -547,7 +591,13 @@ async def reconcile_dlq_task():
                         
                         try:
                             with open(processing_path, "r") as f:
-                                item = json.load(f)
+                                wrapper = json.load(f)
+                            if isinstance(wrapper, dict) and wrapper.get("encrypted"):
+                                from src.utils.security import decrypt_payload
+                                decrypted_data = decrypt_payload(wrapper["data"])
+                                item = json.loads(decrypted_data)
+                            else:
+                                item = wrapper
                             task = asyncio.create_task(process_reconciliation(item, "local", str(processing_path)))
                             active_tasks.add(task)
                             task.add_done_callback(active_tasks.discard)
