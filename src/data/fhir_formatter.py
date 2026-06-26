@@ -139,8 +139,48 @@ class EHRGateway:
         self.logger = logging.getLogger("ehr-gateway")
         self.endpoint_url = endpoint_url or os.getenv("EHR_GATEWAY_URL", "https://mock-ehr-gateway.internal/fhir")
 
+    def validate_patient(self, patient_id: str) -> bool:
+        """Validates that the patient exists in the EHR system before posting observations.
+        Makes a read request to Patient resource (GET /fhir/Patient/{id}).
+        """
+        import requests
+        
+        # If the endpoint is mock, simulate validation
+        if "mock-ehr-gateway.internal" in self.endpoint_url:
+            self.logger.info(f"[EHR Gateway] Mock validating patient {patient_id}...")
+            if patient_id == "invalid-patient-id":
+                self.logger.error(f"[EHR Gateway] Patient {patient_id} not found in Mock EHR.")
+                return False
+            return True
+            
+        try:
+            url = f"{self.endpoint_url}/Patient/{patient_id}"
+            headers = {"Accept": "application/fhir+json"}
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                self.logger.info(f"[EHR Gateway] Successfully validated patient {patient_id} in EHR.")
+                return True
+            else:
+                self.logger.error(f"[EHR Gateway] Patient validation failed for ID {patient_id}. HTTP status: {response.status_code}")
+                return False
+        except Exception as e:
+            self.logger.error(f"[EHR Gateway] EHR connection error during patient validation: {e}")
+            return False
+
     def push_report(self, fhir_json: str, is_retry: bool = False):
         """Pushes the report to a hospital's FHIR server with robust retry logic."""
+        # Validate patient existence before pushing report observations
+        try:
+            report_data = json.loads(fhir_json) if isinstance(fhir_json, str) else fhir_json
+            subject_ref = report_data.get("subject", {}).get("reference", "")
+            if subject_ref.startswith("Patient/"):
+                patient_id = subject_ref.split("/")[-1]
+                if not self.validate_patient(patient_id):
+                    self.logger.error(f"[EHR Gateway] Aborting report push: Patient ID {patient_id} is invalid.")
+                    return False
+        except Exception as parse_err:
+            self.logger.warning(f"[EHR Gateway] Could not parse patient ID for validation: {parse_err}")
+
         from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
         import requests
         

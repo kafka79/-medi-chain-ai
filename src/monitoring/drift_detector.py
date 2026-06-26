@@ -173,6 +173,9 @@ class DriftDetector:
         if self.redis_client is not None:
             try:
                 self.redis_client.set(self.baseline_key, json.dumps(probs))
+                now_str = datetime.now(timezone.utc).isoformat()
+                self.redis_client.set("medi_chain:drift:baseline:updated_at", now_str)
+                self._last_baseline_update = now_str
                 logger.info("Saved new global drift prediction baseline to Redis.")
             except Exception as e:
                 logger.error(f"Failed to save prediction baseline to Redis: {e}")
@@ -207,12 +210,29 @@ class DriftDetector:
         if self.redis_client is not None:
             try:
                 self.redis_client.set(self.features_baseline_key, json.dumps(features))
+                now_str = datetime.now(timezone.utc).isoformat()
+                self.redis_client.set("medi_chain:drift:baseline:updated_at", now_str)
+                self._last_baseline_update = now_str
                 logger.info("Saved new global features baseline (covariate shift) to Redis.")
             except Exception as e:
                 logger.error(f"Failed to save features baseline to Redis: {e}")
                 
         self._write_local_cache("features_baseline_cache.json", features)
         self.features_baseline = np.array(features)
+
+    def _refresh_baselines_if_changed(self):
+        if self.redis_client is None:
+            return
+        try:
+            redis_timestamp = self.redis_client.get("medi_chain:drift:baseline:updated_at")
+            if redis_timestamp:
+                if not hasattr(self, "_last_baseline_update") or self._last_baseline_update != redis_timestamp:
+                    logger.info("New baseline detected in Redis. Reloading baselines.")
+                    self.baseline = self._load_baseline()
+                    self.features_baseline = self._load_features_baseline()
+                    self._last_baseline_update = redis_timestamp
+        except Exception as e:
+            logger.error(f"Error checking baseline update status: {e}")
 
     async def add_prediction(self, probs: list, visual_features: list = None):
         """Adds current prediction probabilities and visual features to persistent distributed windows.
@@ -228,6 +248,7 @@ class DriftDetector:
     def _add_prediction_sync(self, probs: list, visual_features: list = None):
         """Synchronous implementation of add_prediction to be run in asyncio.to_thread."""
         try:
+            self._refresh_baselines_if_changed()
             val_probs = json.dumps(probs)
             val_features = json.dumps(visual_features) if visual_features is not None else ""
             

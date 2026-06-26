@@ -260,14 +260,48 @@ class ClinicalAgent:
         all_probs = results['all_probs'][0]
         max_softmax = max(all_probs) if all_probs else 0.0
 
-        # Flaw #6 Fix: OOD detection — reject predictions where max softmax is below threshold
-        ood_flag = max_softmax < OOD_CONFIDENCE_THRESHOLD
+        # Distance-based visual OOD detection
+        visual_ood_detected = False
+        try:
+            import json
+            baseline_path = Path("temp/drift/features_baseline_cache.json")
+            if baseline_path.exists():
+                with open(baseline_path, "r") as f:
+                    baseline_features = json.load(f)
+                
+                if baseline_features and len(baseline_features) > 0:
+                    baseline_arr = np.array(baseline_features)  # (N, 512)
+                    current_arr = np.array(v)                   # (1, 512)
+                    
+                    mean_baseline = np.mean(baseline_arr, axis=0)
+                    mean_current = np.mean(current_arr, axis=0)
+                    
+                    norm_b = np.linalg.norm(mean_baseline)
+                    norm_c = np.linalg.norm(mean_current)
+                    
+                    if norm_b > 0 and norm_c > 0:
+                        cos_sim = np.dot(mean_baseline, mean_current) / (norm_b * norm_c)
+                        cos_sim_threshold = float(os.getenv("OOD_COSINE_THRESHOLD", "0.8"))
+                        if cos_sim < cos_sim_threshold:
+                            visual_ood_detected = True
+                            logger.warning(
+                                f"[OOD Detection] Distance-based visual OOD check failed: "
+                                f"cosine similarity = {cos_sim:.4f} < threshold {cos_sim_threshold}."
+                            )
+        except Exception as e:
+            logger.error(f"Error running distance-based OOD detector: {e}")
+
+        # Flaw #6 Fix: OOD detection — reject predictions where max softmax is below threshold or visual distance check fails
+        ood_flag = (max_softmax < OOD_CONFIDENCE_THRESHOLD) or visual_ood_detected
         if ood_flag:
             logger.warning(
-                f"[OOD Detection] max(softmax) = {max_softmax:.4f} < threshold {OOD_CONFIDENCE_THRESHOLD}. "
-                f"Input may contain pathology outside training distribution. Flagging for escalation."
+                f"[OOD Detection] OOD check triggered. "
+                f"max(softmax) = {max_softmax:.4f} (threshold {OOD_CONFIDENCE_THRESHOLD}), "
+                f"visual_ood_detected = {visual_ood_detected}. Flagging for escalation."
             )
             top_finding = "Out-of-Distribution"
+            # Overwrite uncertainty to a high value to reflect OOD
+            uncertainty_std = max(uncertainty_std, 0.5)
         
         # Generate Clinical Rationale (Fixes 'User-Led Explanation')
         from src.monitoring.xai_explainer import XAIExplainer

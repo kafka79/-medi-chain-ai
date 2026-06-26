@@ -9,8 +9,13 @@ logger = logging.getLogger("medi-chain-security")
 def _get_encryption_key() -> bytes:
     key_str = os.getenv("DLQ_ENCRYPTION_KEY")
     if not key_str:
-        # Fallback key for testing/dev (never use in real production!)
-        return b"dev_key_for_medi_chain_dlq_32B_!"  # Exactly 32 bytes
+        if os.getenv("TESTING") == "true" or os.getenv("STORAGE_MODE") == "local":
+            return b"dev_key_for_medi_chain_dlq_32B_!"  # Exactly 32 bytes
+        raise RuntimeError(
+            "CRITICAL: DLQ_ENCRYPTION_KEY environment variable is not set. "
+            "Refusing to start with default key fallback in a production-like environment. "
+            "Set DLQ_ENCRYPTION_KEY in your environment/secrets."
+        )
     try:
         decoded = base64.b64decode(key_str)
         if len(decoded) in [16, 24, 32]:

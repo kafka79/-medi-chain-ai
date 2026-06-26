@@ -18,6 +18,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Backgroun
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 import secrets
+from filelock import FileLock
 import uvicorn
 import contextvars
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -96,6 +97,15 @@ if not _api_key and os.getenv("TESTING") != "true" and os.getenv("STORAGE_MODE")
         "CRITICAL: API_KEY environment variable is not set. "
         "Refusing to start with default credentials in a production-like environment. "
         "Set API_KEY in your .env file."
+    )
+
+# Security Fail-Fast: Fail fast if DLQ_ENCRYPTION_KEY is not set in production
+_dlq_encryption_key = os.getenv("DLQ_ENCRYPTION_KEY")
+if not _dlq_encryption_key and os.getenv("TESTING") != "true" and os.getenv("STORAGE_MODE") != "local":
+    raise RuntimeError(
+        "CRITICAL: DLQ_ENCRYPTION_KEY environment variable is not set. "
+        "Refusing to start with default key fallback in a production-like environment. "
+        "Set DLQ_ENCRYPTION_KEY in your .env file."
     )
 
 # Check if Redis is actually responsive before using it for rate limiting
@@ -184,6 +194,11 @@ class RedisDistributedSemaphore:
         self.fallback_sem = asyncio.Semaphore(fallback_limit)
         self.client_id_var = contextvars.ContextVar(f"sem_client_id_{name}", default=None)
         self.last_reconnect_attempt = 0.0
+        
+        # Ensure temp/storage folder exists for lock files
+        lock_dir = Path("temp/storage")
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        self.fallback_file_lock = FileLock(lock_dir / f"semaphore_{name}.lock")
 
     async def __aenter__(self):
         # Attempt self-healing reconnection check
@@ -200,9 +215,16 @@ class RedisDistributedSemaphore:
                 except Exception as e:
                     logger.warning(f"Redis reconnection attempt failed: {e}")
 
-        # Local fallback mode
+        # Local/File fallback mode (coordinated across replicas via shared FileLock)
         if self.redis is None:
             await self.fallback_sem.acquire()
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self.fallback_file_lock.acquire)
+            except Exception as e:
+                logger.error(f"Fallback file lock acquire failed: {e}")
+                self.fallback_sem.release()
+                raise
             return self
 
         # Normal distributed mode
@@ -248,13 +270,19 @@ class RedisDistributedSemaphore:
             if res == 1:
                 acquired = True
         except Exception as e:
-            logger.error(f"Redis acquisition failed, degrading to local fallback semaphore: {e}")
+            logger.error(f"Redis acquisition failed, degrading to local/file fallback semaphore: {e}")
             self.client_id_var.set(None)
             self.local_sem.release()
             self.redis = None
             self.last_reconnect_attempt = time.time()
-            _send_system_alert("Redis Semaphore Outage", f"Degrading to local fallback. Error: {e}")
+            _send_system_alert("Redis Semaphore Outage", f"Degrading to local/file fallback. Error: {e}")
             await self.fallback_sem.acquire()
+            try:
+                await loop.run_in_executor(None, self.fallback_file_lock.acquire)
+            except Exception as fe:
+                logger.error(f"Fallback file lock acquire failed after Redis exception: {fe}")
+                self.fallback_sem.release()
+                raise
             return self
         
         # If not acquired, block on BLPOP notifications instead of polling
@@ -272,13 +300,19 @@ class RedisDistributedSemaphore:
                 if res == 1:
                     acquired = True
             except Exception as e:
-                logger.error(f"Redis execution failed during blpop/retry, degrading to local fallback: {e}")
+                logger.error(f"Redis execution failed during blpop/retry, degrading to local/file fallback: {e}")
                 self.client_id_var.set(None)
                 self.local_sem.release()
                 self.redis = None
                 self.last_reconnect_attempt = time.time()
-                _send_system_alert("Redis Semaphore Outage", f"Degrading to local fallback during wait. Error: {e}")
+                _send_system_alert("Redis Semaphore Outage", f"Degrading to local/file fallback during wait. Error: {e}")
                 await self.fallback_sem.acquire()
+                try:
+                    await loop.run_in_executor(None, self.fallback_file_lock.acquire)
+                except Exception as fe:
+                    logger.error(f"Fallback file lock acquire failed during wait exception: {fe}")
+                    self.fallback_sem.release()
+                    raise
                 return self
         return self
 
@@ -301,7 +335,13 @@ class RedisDistributedSemaphore:
                     logger.error(f"Redis semaphore release failed: {e}")
             self.local_sem.release()
         else:
-            self.fallback_sem.release()
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self.fallback_file_lock.release)
+            except Exception as e:
+                logger.error(f"Fallback file lock release failed: {e}")
+            finally:
+                self.fallback_sem.release()
 
 
 
@@ -547,6 +587,23 @@ async def reconcile_dlq_task():
             
     while True:
         try:
+            run_reconcile = True
+            if use_redis and r:
+                try:
+                    # Acquire lock to run DLQ reconciliation loop (lease of 30 seconds)
+                    acquired = await loop.run_in_executor(
+                        None,
+                        lambda: r.set("medi_chain:locks:dlq_reconciler", "locked", ex=30, nx=True)
+                    )
+                    if not acquired:
+                        run_reconcile = False
+                except Exception as lock_err:
+                    logger.warning(f"[DLQ Reconciler] Failed to acquire Redis lock: {lock_err}")
+            
+            if not run_reconcile:
+                await asyncio.sleep(10)
+                continue
+
             # Wait until a semaphore slot is available
             await dlq_semaphore.acquire()
             
@@ -741,6 +798,17 @@ def create_app() -> FastAPI:
             # Flaw #5 Fix: Surface escalation_required as a first-class response field
             escalation = result.get('escalation_required', False)
 
+            # Telemetry for escalation rates
+            if use_redis and redis_client:
+                try:
+                    pipeline = redis_client.pipeline()
+                    pipeline.incr("medi_chain:telemetry:total_cases")
+                    if escalation:
+                        pipeline.incr("medi_chain:telemetry:escalated_cases")
+                    pipeline.execute()
+                except Exception as telemetry_err:
+                    logger.error(f"Failed to update escalation telemetry: {telemetry_err}")
+
             # Flaw #17 Fix: Include model version metadata in every response for audit trail
             response_payload = {
                 "request_id": request_id,
@@ -871,6 +939,45 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error(f"Failed to load discrepancies: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to load discrepancies: {e}")
+
+    @app.get("/telemetry/metrics")
+    @limiter.limit("10/minute")
+    async def get_telemetry_metrics(
+        request: Request,
+        api_key: str = Depends(verify_api_key)
+    ):
+        """Returns production telemetry metrics including the real-world escalation rate."""
+        if not use_redis or not redis_client:
+            return {
+                "total_cases": 0,
+                "escalated_cases": 0,
+                "escalation_rate": 0.0,
+                "message": "Telemetry requires active Redis connection."
+            }
+        
+        try:
+            total = int(redis_client.get("medi_chain:telemetry:total_cases") or 0)
+            escalated = int(redis_client.get("medi_chain:telemetry:escalated_cases") or 0)
+            rate = escalated / total if total > 0 else 0.0
+            
+            # ROI Calculations (factor in manual radiologist baseline vs automated with escalation)
+            # Baseline: 18 mins per case. Automated: < 1 min per case (we use 1 min).
+            # Escalated: still takes 18 mins.
+            # Saved time per non-escalated case = 17 mins.
+            saved_minutes = (total - escalated) * 17
+            saved_hours = round(saved_minutes / 60, 2)
+            saved_cost = round(saved_hours * 250, 2) # At $250/hour
+            
+            return {
+                "total_cases": total,
+                "escalated_cases": escalated,
+                "escalation_rate": round(rate, 4),
+                "saved_time_hours": saved_hours,
+                "saved_cost_usd": saved_cost
+            }
+        except Exception as e:
+            logger.error(f"Failed to load telemetry metrics: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load telemetry metrics: {e}")
 
     @app.get("/health")
     async def health_check(request: Request):
