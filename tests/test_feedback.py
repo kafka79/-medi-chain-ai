@@ -30,7 +30,7 @@ def test_analyze_escalation_header(monkeypatch, mock_inference_api):
     app = api_main.create_app()
     with TestClient(app) as client:
         response = client.post(
-            "/analyze",
+            "/analyze?sync=true",
             files={
                 "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
                 "history": ("history.pdf", BytesIO(b"pdf-bytes"), "application/pdf"),
@@ -49,7 +49,7 @@ def test_analyze_no_escalation_header(monkeypatch, mock_inference_api):
     app = api_main.create_app()
     with TestClient(app) as client:
         response = client.post(
-            "/analyze",
+            "/analyze?sync=true",
             files={
                 "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
                 "history": ("history.pdf", BytesIO(b"pdf-bytes"), "application/pdf"),

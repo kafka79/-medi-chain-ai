@@ -278,7 +278,12 @@ class PrivacyScrubber:
                 # Mask text box by drawing a solid black rectangle over it
                 cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 0), -1)
                 
-            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            from pathlib import Path
+            original_suffix = Path(image_path).suffix.lower()
+            intermediate_suffix = ".png" if original_suffix in [".png", ".jpg", ".jpeg"] else original_suffix
+            if not intermediate_suffix:
+                intermediate_suffix = ".png"
+            tmp = tempfile.NamedTemporaryFile(suffix=intermediate_suffix, delete=False)
             output_path = tmp.name
             tmp.close()
                 

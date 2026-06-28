@@ -694,13 +694,26 @@ async def reconcile_dlq_task():
 async def lifespan(app: FastAPI):
     # Eagerly initialize the agent
     app.state.agent = build_agent()
-    # Start background cleanup
-    cleanup_task = asyncio.create_task(cleanup_old_temp_files())
-    # Start background DLQ reconciler
-    dlq_task = asyncio.create_task(reconcile_dlq_task())
+    
+    # Conditionally start background tasks
+    run_workers = os.getenv("RUN_BACKGROUND_WORKERS_IN_API", "true").lower() == "true"
+    cleanup_task = None
+    dlq_task = None
+    
+    if run_workers:
+        cleanup_task = asyncio.create_task(cleanup_old_temp_files())
+        dlq_task = asyncio.create_task(reconcile_dlq_task())
+        logger.info("Background cleanup and DLQ tasks started inside the API process.")
+    else:
+        logger.info("Background tasks are disabled inside the API process (RUN_BACKGROUND_WORKERS_IN_API=false).")
+        
     yield
-    cleanup_task.cancel()
-    dlq_task.cancel()
+    
+    if cleanup_task:
+        cleanup_task.cancel()
+    if dlq_task:
+        dlq_task.cancel()
+        
     # Flaw #5-structural Fix: Gracefully close the agent's persistent httpx client
     if app.state.agent and hasattr(app.state.agent, 'close'):
         try:
@@ -708,6 +721,79 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Error closing agent HTTP client: {e}")
     app.state.agent = None
+
+_jobs_db = {}
+_jobs_db_lock = asyncio.Lock()
+
+async def _update_job_status(job_id: str, status: str, result: dict = None, error: str = None):
+    data = {
+        "job_id": job_id,
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    if result is not None:
+        data["result"] = result
+    if error is not None:
+        data["error"] = error
+        
+    if use_redis and redis_client:
+        try:
+            # We wrap the synchronous Redis set in asyncio.to_thread to avoid blocking the event loop
+            await asyncio.to_thread(redis_client.set, f"medi_chain:jobs:{job_id}", json.dumps(data), ex=86400)
+        except Exception as e:
+            logger.error(f"Failed to update job {job_id} in Redis: {e}")
+            
+    async with _jobs_db_lock:
+        _jobs_db[job_id] = data
+
+async def process_analyze_job(
+    job_id: str,
+    local_img_path: str,
+    local_pdf_path: str,
+    request_temp_dir: str,
+    agent: ClinicalAgent
+):
+    await _update_job_status(job_id, "running")
+    try:
+        async with inference_semaphore:
+            result = await agent.run(local_img_path, local_pdf_path)
+            
+        await drift_detector.add_prediction(
+            result['diagnosis']['probabilities'],
+            result.get('visual_features')
+        )
+        
+        escalation = result.get('escalation_required', False)
+        if use_redis and redis_client:
+            try:
+                pipeline = redis_client.pipeline()
+                pipeline.incr("medi_chain:telemetry:total_cases")
+                if escalation:
+                    pipeline.incr("medi_chain:telemetry:escalated_cases")
+                await asyncio.to_thread(pipeline.execute)
+            except Exception as telemetry_err:
+                logger.error(f"Failed to update escalation telemetry: {telemetry_err}")
+                
+        response_payload = {
+            "request_id": job_id,
+            "diagnosis": result.get("diagnosis", {}),
+            "confidence": result.get("confidence", 0.0),
+            "heatmap_base64": result.get("heatmap_base64", ""),
+            "pubmed_citations": result.get("pubmed_citations", []),
+            "escalation_required": escalation,
+            "iteration_count": result.get("iteration_count", 0),
+            "model_metadata": get_model_metadata(),
+        }
+        await _update_job_status(job_id, "completed", result=response_payload)
+    except Exception as exc:
+        logger.error(f"Async job {job_id} failed: {exc}")
+        await _update_job_status(job_id, "failed", error=str(exc))
+    finally:
+        if request_temp_dir and os.path.exists(request_temp_dir):
+            try:
+                shutil.rmtree(request_temp_dir, ignore_errors=True)
+            except Exception as cleanup_err:
+                logger.error(f"Failed to clean up temporary directory {request_temp_dir}: {cleanup_err}")
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -760,6 +846,7 @@ def create_app() -> FastAPI:
         background_tasks: BackgroundTasks,
         image: UploadFile = File(...),
         history: UploadFile = File(...),
+        sync: bool = False,
         api_key: str = Depends(verify_api_key)
     ):
         if image.content_type not in ["image/jpeg", "image/png", "application/dicom"]:
@@ -788,55 +875,106 @@ def create_app() -> FastAPI:
                 shutil.copyfileobj(image.file, f)
             with open(local_pdf_path, "wb") as f:
                 shutil.copyfileobj(history.file, f)
-            
-            async with inference_semaphore:
-                result = await agent.run(local_img_path, local_pdf_path)
+
+            if sync:
+                # Synchronous path: execute agent run blocking the endpoint until completion
+                async with inference_semaphore:
+                    result = await agent.run(local_img_path, local_pdf_path)
+                    
+                # Monitor for drift (prediction drift and covariate shift)
+                background_tasks.add_task(drift_detector.add_prediction, result['diagnosis']['probabilities'], result.get('visual_features'))
                 
-            # Monitor for drift (prediction drift and covariate shift)
-            background_tasks.add_task(drift_detector.add_prediction, result['diagnosis']['probabilities'], result.get('visual_features'))
-            
-            # Flaw #5 Fix: Surface escalation_required as a first-class response field
-            escalation = result.get('escalation_required', False)
+                escalation = result.get('escalation_required', False)
 
-            # Telemetry for escalation rates
-            if use_redis and redis_client:
-                try:
-                    pipeline = redis_client.pipeline()
-                    pipeline.incr("medi_chain:telemetry:total_cases")
-                    if escalation:
-                        pipeline.incr("medi_chain:telemetry:escalated_cases")
-                    pipeline.execute()
-                except Exception as telemetry_err:
-                    logger.error(f"Failed to update escalation telemetry: {telemetry_err}")
+                # Telemetry for escalation rates
+                if use_redis and redis_client:
+                    try:
+                        pipeline = redis_client.pipeline()
+                        pipeline.incr("medi_chain:telemetry:total_cases")
+                        if escalation:
+                            pipeline.incr("medi_chain:telemetry:escalated_cases")
+                        pipeline.execute()
+                    except Exception as telemetry_err:
+                        logger.error(f"Failed to update escalation telemetry: {telemetry_err}")
 
-            # Flaw #17 Fix: Include model version metadata in every response for audit trail
-            response_payload = {
-                "request_id": request_id,
-                "diagnosis": result.get("diagnosis", {}),
-                "confidence": result.get("confidence", 0.0),
-                "heatmap_base64": result.get("heatmap_base64", ""),
-                "pubmed_citations": result.get("pubmed_citations", []),
-                "escalation_required": escalation,
-                "iteration_count": result.get("iteration_count", 0),
-                "model_metadata": get_model_metadata(),
-            }
+                response_payload = {
+                    "request_id": request_id,
+                    "diagnosis": result.get("diagnosis", {}),
+                    "confidence": result.get("confidence", 0.0),
+                    "heatmap_base64": result.get("heatmap_base64", ""),
+                    "pubmed_citations": result.get("pubmed_citations", []),
+                    "escalation_required": escalation,
+                    "iteration_count": result.get("iteration_count", 0),
+                    "model_metadata": get_model_metadata(),
+                }
 
-            # Flaw #5 Fix: Remove the X-Requires-Human-Review HTTP header setting.
-            # Escalation is now a first-class field in the JSON response payload.
-            headers = {}
-            if escalation:
-                logger.warning(f"[{request_id}] Escalation triggered — insufficient evidence for automated diagnosis.")
+                if escalation:
+                    logger.warning(f"[{request_id}] Escalation triggered — insufficient evidence for automated diagnosis.")
 
-            return JSONResponse(content=response_payload, headers=headers)
+                return JSONResponse(content=response_payload)
+            else:
+                # Asynchronous path: record pending state and offload run to BackgroundTasks
+                job_id = request_id
+                await _update_job_status(job_id, "pending")
+                
+                background_tasks.add_task(
+                    process_analyze_job,
+                    job_id,
+                    local_img_path,
+                    local_pdf_path,
+                    request_temp_dir,
+                    agent
+                )
+                
+                status_payload = {
+                    "job_id": job_id,
+                    "status": "pending",
+                    "status_url": f"/analyze/status/{job_id}"
+                }
+                return JSONResponse(status_code=202, content=status_payload)
+                
         except Exception as exc:
             logger.error(f"Analysis failed: {exc}")
+            # If sync execution failed, clean up temp dir now; if async, process_analyze_job cleans it up
+            if sync or request_temp_dir is not None:
+                if request_temp_dir and os.path.exists(request_temp_dir):
+                    try:
+                        shutil.rmtree(request_temp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
             return JSONResponse(status_code=500, content={"detail": f"Analysis failed: {exc}"})
         finally:
-            if request_temp_dir and os.path.exists(request_temp_dir):
-                try:
-                    shutil.rmtree(request_temp_dir, ignore_errors=True)
-                except Exception as cleanup_err:
-                    logger.error(f"Failed to clean up temporary directory {request_temp_dir}: {cleanup_err}")
+            if sync:
+                if request_temp_dir and os.path.exists(request_temp_dir):
+                    try:
+                        shutil.rmtree(request_temp_dir, ignore_errors=True)
+                    except Exception as cleanup_err:
+                        logger.error(f"Failed to clean up temporary directory {request_temp_dir}: {cleanup_err}")
+
+    @app.get("/analyze/status/{job_id}")
+    @limiter.limit("60/minute")
+    async def get_job_status(
+        job_id: str,
+        request: Request,
+        api_key: str = Depends(verify_api_key)
+    ):
+        job_data = None
+        if use_redis and redis_client:
+            try:
+                raw = await asyncio.to_thread(redis_client.get, f"medi_chain:jobs:{job_id}")
+                if raw:
+                    job_data = json.loads(raw)
+            except Exception as e:
+                logger.error(f"Failed to read job {job_id} from Redis: {e}")
+                
+        if job_data is None:
+            async with _jobs_db_lock:
+                job_data = _jobs_db.get(job_id)
+                
+        if job_data is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+            
+        return JSONResponse(content=job_data)
 
     class FeedbackPayload(BaseModel):
         session_id: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
@@ -946,13 +1084,63 @@ def create_app() -> FastAPI:
         request: Request,
         api_key: str = Depends(verify_api_key)
     ):
-        """Returns production telemetry metrics including the real-world escalation rate."""
+        """Returns production telemetry metrics including the real-world escalation rate and clinician override rates."""
+        # Calculate feedback metrics first
+        feedback_total = 0
+        agreements = 0
+        disagreements = 0
+        agreement_rate = 1.0
+        override_rate = 0.0
+        
+        summary_raw = None
+        if use_redis and redis_client:
+            try:
+                summary_raw = await asyncio.to_thread(redis_client.get, "medi_chain:drift:feedback_summary")
+            except Exception as telemetry_err:
+                logger.error(f"Failed to load drift feedback summary from Redis: {telemetry_err}")
+                
+        if summary_raw:
+            try:
+                summary = json.loads(summary_raw)
+                feedback_total = int(summary.get("total_cases", 0))
+                agreements = int(summary.get("agreements", 0))
+                disagreements = int(summary.get("disagreements", 0))
+                agreement_rate = float(summary.get("agreement_rate", 1.0))
+                override_rate = 1.0 - agreement_rate if feedback_total > 0 else 0.0
+            except Exception as parse_err:
+                logger.error(f"Failed to parse Redis feedback summary: {parse_err}")
+        else:
+            # Fallback: parse from local CSV file directly
+            import csv
+            csv_path = feedback_logger.csv_path
+            if csv_path.exists():
+                try:
+                    with csv_path.open("r", encoding="utf-8") as handle:
+                        reader = csv.DictReader(handle)
+                        for row in reader:
+                            feedback_total += 1
+                            v = row.get("verdict", "").strip().lower()
+                            if v in {"agree", "match"}:
+                                agreements += 1
+                            elif v in {"disagree", "mismatch"}:
+                                disagreements += 1
+                    if feedback_total > 0:
+                        agreement_rate = agreements / feedback_total
+                        override_rate = disagreements / feedback_total
+                except Exception as csv_err:
+                    logger.error(f"Failed to read local feedback CSV for telemetry: {csv_err}")
+
         if not use_redis or not redis_client:
             return {
                 "total_cases": 0,
                 "escalated_cases": 0,
                 "escalation_rate": 0.0,
-                "message": "Telemetry requires active Redis connection."
+                "feedback_total_cases": feedback_total,
+                "feedback_agreements": agreements,
+                "feedback_disagreements": disagreements,
+                "clinician_agreement_rate": round(agreement_rate, 4),
+                "clinician_override_rate": round(override_rate, 4),
+                "message": "Full telemetry requires active Redis connection. Feedback metrics loaded from local cache."
             }
         
         try:
@@ -973,7 +1161,12 @@ def create_app() -> FastAPI:
                 "escalated_cases": escalated,
                 "escalation_rate": round(rate, 4),
                 "saved_time_hours": saved_hours,
-                "saved_cost_usd": saved_cost
+                "saved_cost_usd": saved_cost,
+                "feedback_total_cases": feedback_total,
+                "feedback_agreements": agreements,
+                "feedback_disagreements": disagreements,
+                "clinician_agreement_rate": round(agreement_rate, 4),
+                "clinician_override_rate": round(override_rate, 4),
             }
         except Exception as e:
             logger.error(f"Failed to load telemetry metrics: {e}")

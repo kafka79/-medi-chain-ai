@@ -20,6 +20,22 @@ class UncertaintyEstimator:
         """
         self.model.eval()
         
+        # Load empirical baseline standard deviations to capture non-isotropic manifold variance
+        empirical_std = None
+        try:
+            import json
+            from pathlib import Path
+            baseline_path = Path("temp/drift/features_baseline_cache.json")
+            if baseline_path.exists():
+                with open(baseline_path, "r") as f:
+                    baseline_features = json.load(f)
+                if baseline_features and len(baseline_features) > 1:
+                    baseline_arr = np.array(baseline_features)
+                    empirical_std_np = np.std(baseline_arr, axis=0) + 1e-6
+                    empirical_std = torch.tensor(empirical_std_np, dtype=torch.float32, device=vision_emb.device)
+        except Exception:
+            pass
+        
         try:
             # Enable dropout layers specifically inside the fusion model
             for m in self.model.modules():
@@ -39,9 +55,21 @@ class UncertaintyEstimator:
                             visual_std_t = torch.tensor(visual_std, dtype=torch.float32, device=vision_emb.device)
                         else:
                             visual_std_t = visual_std.to(vision_emb.device)
-                        noise = torch.randn_like(vision_emb) * visual_std_t
+                        
+                        if empirical_std is not None:
+                            # Scale visual noise non-isotropically by relative dimension variation
+                            normalized_empirical = empirical_std / (empirical_std.mean() + 1e-8)
+                            noise_scale = visual_std_t * normalized_empirical
+                        else:
+                            noise_scale = visual_std_t
+                        noise = torch.randn_like(vision_emb) * noise_scale
                     else:
-                        noise = torch.randn_like(vision_emb) * 0.05
+                        if empirical_std is not None:
+                            # Scale isotropic noise (0.05) by normalized empirical standard deviation
+                            normalized_empirical = empirical_std / (empirical_std.mean() + 1e-8)
+                            noise = torch.randn_like(vision_emb) * 0.05 * normalized_empirical
+                        else:
+                            noise = torch.randn_like(vision_emb) * 0.05
                         
                     perturbed_v = vision_emb + noise
                     perturbed_t = text_emb + torch.randn_like(text_emb) * 0.05

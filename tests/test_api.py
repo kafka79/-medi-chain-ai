@@ -83,7 +83,7 @@ def test_analyze_cleans_request_dir_on_success(monkeypatch):
 
     with TestClient(app) as client:
         response = client.post(
-            "/analyze",
+            "/analyze?sync=true",
             files={
                 "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
                 "history": ("history.pdf", BytesIO(b"pdf-bytes"), "application/pdf"),
@@ -105,7 +105,7 @@ def test_analyze_cleans_request_dir_on_failure(monkeypatch):
 
     with TestClient(app) as client:
         response = client.post(
-            "/analyze",
+            "/analyze?sync=true",
             files={
                 "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
                 "history": ("history.pdf", BytesIO(b"pdf-bytes"), "application/pdf"),
