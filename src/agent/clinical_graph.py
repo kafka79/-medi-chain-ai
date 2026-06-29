@@ -216,10 +216,11 @@ class ClinicalAgent:
         # Get visual features (already list from API)
         v = state['visual_features']
             
-        # Get text features from history and pubmed citations (incorporating RAG context to update classification input)
+        # RAG Cognitive Noise Fix: Keep patient clinical history separate from retrieved public PubMed literature text.
+        # Do not append raw PubMed abstract text to the text encoder content to avoid feature space pollution.
+        # Retrieved citations are stored in state and used exclusively for downstream clinician XAIExplainer.
         history = state['history_data']
-        citations_text = " ".join([c.get("text", "") for c in state.get("pubmed_citations", []) if c.get("text")])
-        text_content = f"{history.get('chief_complaint', '')} {history.get('history_present_illness', '')} {history.get('labs', '')} {citations_text}".strip()
+        text_content = f"{history.get('chief_complaint', '')} {history.get('history_present_illness', '')} {history.get('labs', '')}".strip()
         
         # Embed text using remote API (Flaw #5-structural: uses persistent self._http_client)
         try:
@@ -281,7 +282,23 @@ class ClinicalAgent:
                     
                     if norm_b > 0 and norm_c > 0:
                         cos_sim = np.dot(mean_baseline, mean_current) / (norm_b * norm_c)
-                        cos_sim_threshold = float(os.getenv("OOD_COSINE_THRESHOLD", "0.8"))
+                        
+                        # Dynamically calibrate the threshold based on baseline similarity statistics
+                        # Calculate similarity of each baseline vector to the mean baseline vector
+                        baseline_norms = np.linalg.norm(baseline_arr, axis=1)
+                        valid_mask = (baseline_norms > 0) & (norm_b > 0)
+                        if np.any(valid_mask):
+                            baseline_similarities = np.dot(baseline_arr[valid_mask], mean_baseline) / (baseline_norms[valid_mask] * norm_b)
+                            mean_sim = np.mean(baseline_similarities)
+                            std_sim = np.std(baseline_similarities)
+                            # Threshold at 3 standard deviations below the mean baseline similarity (99.7% confidence interval)
+                            calibrated_threshold = mean_sim - 3.0 * std_sim
+                            # Cap it to a reasonable range [0.5, 0.95] to prevent degenerate thresholds on tiny baselines
+                            cos_sim_threshold = float(os.getenv("OOD_COSINE_THRESHOLD", str(max(0.5, min(0.95, calibrated_threshold)))))
+                            logger.info(f"[OOD Calibration] Dynamically tuned OOD similarity threshold to {cos_sim_threshold:.4f} based on baseline variance (mean={mean_sim:.4f}, std={std_sim:.4f}).")
+                        else:
+                            cos_sim_threshold = float(os.getenv("OOD_COSINE_THRESHOLD", "0.8"))
+                            
                         if cos_sim < cos_sim_threshold:
                             visual_ood_detected = True
                             logger.warning(

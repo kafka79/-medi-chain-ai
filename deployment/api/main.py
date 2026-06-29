@@ -194,11 +194,30 @@ class RedisDistributedSemaphore:
         self.fallback_sem = asyncio.Semaphore(fallback_limit)
         self.client_id_var = contextvars.ContextVar(f"sem_client_id_{name}", default=None)
         self.last_reconnect_attempt = 0.0
+        self.refresher_task = None
         
         # Ensure temp/storage folder exists for lock files
         lock_dir = Path("temp/storage")
         lock_dir.mkdir(parents=True, exist_ok=True)
         self.fallback_file_lock = FileLock(lock_dir / f"semaphore_{name}.lock")
+
+    async def _refresh_lease_loop(self, client_id: str):
+        lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "10"))
+        refresh_interval = max(1, lease_ttl // 3)
+        try:
+            while True:
+                await asyncio.sleep(refresh_interval)
+                if self.redis is not None:
+                    loop = asyncio.get_running_loop()
+                    now = time.time()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.redis.zadd(self.name, {client_id: now})
+                    )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to refresh distributed semaphore lease: {e}")
 
     async def __aenter__(self):
         # Attempt self-healing reconnection check
@@ -234,7 +253,7 @@ class RedisDistributedSemaphore:
         
         acquired = False
         loop = asyncio.get_running_loop()
-        lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "60"))
+        lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "10"))
         blpop_timeout = int(os.getenv("SEMAPHORE_BLPOP_TIMEOUT", "5"))
         
         acquire_script = """
@@ -314,12 +333,25 @@ class RedisDistributedSemaphore:
                     self.fallback_sem.release()
                     raise
                 return self
+        
+        # Start background lease extension task
+        self.refresher_task = asyncio.create_task(self._refresh_lease_loop(client_id))
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         client_id = self.client_id_var.get()
         if client_id:
             self.client_id_var.set(None)
+            
+            # Cancel and clean up the lease extension task
+            if self.refresher_task:
+                self.refresher_task.cancel()
+                try:
+                    await self.refresher_task
+                except asyncio.CancelledError:
+                    pass
+                self.refresher_task = None
+                
             if self.redis is not None:
                 try:
                     loop = asyncio.get_running_loop()
@@ -696,7 +728,7 @@ async def lifespan(app: FastAPI):
     app.state.agent = build_agent()
     
     # Conditionally start background tasks
-    run_workers = os.getenv("RUN_BACKGROUND_WORKERS_IN_API", "true").lower() == "true"
+    run_workers = os.getenv("RUN_BACKGROUND_WORKERS_IN_API", "false").lower() == "true"
     cleanup_task = None
     dlq_task = None
     

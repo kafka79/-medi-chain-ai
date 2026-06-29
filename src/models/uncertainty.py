@@ -109,6 +109,15 @@ class UncertaintyEstimator:
         
         fusion_uncertainties = var_Y.sqrt()
         
+        if num_passes > 1 and torch.all(var_Y == 0.0):
+            import logging
+            temp_logger = logging.getLogger("uncertainty-estimator")
+            temp_logger.critical(
+                "MC DROPOUT STATE ERROR: Variance is exactly zero across all passes. "
+                "Verify that the model has active dropout layers and that they are "
+                "explicitly set to training mode during estimation."
+            )
+        
         # Flaw #2-structural Fix: Compute visual uncertainty score from TTA std
         # visual_std is the per-dimension std across TTA augmented images.
         if visual_std is not None:

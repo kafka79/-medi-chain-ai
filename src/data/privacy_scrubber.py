@@ -154,6 +154,56 @@ class PrivacyScrubber:
                 scrubbed_data[key] = value
         return scrubbed_data
 
+    def _is_likely_text(self, crop_img) -> bool:
+        """Heuristic check to determine if a cropped bounding box actually contains text.
+        Text has multiple character-level horizontal and vertical transitions and high local variance.
+        Smooth anatomical structures like calcifications or nodules are typically more homogeneous.
+        """
+        import cv2
+        import numpy as np
+        
+        if not isinstance(crop_img, np.ndarray) or crop_img.ndim < 2:
+            return True
+            
+        h_c, w_c = crop_img.shape[:2]
+        if h_c < 4 or w_c < 6:
+            return False
+            
+        # 1. Aspect ratio validation: text regions/words are horizontal spans
+        aspect_ratio = w_c / float(h_c)
+        if aspect_ratio < 0.4:
+            return False
+            
+        # 2. Gradient variation check: text has high contrast and sharp transitions
+        grad_x = cv2.Sobel(crop_img, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(crop_img, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+        std_grad = np.std(grad_mag)
+        
+        # If the gradient variance is very low, it represents a smooth background or homogeneous mass
+        if std_grad < 5.0:
+            return False
+            
+        # 3. Transition density analysis:
+        # A horizontal scan line across letters crosses several strokes (black/white edges).
+        _, thresh_crop = cv2.threshold(crop_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        transitions = []
+        for r in range(h_c):
+            row = thresh_crop[r, :]
+            row_diff = np.diff(row)
+            num_transitions = np.count_nonzero(row_diff)
+            transitions.append(num_transitions)
+            
+        avg_transitions = np.mean(transitions)
+        
+        # Text characters generate multiple stroke transitions.
+        # If the box is wide but has fewer transitions (e.g. solid white/black blob), it is not text.
+        if avg_transitions < 3.0:
+            return False
+            
+        return True
+
     def detect_burned_in_text(self, image_path: str):
         """
         Detects regions likely to contain burned-in patient identifiers.
@@ -206,8 +256,13 @@ class PrivacyScrubber:
                     
                     # Filtering contours using dynamic scaled heuristics
                     if min_h_c <= h_c <= max_h_c and w_c >= min_w_c:
-                        # Translate zone-relative y-coordinate to full image space
-                        boxes.append((x_c, start_y + y_c, w_c, h_c))
+                        # Extract the crop and apply the heuristic de-identification check
+                        crop_img = zone_img[y_c:y_c + h_c, x_c:x_c + w_c]
+                        if self._is_likely_text(crop_img):
+                            # Translate zone-relative y-coordinate to full image space
+                            boxes.append((x_c, start_y + y_c, w_c, h_c))
+                        else:
+                            logger.info(f"Preserving potential anatomical structure at ({x_c}, {start_y + y_c}, {w_c}, {h_c}) - failed text validation.")
                         
             return boxes
         except Exception as e:
