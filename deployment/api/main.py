@@ -36,6 +36,18 @@ from src.utils.storage import S3StorageProvider
 from src.monitoring.drift_detector import DriftDetector
 from src.utils.feedback_logger import FeedbackLogger
 from pydantic import BaseModel, Field, field_validator
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi import Response
+
+# Prometheus metrics
+PROM_CASES_PROCESSED = Counter("medi_chain_cases_processed_total", "Total number of clinical cases processed.")
+PROM_ESCALATIONS = Counter("medi_chain_escalations_total", "Total number of clinical cases escalated.")
+PROM_FEEDBACK = Counter("medi_chain_feedback_total", "Clinician feedback verdicts.", ["verdict"])
+PROM_SIGN_OFF_TIME = Histogram(
+    "medi_chain_sign_off_time_seconds", 
+    "Radiologist sign-off time in seconds.",
+    buckets=(10, 30, 45, 60, 120, 180, 300, 600, 1200, 3600)
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -45,20 +57,19 @@ audit_logger.setLevel(logging.INFO)
 
 
 def _configure_audit_logger():
-    """Attach a JSON-lines file handler for request/response audit events."""
-    default_to_file = "false" if os.getenv("TESTING") == "true" else "true"
-    if os.getenv("API_AUDIT_LOG_TO_FILE", default_to_file).lower() != "true":
-        return
-
-    audit_path = Path(os.getenv("API_AUDIT_LOG_PATH", "outputs/audit/api_audit.log"))
-    audit_path.parent.mkdir(parents=True, exist_ok=True)
-    resolved_path = str(audit_path.resolve())
-    for handler in audit_logger.handlers:
-        if isinstance(handler, logging.FileHandler) and handler.baseFilename == resolved_path:
-            return
-
-    handler = logging.FileHandler(resolved_path, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    """Configure container-native stdout audit logging, falling back to local file if explicitly requested."""
+    audit_logger.handlers = []
+    audit_logger.propagate = False
+    
+    log_mode = os.getenv("API_AUDIT_LOG_MODE", "stdout").lower()
+    if log_mode == "file":
+        audit_path = Path(os.getenv("API_AUDIT_LOG_PATH", "outputs/audit/api_audit.log"))
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(str(audit_path.resolve()), encoding="utf-8")
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+        
+    handler.setFormatter(logging.Formatter("[AUDIT] %(message)s"))
     audit_logger.addHandler(handler)
 
 
@@ -114,13 +125,43 @@ use_redis = False
 redis_client = None
 is_production = os.getenv("TESTING") != "true" and os.getenv("STORAGE_MODE") != "local"
 
-if redis_url.startswith("redis://") or redis_url.startswith("rediss://"):
+# Support Redis Sentinel or Redis Cluster for High Availability (removes SPOF)
+sentinel_hosts_str = os.getenv("REDIS_SENTINEL_HOSTS", "")
+cluster_nodes_str = os.getenv("REDIS_CLUSTER_NODES", "")
+
+if sentinel_hosts_str or cluster_nodes_str or redis_url.startswith("redis://") or redis_url.startswith("rediss://"):
     try:
         import redis
-        redis_client = redis.from_url(redis_url, socket_connect_timeout=1)
+        if sentinel_hosts_str:
+            from redis.sentinel import Sentinel
+            sentinels = []
+            for s in sentinel_hosts_str.split(","):
+                if ":" in s:
+                    host, port = s.split(":")
+                    sentinels.append((host, int(port)))
+                else:
+                    sentinels.append((s, 26379))
+            service_name = os.getenv("REDIS_SENTINEL_SERVICE_NAME", "mymaster")
+            sentinel_client = Sentinel(sentinels, socket_connect_timeout=1, decode_responses=True)
+            redis_client = sentinel_client.master_for(service_name, socket_connect_timeout=1, decode_responses=True)
+            logger.info("Successfully configured Redis Sentinel for High Availability.")
+        elif cluster_nodes_str:
+            from redis.cluster import RedisCluster, ClusterNode
+            nodes = []
+            for node in cluster_nodes_str.split(","):
+                if ":" in node:
+                    host, port = node.split(":")
+                    nodes.append(ClusterNode(host, int(port)))
+                else:
+                    nodes.append(ClusterNode(node, 6379))
+            redis_client = RedisCluster(startup_nodes=nodes, socket_connect_timeout=1, decode_responses=True)
+            logger.info("Successfully configured Redis Cluster for High Availability.")
+        else:
+            redis_client = redis.from_url(redis_url, socket_connect_timeout=1)
+            
         redis_client.ping()
         use_redis = True
-        logger.info("Successfully connected to Redis for rate limiting.")
+        logger.info("Successfully connected to Redis.")
     except Exception as e:
         redis_client = None
         if not is_production:
@@ -130,7 +171,7 @@ if redis_url.startswith("redis://") or redis_url.startswith("rediss://"):
             raise RuntimeError(f"Redis rate limiter connection failed in production: {e}")
 else:
     if is_production:
-        logger.critical("REDIS_URL must start with 'redis://' or 'rediss://' in production. Memory fallback is disabled.")
+        logger.critical("REDIS_URL must start with 'redis://' or 'rediss://', or Sentinel/Cluster variables must be set in production.")
         raise RuntimeError("Redis is required for rate limiting in production.")
 
 if not use_redis:
@@ -795,7 +836,10 @@ async def process_analyze_job(
             result.get('visual_features')
         )
         
+        PROM_CASES_PROCESSED.inc()
         escalation = result.get('escalation_required', False)
+        if escalation:
+            PROM_ESCALATIONS.inc()
         if use_redis and redis_client:
             try:
                 pipeline = redis_client.pipeline()
@@ -916,7 +960,10 @@ def create_app() -> FastAPI:
                 # Monitor for drift (prediction drift and covariate shift)
                 background_tasks.add_task(drift_detector.add_prediction, result['diagnosis']['probabilities'], result.get('visual_features'))
                 
+                PROM_CASES_PROCESSED.inc()
                 escalation = result.get('escalation_required', False)
+                if escalation:
+                    PROM_ESCALATIONS.inc()
 
                 # Telemetry for escalation rates
                 if use_redis and redis_client:
@@ -1015,6 +1062,7 @@ def create_app() -> FastAPI:
         diagnosis: dict
         history_metadata: dict
         doctor_id: str = Field("dr-anonymous", max_length=128)
+        start_time: Optional[float] = None
 
         @field_validator("verdict")
         @classmethod
@@ -1065,6 +1113,13 @@ def create_app() -> FastAPI:
                 history_metadata=payload.history_metadata
             )
             background_tasks.add_task(drift_detector.update_feedback_summary, agreement)
+            
+            # Record clinician sign-off latency and verdict count in Prometheus metrics
+            PROM_FEEDBACK.labels(verdict=payload.verdict).inc()
+            if payload.start_time is not None:
+                latency = time.time() - payload.start_time
+                PROM_SIGN_OFF_TIME.observe(latency)
+                
             _write_audit_event({
                 "event": "feedback_received",
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -1203,6 +1258,10 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error(f"Failed to load telemetry metrics: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to load telemetry metrics: {e}")
+
+    @app.get("/metrics")
+    async def metrics_endpoint():
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/health")
     async def health_check(request: Request):

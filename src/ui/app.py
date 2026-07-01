@@ -28,6 +28,10 @@ st.markdown(
         box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         border: 2px solid #ddd;
     }
+    /* Flaw 7 Fix: Prevent aspect-ratio warping of clinical scans/heatmaps under viewport scaling */
+    img {
+        object-fit: contain !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -102,6 +106,8 @@ def main():
                         response = requests.post(f"{api_url}/analyze", files=files, headers=headers)
                     response.raise_for_status()
                     result = response.json()
+                    import time
+                    st.session_state.analysis_timestamp = time.time()
                     status.update(label="Analysis complete", state="complete", expanded=False)
                 except Exception as e:
                     status.update(label="Analysis failed", state="error", expanded=False)
@@ -157,13 +163,18 @@ def main():
                         try:
                             api_url = os.getenv("API_URL", "http://medi-api:8000")
                             headers = {"X-API-Key": os.getenv("API_KEY", "dev-secret-key-123")}
+                            
+                            # Track start time for backend latency telemetry
+                            start_time = st.session_state.get("analysis_timestamp", None)
+                            
                             payload = {
                                 "session_id": st.session_state.session_id,
                                 "verdict": feedback,
                                 "notes": feedback_notes,
                                 "diagnosis": diagnosis,
                                 "history_metadata": result.get("history_data", {}).get("metadata", {}),
-                                "doctor_id": "dr-authorized-1"
+                                "doctor_id": "dr-authorized-1",
+                                "start_time": start_time
                             }
                             fb_resp = requests.post(f"{api_url}/feedback", json=payload, headers=headers)
                             fb_resp.raise_for_status()
@@ -190,9 +201,22 @@ def main():
             with tab1:
                 citations = result.get("pubmed_citations", [])
                 if citations:
+                    st.markdown("##### Clinical Literature Reference Cards")
                     for cit in citations:
-                        with st.expander(f"PMID {cit.get('pmid')} - {cit.get('title', 'Abstract')}"):
-                            st.write(cit.get("text", ""))
+                        title = cit.get('title', 'Abstract')
+                        pmid = cit.get('pmid')
+                        text = cit.get("text", "")
+                        
+                        # Limit to first 2 sentences to reduce cognitive load
+                        import re
+                        sentences = re.split(r'(?<=[.!?])\s+', text)
+                        tldr = " ".join(sentences[:2]) if len(sentences) > 0 else text
+                        
+                        with st.expander(f"PMID {pmid} - {title}"):
+                            st.markdown(f"**Key Findings:** *{tldr}*")
+                            if len(sentences) > 2:
+                                if st.checkbox("Show Full Abstract", key=f"show_abstract_{pmid}"):
+                                    st.write(text)
                 else:
                     st.info("No citations were returned for this case.")
 

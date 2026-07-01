@@ -2,6 +2,7 @@ from pymilvus import connections, Collection
 import os
 import logging
 import time
+import asyncio
 from datetime import datetime, timezone
 import requests
 
@@ -56,6 +57,7 @@ class RAGEvaluator:
 
         self.collection = None
         self._conn_lock = threading.Lock()
+        self._async_conn_lock = None
         
         if os.getenv("TESTING") == "true":
             return
@@ -71,20 +73,20 @@ class RAGEvaluator:
             logger.warning(msg)
             _send_alert("Milvus Connection Failure", msg)
 
-    def _ensure_connected(self):
-        """Flaw #4 Fix: Thread-safe lazy initialization check."""
+    async def _ensure_connected(self):
+        """Flaw #4 Fix: Thread-safe lazy initialization check, run asynchronously to avoid blocking loop."""
         if self.collection is not None:
             return
             
-        with self._conn_lock:
+        if self._async_conn_lock is None:
+            self._async_conn_lock = asyncio.Lock()
+            
+        async with self._async_conn_lock:
             if self.collection is not None:
                 return
             try:
-                logger.info(f"Attempting lazy Milvus connection to {self.milvus_host}:{self.milvus_port}...")
-                connections.connect("default", host=self.milvus_host, port=self.milvus_port)
-                self.collection = Collection(self.collection_name)
-                self.collection.load()
-                logger.info("Lazily loaded Milvus RAG collection successfully.")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._sync_connect)
             except Exception as e:
                 msg = f"Milvus lazy connection failed: {e}"
                 logger.error(msg)
@@ -92,9 +94,16 @@ class RAGEvaluator:
                 _send_alert("Milvus Connection Failure", msg)
                 raise RuntimeError("Milvus RAG collection is offline or uninitialized.")
 
+    def _sync_connect(self):
+        logger.info(f"Attempting lazy Milvus connection to {self.milvus_host}:{self.milvus_port}...")
+        connections.connect("default", host=self.milvus_host, port=self.milvus_port)
+        self.collection = Collection(self.collection_name)
+        self.collection.load()
+        logger.info("Lazily loaded Milvus RAG collection successfully.")
+
     async def search(self, query, k=5):
         """Perform search in Milvus. Raises RuntimeError if offline."""
-        self._ensure_connected()
+        await self._ensure_connected()
         
         import httpx
         try:

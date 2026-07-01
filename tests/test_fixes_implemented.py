@@ -59,7 +59,8 @@ def test_xai_explainer_dynamic_synthesis():
     assert "PMID: 999888" in rationale
     assert "Margin of 83.0%" in rationale
 
-def test_evaluator_lazy_connection():
+@pytest.mark.asyncio
+async def test_evaluator_lazy_connection():
     with patch("pymilvus.connections.connect") as mock_connect, \
          patch("src.rag.evaluator._send_alert") as mock_alert:
          
@@ -75,7 +76,7 @@ def test_evaluator_lazy_connection():
             
             # Trigger lazy connection check: should fail on first try (which is the 2nd overall fail)
             with pytest.raises(RuntimeError) as exc:
-                evaluator._ensure_connected()
+                await evaluator._ensure_connected()
             assert "uninitialized" in str(exc.value)
             
             # Called once during eager init and once during lazy connection
@@ -87,7 +88,7 @@ def test_evaluator_lazy_connection():
                 mock_collection_class.return_value = mock_collection
                 
                 # Try lazy connection again: 3rd overall call will succeed
-                evaluator._ensure_connected()
+                await evaluator._ensure_connected()
                 assert evaluator.collection is not None
 
 def test_async_alert_sending():
