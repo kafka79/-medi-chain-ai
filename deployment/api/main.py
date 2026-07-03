@@ -468,8 +468,10 @@ async def cleanup_old_temp_files():
     if the remote storage (e.g. MinIO) is transiently unavailable."""
     consecutive_failures = 0
     base_sleep = 600
+    cleanup_file_lock = None
     while True:
         run_cleanup = True
+        file_lock_acquired = False
         if use_redis and redis_client:
             try:
                 loop = asyncio.get_running_loop()
@@ -483,6 +485,20 @@ async def cleanup_old_temp_files():
             except Exception as e:
                 logger.critical(f"Failed to acquire Redis cleanup lock: {e}. Skipping cleanup task as fallback to avoid concurrent write races on shared volumes.")
                 run_cleanup = False
+        else:
+            # Fallback to local shared FileLock if Redis is not active/available
+            try:
+                TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+                if cleanup_file_lock is None:
+                    cleanup_file_lock = FileLock(TEMP_ROOT / "cleanup.lock")
+                # Non-blocking acquire on the main thread is extremely fast and won't block the event loop.
+                # Running both acquire and release on the main thread prevents Windows thread ownership errors.
+                cleanup_file_lock.acquire(timeout=0)
+                file_lock_acquired = True
+                logger.info("Acquired local file lock for storage cleanup.")
+            except Exception:
+                run_cleanup = False
+                logger.info("Another replica is holding the local cleanup file lock. Skipping this run.")
         
         if run_cleanup:
             try:
@@ -499,6 +515,12 @@ async def cleanup_old_temp_files():
                         f"Cleanup task experienced {consecutive_failures} consecutive failures. "
                         f"Storage cleanup is impaired. System requires manual check/reboot."
                     )
+            finally:
+                if file_lock_acquired and cleanup_file_lock:
+                    try:
+                        cleanup_file_lock.release()
+                    except Exception as le:
+                        logger.error(f"Failed to release local cleanup file lock: {le}")
         else:
             sleep_time = base_sleep
             
@@ -972,7 +994,7 @@ def create_app() -> FastAPI:
                         pipeline.incr("medi_chain:telemetry:total_cases")
                         if escalation:
                             pipeline.incr("medi_chain:telemetry:escalated_cases")
-                        pipeline.execute()
+                        await asyncio.to_thread(pipeline.execute)
                     except Exception as telemetry_err:
                         logger.error(f"Failed to update escalation telemetry: {telemetry_err}")
 
@@ -1145,21 +1167,26 @@ def create_app() -> FastAPI:
             records = []
             if redis_client is not None:
                 # Load from shared Redis list
-                raw_records = redis_client.lrange("medi_chain:feedback:records", 0, -1)
+                raw_records = await asyncio.to_thread(redis_client.lrange, "medi_chain:feedback:records", 0, -1)
                 for r_raw in raw_records:
                     rec = json.loads(r_raw)
                     if rec.get("verdict") in {"disagree", "mismatch"}:
                         records.append(rec)
             else:
                 # Fallback to reading the local CSV if Redis isn't configured
-                import csv
-                csv_path = feedback_logger.csv_path
-                if csv_path.exists():
-                    with csv_path.open("r", encoding="utf-8") as handle:
-                        reader = csv.DictReader(handle)
-                        for row in reader:
-                            if row.get("verdict") in {"disagree", "mismatch"}:
-                                records.append(row)
+                def read_local_csv():
+                    import csv
+                    csv_path = feedback_logger.csv_path
+                    local_records = []
+                    if csv_path.exists():
+                        with csv_path.open("r", encoding="utf-8") as handle:
+                            reader = csv.DictReader(handle)
+                            for row in reader:
+                                if row.get("verdict") in {"disagree", "mismatch"}:
+                                    local_records.append(row)
+                    return local_records
+                
+                records = await asyncio.to_thread(read_local_csv)
             return JSONResponse(content={"discrepancies": records})
         except Exception as e:
             logger.error(f"Failed to load discrepancies: {e}")
@@ -1198,24 +1225,28 @@ def create_app() -> FastAPI:
                 logger.error(f"Failed to parse Redis feedback summary: {parse_err}")
         else:
             # Fallback: parse from local CSV file directly
-            import csv
-            csv_path = feedback_logger.csv_path
-            if csv_path.exists():
-                try:
+            def read_local_csv_telemetry():
+                import csv
+                csv_path = feedback_logger.csv_path
+                fb_total = 0
+                fb_agreements = 0
+                fb_disagreements = 0
+                if csv_path.exists():
                     with csv_path.open("r", encoding="utf-8") as handle:
                         reader = csv.DictReader(handle)
                         for row in reader:
-                            feedback_total += 1
+                            fb_total += 1
                             v = row.get("verdict", "").strip().lower()
                             if v in {"agree", "match"}:
-                                agreements += 1
+                                fb_agreements += 1
                             elif v in {"disagree", "mismatch"}:
-                                disagreements += 1
-                    if feedback_total > 0:
-                        agreement_rate = agreements / feedback_total
-                        override_rate = disagreements / feedback_total
-                except Exception as csv_err:
-                    logger.error(f"Failed to read local feedback CSV for telemetry: {csv_err}")
+                                fb_disagreements += 1
+                return fb_total, fb_agreements, fb_disagreements
+
+            feedback_total, agreements, disagreements = await asyncio.to_thread(read_local_csv_telemetry)
+            if feedback_total > 0:
+                agreement_rate = agreements / feedback_total
+                override_rate = disagreements / feedback_total
 
         if not use_redis or not redis_client:
             return {
@@ -1231,8 +1262,8 @@ def create_app() -> FastAPI:
             }
         
         try:
-            total = int(redis_client.get("medi_chain:telemetry:total_cases") or 0)
-            escalated = int(redis_client.get("medi_chain:telemetry:escalated_cases") or 0)
+            total = int((await asyncio.to_thread(redis_client.get, "medi_chain:telemetry:total_cases")) or 0)
+            escalated = int((await asyncio.to_thread(redis_client.get, "medi_chain:telemetry:escalated_cases")) or 0)
             rate = escalated / total if total > 0 else 0.0
             
             # ROI Calculations (factor in manual radiologist baseline vs automated with escalation)

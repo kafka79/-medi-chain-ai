@@ -59,6 +59,10 @@ class RAGEvaluator:
         self._conn_lock = threading.Lock()
         self._async_conn_lock = None
         
+        # Circuit breaker parameters
+        self.last_conn_failure_time = 0.0
+        self.conn_fail_cooldown = float(os.getenv("MILVUS_CONN_FAIL_COOLDOWN", "60.0"))
+        
         if os.getenv("TESTING") == "true":
             return
         
@@ -69,6 +73,7 @@ class RAGEvaluator:
             self.collection.load()
             logger.info("Successfully established eager connection to Milvus.")
         except Exception as e:
+            self.last_conn_failure_time = time.time()
             msg = f"Eager Milvus connection failed during RAGEvaluator init: {e}. Will attempt lazy reconnection on query."
             logger.warning(msg)
             _send_alert("Milvus Connection Failure", msg)
@@ -84,10 +89,18 @@ class RAGEvaluator:
         async with self._async_conn_lock:
             if self.collection is not None:
                 return
+                
+            # Circuit breaker to prevent connection storms and alert cascades
+            now = time.time()
+            if now - self.last_conn_failure_time < self.conn_fail_cooldown:
+                logger.warning("[Milvus Connection] Circuit breaker active. Skipping connection attempt.")
+                raise RuntimeError("Milvus RAG collection is offline or uninitialized (circuit breaker active).")
+                
             try:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, self._sync_connect)
             except Exception as e:
+                self.last_conn_failure_time = time.time()
                 msg = f"Milvus lazy connection failed: {e}"
                 logger.error(msg)
                 # Send non-blocking alert on connection failure

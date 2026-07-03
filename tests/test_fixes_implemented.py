@@ -68,7 +68,8 @@ async def test_evaluator_lazy_connection():
         mock_connect.side_effect = [ValueError("Milvus offline"), ValueError("Milvus offline"), None]
         
         # In CI testing defaults to True which skips eager connection, so we patch to False
-        with patch.dict(os.environ, {"TESTING": "false"}):
+        # Set MILVUS_CONN_FAIL_COOLDOWN to 0 to bypass the circuit breaker during this test
+        with patch.dict(os.environ, {"TESTING": "false", "MILVUS_CONN_FAIL_COOLDOWN": "0"}):
             evaluator = RAGEvaluator(milvus_host="localhost", milvus_port="19530")
             
             # Connection failed during init but didn't block or raise
