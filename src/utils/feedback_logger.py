@@ -57,12 +57,22 @@ class FeedbackLogger:
             except Exception as e:
                 logger.error(f"Failed to save feedback to S3: {e}")
 
-        # 3. Fallback to local append
-        write_header = not self.csv_path.exists()
-        with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(record.keys()))
-            if write_header:
-                writer.writeheader()
-            writer.writerow(record)
+        # 3. Fallback to local append (configurable and protected by file lock)
+        import os
+        if os.getenv("ENABLE_LOCAL_CSV_LOGGING", "true").lower() == "true":
+            try:
+                from filelock import FileLock
+                lock_path = self.csv_path.with_suffix(".csv.lock")
+                # Ensure the directory exists
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                with FileLock(str(lock_path), timeout=5.0):
+                    write_header = not self.csv_path.exists()
+                    with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+                        writer = csv.DictWriter(handle, fieldnames=list(record.keys()))
+                        if write_header:
+                            writer.writeheader()
+                        writer.writerow(record)
+            except Exception as e:
+                logger.error(f"Failed to append local feedback CSV: {e}")
 
         return self.csv_path

@@ -55,6 +55,8 @@ class DriftDetector:
         self.baseline_key = "medi_chain:drift:baseline"
         self.features_window_key = "medi_chain:drift:features_window"
         self.features_baseline_key = "medi_chain:drift:features_baseline"
+        self.processing_window_key = "medi_chain:drift:window:processing"
+        self.processing_features_window_key = "medi_chain:drift:features_window:processing"
         # Flaw #9 Fix: Performance drift feedback stored in Redis, not local disk
         self.feedback_summary_key = "medi_chain:drift:feedback_summary"
         self.disabled = os.getenv("TESTING") == "true"
@@ -62,10 +64,12 @@ class DriftDetector:
         self.baseline = None
         self.features_baseline = None
 
-        # Lua script to atomically push elements, set TTL, check count, and conditionally pop both windows
+        # Lua script to atomically push elements, set TTL, check count, and conditionally rename both windows to processing keys
         self.lua_push_and_check = """
         local window_key = KEYS[1]
         local features_key = KEYS[2]
+        local proc_window = KEYS[3]
+        local proc_features = KEYS[4]
         local val_probs = ARGV[1]
         local val_features = ARGV[2]
         local ttl = tonumber(ARGV[3])
@@ -84,13 +88,50 @@ class DriftDetector:
         -- Check size
         local count = redis.call('LLEN', window_key)
         if count >= threshold then
-            local probs = redis.call('LRANGE', window_key, 0, -1)
-            local features = redis.call('LRANGE', features_key, 0, -1)
-            redis.call('DEL', window_key)
-            redis.call('DEL', features_key)
+            -- Delete any stale processing keys
+            redis.call('DEL', proc_window)
+            redis.call('DEL', proc_features)
+            
+            -- Rename to processing keys
+            redis.call('RENAME', window_key, proc_window)
+            if val_features ~= "" then
+                redis.call('RENAME', features_key, proc_features)
+            end
+            
+            local probs = redis.call('LRANGE', proc_window, 0, -1)
+            local features = {}
+            if val_features ~= "" then
+                features = redis.call('LRANGE', proc_features, 0, -1)
+            end
             return {probs, features}
         end
         return nil
+        """
+
+        self.lua_restore_processing = """
+        local window_key = KEYS[1]
+        local features_key = KEYS[2]
+        local proc_window = KEYS[3]
+        local proc_features = KEYS[4]
+        
+        -- Prepend elements from processing window back to main window
+        if redis.call('EXISTS', proc_window) == 1 then
+            local window_items = redis.call('LRANGE', proc_window, 0, -1)
+            for i = #window_items, 1, -1 do
+                redis.call('LPUSH', window_key, window_items[i])
+            end
+            redis.call('DEL', proc_window)
+        end
+        
+        -- Prepend elements from processing features back to main features
+        if redis.call('EXISTS', proc_features) == 1 then
+            local features_items = redis.call('LRANGE', proc_features, 0, -1)
+            for i = #features_items, 1, -1 do
+                redis.call('LPUSH', features_key, features_items[i])
+            end
+            redis.call('DEL', proc_features)
+        end
+        return 1
         """
 
         self.cache_dir = Path(os.getenv("DRIFT_CACHE_DIR", "temp/drift"))
@@ -255,9 +296,11 @@ class DriftDetector:
             # Execute Lua script to push and conditionally retrieve expired lists atomically
             result = self.redis_client.eval(
                 self.lua_push_and_check,
-                2,
+                4,
                 self.window_key,
                 self.features_window_key,
+                self.processing_window_key,
+                self.processing_features_window_key,
                 val_probs,
                 val_features,
                 DRIFT_KEY_TTL_SECONDS,
@@ -269,11 +312,30 @@ class DriftDetector:
                 current_probs = [json.loads(p) for p in raw_probs]
                 current_features = [json.loads(f) for f in raw_features] if (raw_features and len(raw_features) > 0) else None
                 
-                # Perform drift calculations sequentially in this background thread
-                self.check_prediction_drift(current_probs)
-                if current_features and len(current_features) > 0:
-                    self.check_covariate_shift(current_features)
-                self.check_performance_drift()
+                try:
+                    # Perform drift calculations sequentially in this background thread
+                    self.check_prediction_drift(current_probs)
+                    if current_features and len(current_features) > 0:
+                        self.check_covariate_shift(current_features)
+                    self.check_performance_drift()
+                    
+                    # On success, clear the processing/staging keys
+                    self.redis_client.delete(self.processing_window_key, self.processing_features_window_key)
+                except Exception as check_exc:
+                    logger.error(f"Error during drift calculation, executing Redis rollback: {check_exc}")
+                    try:
+                        self.redis_client.eval(
+                            self.lua_restore_processing,
+                            4,
+                            self.window_key,
+                            self.features_window_key,
+                            self.processing_window_key,
+                            self.processing_features_window_key
+                        )
+                        logger.info("Successfully rolled back processing keys to active keys in Redis.")
+                    except Exception as rollback_exc:
+                        logger.critical(f"Failed to execute Redis rollback for drift windows: {rollback_exc}")
+                    raise check_exc
         except redis.ConnectionError as e:
             logger.error(f"Redis connection failed: {e}. Cannot monitor drift.")
         except Exception as e:
@@ -337,7 +399,9 @@ class DriftDetector:
 
         # Truncate to equal length and shuffle for unbiased pairing
         X, Y = X[:n], Y[:n]
-        perm = np.random.permutation(n)
+        # Use a deterministic RandomState to make MMD calculation deterministic for identical datasets
+        rng = np.random.RandomState(42)
+        perm = rng.permutation(n)
         X, Y = X[perm], Y[perm]
 
         # Use only even number of samples for clean pairing

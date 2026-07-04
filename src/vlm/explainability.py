@@ -39,21 +39,38 @@ class VisualExplainer:
         # Resolve target layers dynamically to support different OpenCLIP versions and ViT trunk structures
         self.target_layers = None
         
-        # Strategy A: BiomedCLIP/OpenCLIP visual.trunk (standard in newer versions)
-        if hasattr(model, "visual") and hasattr(model.visual, "trunk"):
+        # Strategy A: Check user configuration via environment variable (e.g. "visual.trunk.blocks[-1].norm1")
+        target_layer_path = os.getenv("GRADCAM_TARGET_LAYER")
+        if target_layer_path:
+            try:
+                curr = model
+                for part in target_layer_path.split("."):
+                    if "[" in part and part.endswith("]"):
+                        name, idx_str = part[:-1].split("[")
+                        idx = int(idx_str)
+                        curr = getattr(curr, name)[idx]
+                    else:
+                        curr = getattr(curr, part)
+                self.target_layers = [curr]
+                logger.info(f"Successfully resolved custom Grad-CAM target layer: {target_layer_path}")
+            except Exception as e:
+                logger.error(f"Failed to resolve custom Grad-CAM target layer path '{target_layer_path}': {e}. Falling back to default strategies.")
+
+        # Strategy B: BiomedCLIP/OpenCLIP visual.trunk (standard in newer versions)
+        if not self.target_layers and hasattr(model, "visual") and hasattr(model.visual, "trunk"):
             try:
                 self.target_layers = [model.visual.trunk.blocks[-1].norm1]
             except Exception:
                 pass
                 
-        # Strategy B: Fallback to visual.transformer
+        # Strategy C: Fallback to visual.transformer
         if not self.target_layers and hasattr(model, "visual") and hasattr(model.visual, "transformer"):
             try:
                 self.target_layers = [model.visual.transformer.resblocks[-1]]
             except Exception:
                 pass
 
-        # Strategy C: General fallback searching for any module named norm1 or resblocks
+        # Strategy D: General fallback searching for any module named norm1 or resblocks
         if not self.target_layers:
             for name, module in model.named_modules():
                 if "blocks" in name and "norm1" in name:

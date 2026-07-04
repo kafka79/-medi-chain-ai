@@ -187,11 +187,17 @@ class ClinicalAgent:
 
     async def node_parse_history(self, state: AgentState):
         logger.info("[Node] Parsing Patient History...")
+        path = state['patient_pdf_path']
         loop = asyncio.get_running_loop()
-        raw_history = await loop.run_in_executor(None, self.parser.parse_pdf, state['patient_pdf_path'])
-        
-        # Scrub PHI (Fixes 'De-identification Edge Cases')
-        history = await loop.run_in_executor(None, self.scrubber.scrub_history_data, raw_history)
+        if path.lower().endswith(".json"):
+            import json
+            def load_json():
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            history = await loop.run_in_executor(None, load_json)
+        else:
+            raw_history = await loop.run_in_executor(None, self.parser.parse_pdf, path)
+            history = await loop.run_in_executor(None, self.scrubber.scrub_history_data, raw_history)
         
         return {"history_data": history}
 
@@ -283,27 +289,32 @@ class ClinicalAgent:
                     if norm_b > 0 and norm_c > 0:
                         cos_sim = np.dot(mean_baseline, mean_current) / (norm_b * norm_c)
                         
-                        # Dynamically calibrate the threshold based on baseline similarity statistics
-                        # Calculate similarity of each baseline vector to the mean baseline vector
-                        baseline_norms = np.linalg.norm(baseline_arr, axis=1)
-                        valid_mask = (baseline_norms > 0) & (norm_b > 0)
-                        n_samples = len(baseline_features)
-                        if np.any(valid_mask) and n_samples >= 10:
-                            baseline_similarities = np.dot(baseline_arr[valid_mask], mean_baseline) / (baseline_norms[valid_mask] * norm_b)
-                            median_sim = np.median(baseline_similarities)
-                            mad_sim = np.median(np.abs(baseline_similarities - median_sim))
-                            # Convert MAD to standard deviation scale (1.4826)
-                            mad_std = mad_sim * 1.4826
-                            # Scale outlier sensitivity based on sample size: tighter check for small sample size
-                            multiplier = 2.0 if n_samples < 50 else 3.0
-                            calibrated_threshold = median_sim - multiplier * mad_std
+                        use_static_ood = os.getenv("OOD_USE_STATIC_THRESHOLD", "true").lower() == "true"
+                        if use_static_ood:
+                            cos_sim_threshold = float(os.getenv("OOD_COSINE_THRESHOLD", "0.82"))
+                            logger.info(f"[OOD Check] Using static OOD cosine threshold: {cos_sim_threshold:.4f}")
                         else:
-                            # Too small baseline, use static default
-                            calibrated_threshold = 0.82
-                            
-                        # Cap it to a safe range [0.75, 0.90] to prevent alert fatigue or under-sensitivity
-                        cos_sim_threshold = float(os.getenv("OOD_COSINE_THRESHOLD", str(max(0.75, min(0.90, calibrated_threshold)))))
-                        logger.info(f"[OOD Calibration] Dynamically calibrated OOD threshold to {cos_sim_threshold:.4f} (calibrated={calibrated_threshold:.4f}, samples={n_samples}).")
+                            # Dynamically calibrate the threshold based on baseline similarity statistics
+                            # Calculate similarity of each baseline vector to the mean baseline vector
+                            baseline_norms = np.linalg.norm(baseline_arr, axis=1)
+                            valid_mask = (baseline_norms > 0) & (norm_b > 0)
+                            n_samples = len(baseline_features)
+                            if np.any(valid_mask) and n_samples >= 10:
+                                baseline_similarities = np.dot(baseline_arr[valid_mask], mean_baseline) / (baseline_norms[valid_mask] * norm_b)
+                                median_sim = np.median(baseline_similarities)
+                                mad_sim = np.median(np.abs(baseline_similarities - median_sim))
+                                # Convert MAD to standard deviation scale (1.4826)
+                                mad_std = mad_sim * 1.4826
+                                # Scale outlier sensitivity based on sample size: tighter check for small sample size
+                                multiplier = 2.0 if n_samples < 50 else 3.0
+                                calibrated_threshold = median_sim - multiplier * mad_std
+                            else:
+                                # Too small baseline, use static default
+                                calibrated_threshold = 0.82
+                                
+                            # Cap it to a safe range [0.75, 0.90] to prevent alert fatigue or under-sensitivity
+                            cos_sim_threshold = float(os.getenv("OOD_COSINE_THRESHOLD", str(max(0.75, min(0.90, calibrated_threshold)))))
+                            logger.info(f"[OOD Calibration] Dynamically calibrated OOD threshold to {cos_sim_threshold:.4f} (calibrated={calibrated_threshold:.4f}, samples={n_samples}).")
                             
                         if cos_sim < cos_sim_threshold:
                             visual_ood_detected = True

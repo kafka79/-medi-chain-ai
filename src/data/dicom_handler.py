@@ -1,4 +1,5 @@
 import pydicom
+from typing import Optional
 import numpy as np
 from PIL import Image
 import os
@@ -48,6 +49,83 @@ class DICOMProcessor:
         img_output.save(save_path)
         
         return save_path
+
+
+def create_secondary_capture(original_dcm_path: Optional[str], heatmap_png_path: str, output_dcm_path: str) -> str:
+    """
+    Generate a DICOM Secondary Capture image dataset using metadata from the original uploaded scan.
+    Converts visual PNG overlay output into an standard-compliant DICOM dataset.
+    """
+    import pydicom
+    from pydicom.dataset import FileDataset, FileMetaDataset
+    from pydicom.uid import generate_uid
+    from PIL import Image
+    import numpy as np
+    from typing import Optional
+
+    # Load the heatmap overlay image
+    img = Image.open(heatmap_png_path).convert("RGB")
+    pixel_data = np.array(img)
+
+    # Attempt to load metadata from original scan
+    ds = None
+    if original_dcm_path and os.path.exists(original_dcm_path):
+        try:
+            ds = pydicom.dcmread(original_dcm_path)
+        except Exception:
+            pass
+
+    # Setup FileMeta headers
+    file_meta = FileMetaDataset()
+    file_meta.FileMetaInformationGroupLength = 200
+    file_meta.FileMetaInformationVersion = b'\x00\x01'
+    file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.7'  # Secondary Capture Image Storage
+    file_meta.MediaStorageSOPInstanceUID = generate_uid()
+    file_meta.ImplementationClassUID = '1.2.840.10008.5.1.4.1.1.7.0.1'
+    file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+    # Create new DICOM FileDataset
+    new_ds = FileDataset(output_dcm_path, {}, file_meta=file_meta, preamble=b"\0" * 128)
+    new_ds.is_little_endian = True
+    new_ds.is_implicit_VR = False
+
+    # Extract/populate identity headers
+    if ds:
+        new_ds.PatientName = getattr(ds, "PatientName", "REDACTED_PATIENTNAME")
+        new_ds.PatientID = getattr(ds, "PatientID", "REDACTED_PATIENTID")
+        new_ds.PatientBirthDate = getattr(ds, "PatientBirthDate", "")
+        new_ds.PatientSex = getattr(ds, "PatientSex", "")
+        new_ds.StudyInstanceUID = getattr(ds, "StudyInstanceUID", generate_uid())
+        new_ds.SeriesInstanceUID = getattr(ds, "SeriesInstanceUID", generate_uid())
+        new_ds.StudyID = getattr(ds, "StudyID", "")
+        new_ds.AccessionNumber = getattr(ds, "AccessionNumber", "")
+    else:
+        new_ds.PatientName = "REDACTED_PATIENTNAME"
+        new_ds.PatientID = "REDACTED_PATIENTID"
+        new_ds.StudyInstanceUID = generate_uid()
+        new_ds.SeriesInstanceUID = generate_uid()
+
+    new_ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.7'
+    new_ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    new_ds.Modality = "OT"
+    new_ds.ConversionType = "WSD"
+
+    # Image properties
+    new_ds.Rows = pixel_data.shape[0]
+    new_ds.Columns = pixel_data.shape[1]
+    new_ds.SamplesPerPixel = 3
+    new_ds.PhotometricInterpretation = "RGB"
+    new_ds.PlanarConfiguration = 0
+    new_ds.BitsAllocated = 8
+    new_ds.BitsStored = 8
+    new_ds.HighBit = 7
+    new_ds.PixelRepresentation = 0
+    new_ds.PixelData = pixel_data.tobytes()
+
+    # Save to file
+    os.makedirs(os.path.dirname(output_dcm_path), exist_ok=True)
+    new_ds.save_as(output_dcm_path)
+    return output_dcm_path
 
 if __name__ == "__main__":
     # Integration test

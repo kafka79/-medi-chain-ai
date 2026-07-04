@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import pytest
 import numpy as np
 import json
@@ -564,3 +565,167 @@ def test_drift_detector_local_baseline_cache():
             
     finally:
         shutil.rmtree(custom_cache_dir, ignore_errors=True)
+
+
+def test_failed_pdf_parsing_raises_http_400(monkeypatch):
+    """Verify that malformed/corrupted PDF uploads raise HTTP 400 Bad Request in production-like mode (TESTING=false)."""
+    import deployment.api.main as api_main
+    from fastapi.testclient import TestClient
+    from fastapi import FastAPI
+    from io import BytesIO
+
+    # Mock agent and storage to prevent actual runs
+    class DummyAgent:
+        async def run(self, image_path, pdf_path): return {}
+    monkeypatch.setattr(api_main, "build_agent", lambda: DummyAgent())
+    monkeypatch.setattr(api_main, "storage", MagicMock())
+
+    # Set TESTING to false to simulate production fail-fast check
+    with patch.dict("os.environ", {"TESTING": "false", "API_KEY": "test-secret"}):
+        app = api_main.create_app()
+        with TestClient(app) as client:
+            response = client.post(
+                "/analyze?sync=true",
+                files={
+                    "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
+                    "history": ("corrupt.pdf", BytesIO(b"this-is-garbage-pdf-bytes"), "application/pdf")
+                },
+                headers={"X-API-Key": "test-secret"}
+            )
+            # Should fail fast with HTTP 400 Bad Request
+            assert response.status_code == 400
+            assert "Failed to parse clinical history PDF" in response.json()["detail"]
+
+
+def test_static_ood_threshold(monkeypatch):
+    """Verify that setting OOD_USE_STATIC_THRESHOLD=true utilizes the configured static OOD cosine threshold."""
+    from src.agent.clinical_graph import ClinicalAgent
+    
+    mock_parser = MagicMock()
+    mock_rag = MagicMock()
+    
+    agent = ClinicalAgent(mock_parser, mock_rag, inference_api_url="http://localhost:8000")
+    
+    # We will test the node_synthesize_diagnosis behavior with OOD_USE_STATIC_THRESHOLD=true
+    state = {
+        "visual_features": [[0.0] * 256 + [0.9] * 256],
+        "history_data": {},
+        "diagnosis_results": {
+            "mean_confidence": [0.9],
+            "std_deviation": [0.01],
+            "all_probs": [[0.8, 0.05, 0.05, 0.05, 0.05]]
+        }
+    }
+    
+    # Write a baseline cache JSON file
+    baseline_cache_dir = Path("temp/drift")
+    baseline_cache_dir.mkdir(parents=True, exist_ok=True)
+    baseline_cache_path = baseline_cache_dir / "features_baseline_cache.json"
+    
+    # Set a baseline of 10 samples
+    baseline_data = [[0.9] * 256 + [0.0] * 256] * 10
+    with open(baseline_cache_path, "w") as f:
+        json.dump(baseline_data, f)
+        
+    try:
+        with patch.dict("os.environ", {
+            "OOD_USE_STATIC_THRESHOLD": "true",
+            "OOD_COSINE_THRESHOLD": "0.99"  # Highly strict threshold to guarantee OOD flag is triggered
+        }), patch.object(agent, "_http_client") as mock_client:
+            # Mock async post method
+            async def mock_post(url, *args, **kwargs):
+                m = MagicMock()
+                m.raise_for_status = MagicMock()
+                if "/encode/text" in url:
+                    m.json.return_value = {"embeddings": [[0.1] * 512]}
+                elif "/estimate" in url:
+                    m.json.return_value = {
+                        "prediction": [4],
+                        "mean_confidence": [0.9],
+                        "std_deviation": [0.01],
+                        "all_probs": [[0.8, 0.05, 0.05, 0.05, 0.05]]
+                    }
+                else:
+                    m.json.return_value = {"citations": []}
+                return m
+            mock_client.post = mock_post
+            
+            new_state = asyncio.run(agent.node_synthesize_diagnosis(state))
+            # With threshold = 0.99, our visual features ([0.1]*512 vs baseline [0.9]*512) will fail OOD
+            assert new_state["escalation_required"] is True
+    finally:
+        if baseline_cache_path.exists():
+            baseline_cache_path.unlink()
+
+
+def test_dicom_secondary_capture_generation(tmp_path):
+    """Verify that create_secondary_capture constructs a valid DICOM SC instance containing the heatmap."""
+    from src.data.dicom_handler import create_secondary_capture
+    from PIL import Image
+    import pydicom
+    
+    # 1. Create a dummy PNG image representing the heatmap
+    png_path = tmp_path / "heatmap.png"
+    img = Image.new("RGB", (256, 256), color=(255, 0, 0)) # Solid red image
+    img.save(png_path)
+    
+    dcm_output_path = tmp_path / "output.dcm"
+    
+    # 2. Run conversion (with None for original DICOM path)
+    create_secondary_capture(None, str(png_path), str(dcm_output_path))
+    
+    assert dcm_output_path.exists()
+    
+    # 3. Read it back and verify key tags
+    ds = pydicom.dcmread(str(dcm_output_path))
+    assert ds.PatientName == "REDACTED_PATIENTNAME"
+    assert ds.PatientID == "REDACTED_PATIENTID"
+    assert ds.SOPClassUID == '1.2.840.10008.5.1.4.1.1.7'  # SC Class
+    assert ds.Rows == 256
+    assert ds.Columns == 256
+    assert ds.SamplesPerPixel == 3
+    assert ds.PhotometricInterpretation == "RGB"
+    
+    # Verify pixel data length (256 * 256 * 3 = 196608 bytes)
+    assert len(ds.PixelData) == 196608
+    # The first pixel should be red [255, 0, 0]
+    pixel_array = ds.pixel_array
+    assert np.array_equal(pixel_array[0, 0], [255, 0, 0])
+
+
+def test_roi_telemetry_custom_config(monkeypatch):
+    """Verify that get_telemetry_metrics respects custom configuration environment variables for ROI metrics."""
+    import deployment.api.main as api_main
+    from fastapi.testclient import TestClient
+    
+    mock_redis = MagicMock()
+    mock_redis.get.side_effect = lambda k: {
+        "medi_chain:telemetry:total_cases": "10",
+        "medi_chain:telemetry:escalated_cases": "2"
+    }.get(k, None)
+    
+    monkeypatch.setattr(api_main, "redis_client", mock_redis)
+    monkeypatch.setattr(api_main, "use_redis", True)
+    
+    with patch.dict("os.environ", {
+        "TESTING": "true",
+        "API_KEY": "secret-key",
+        "TELEMETRY_BASELINE_MINUTES": "30",
+        "TELEMETRY_AUTOMATED_MINUTES": "2",
+        "TELEMETRY_HOURLY_RATE": "150.0"
+    }):
+        app = api_main.create_app()
+        with TestClient(app) as client:
+            response = client.get("/telemetry/metrics", headers={"X-API-Key": "secret-key"})
+            assert response.status_code == 200
+            data = response.json()
+            
+            # Expected calculations:
+            # total = 10, escalated = 2
+            # non-escalated = 8
+            # saved_minutes = 8 * (30 - 2) = 224 minutes
+            # saved_hours = 224 / 60 = 3.73 hours
+            # saved_cost = 3.73 * 150 = 559.5 USD
+            assert data["saved_time_hours"] == 3.73
+            assert data["saved_cost_usd"] == 559.5
+
