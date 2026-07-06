@@ -333,7 +333,8 @@ def test_s3_storage_temp_tracking_and_cleanup():
         assert dummy_name not in provider._downloaded_temp_files
 
 
-def test_dlq_configured_directory_and_fsync():
+@pytest.mark.asyncio
+async def test_dlq_configured_directory_and_fsync():
     """Verify that DLQ local fallback uses configured DLQ_DIR environment variable and writes to it."""
     from src.data.fhir_formatter import EHRGateway
     import tempfile
@@ -347,7 +348,7 @@ def test_dlq_configured_directory_and_fsync():
             dummy_payload = json.dumps({"resourceType": "DiagnosticReport", "id": "456"})
             
             # Since S3 is not configured and endpoint is broken, it will fall back to local disk
-            result = gateway.push_report(dummy_payload)
+            result = await gateway.push_report(dummy_payload)
             assert result is False
             
             # Verify file was created in the custom configured directory

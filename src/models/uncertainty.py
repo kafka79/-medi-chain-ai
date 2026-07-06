@@ -76,7 +76,11 @@ class UncertaintyEstimator:
                             noise = torch.randn_like(vision_emb) * 0.05
                         
                     perturbed_v = vision_emb + noise
+                    perturbed_v = torch.nn.functional.normalize(perturbed_v, p=2, dim=-1)
+                    
                     perturbed_t = text_emb + torch.randn_like(text_emb) * 0.05
+                    perturbed_t = torch.nn.functional.normalize(perturbed_t, p=2, dim=-1)
+                    
                     _, logits = self.model(perturbed_v, perturbed_t)
                     all_logits.append(torch.softmax(logits, dim=1))
                     

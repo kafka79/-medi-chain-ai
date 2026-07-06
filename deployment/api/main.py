@@ -516,19 +516,10 @@ async def cleanup_old_temp_files():
                 logger.critical(f"Failed to acquire Redis cleanup lock: {e}. Skipping cleanup task as fallback to avoid concurrent write races on shared volumes.")
                 run_cleanup = False
         else:
-            # Fallback to local shared FileLock if Redis is not active/available
-            try:
-                TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-                if cleanup_file_lock is None:
-                    cleanup_file_lock = FileLock(TEMP_ROOT / "cleanup.lock")
-                # Non-blocking acquire on the main thread is extremely fast and won't block the event loop.
-                # Running both acquire and release on the main thread prevents Windows thread ownership errors.
-                cleanup_file_lock.acquire(timeout=0)
-                file_lock_acquired = True
-                logger.info("Acquired local file lock for storage cleanup.")
-            except Exception:
-                run_cleanup = False
-                logger.info("Another replica is holding the local cleanup file lock. Skipping this run.")
+            # Fallback to local execution without FileLock: stagger executions
+            # across replicas using randomized jitter to prevent write races on S3/MinIO
+            run_cleanup = True
+            logger.info("Redis is down. Running staggered temp file cleanup without distributed lock.")
         
         if run_cleanup:
             try:
@@ -545,16 +536,14 @@ async def cleanup_old_temp_files():
                         f"Cleanup task experienced {consecutive_failures} consecutive failures. "
                         f"Storage cleanup is impaired. System requires manual check/reboot."
                     )
-            finally:
-                if file_lock_acquired and cleanup_file_lock:
-                    try:
-                        cleanup_file_lock.release()
-                    except Exception as le:
-                        logger.error(f"Failed to release local cleanup file lock: {le}")
         else:
             sleep_time = base_sleep
             
-        await asyncio.sleep(sleep_time)
+        import random
+        # Stagger executions across replicas by adding a random jitter of up to 60 seconds
+        is_testing = os.getenv("TESTING") == "true"
+        actual_sleep = sleep_time + (random.randint(0, 60) if not (use_redis and redis_client) and not is_testing else 0)
+        await asyncio.sleep(actual_sleep)
 
 import concurrent.futures
 _alert_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="system-alert-sender")
@@ -614,7 +603,7 @@ async def reconcile_dlq_task():
             logger.info(f"[DLQ Reconciler] Attempting to reconcile report from {source_type}...")
             
             # Pass is_retry=True to avoid duplicate DLQ writes inside push_report
-            success = await loop.run_in_executor(None, ehr_gateway.push_report, fhir_json, True)
+            success = await ehr_gateway.push_report(fhir_json, True)
             
             if success:
                 logger.info(f"[DLQ Reconciler] Successfully reconciled report from {source_type}.")
@@ -691,18 +680,41 @@ async def reconcile_dlq_task():
                     elif source_type == "local" and identifier:
                         logger.warning(f"[DLQ Reconciler] Local re-push failed. Saving updated retry count to local file {identifier}.")
                         try:
+                            import tempfile
+                            import shutil
                             from src.utils.security import encrypt_payload
+                            
                             payload_json = json.dumps(item, indent=2)
                             encrypted_payload = encrypt_payload(payload_json)
                             wrapper = {
                                 "encrypted": True,
                                 "data": encrypted_payload
                             }
-                            with open(identifier, "w") as f:
-                                json.dump(wrapper, f, indent=2)
-                            # Rename back to .json so it can be picked up again
-                            orig_path = Path(identifier).with_suffix(".json")
-                            Path(identifier).rename(orig_path)
+                            wrapper_json = json.dumps(wrapper, indent=2)
+                            
+                            target_path = Path(identifier).with_suffix(".json")
+                            dlq_dir = target_path.parent
+                            
+                            # Validate disk space before writing
+                            total, used, free = shutil.disk_usage(dlq_dir)
+                            if free < 50 * 1024 * 1024:
+                                raise RuntimeError("Critically low disk space on local partition")
+                                
+                            fd, tmp_path = tempfile.mkstemp(dir=str(dlq_dir), suffix=".tmp")
+                            try:
+                                with os.fdopen(fd, "w") as f:
+                                    f.write(wrapper_json)
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                os.replace(tmp_path, str(target_path))
+                            except Exception:
+                                if os.path.exists(tmp_path):
+                                    os.remove(tmp_path)
+                                raise
+                                
+                            # Safely delete processing file only after new .json file is durable
+                            Path(identifier).unlink(missing_ok=True)
+                            logger.info(f"[DLQ Reconciler] Successfully saved updated retry count to local DLQ file {target_path.name}")
                         except Exception as local_err:
                             logger.error(f"[DLQ Reconciler] Failed to write updated local DLQ retry count: {local_err}")
         except Exception as err:

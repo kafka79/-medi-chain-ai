@@ -366,11 +366,15 @@ class DriftDetector:
 
         drift_detected = False
         
+        # Bonferroni correction: alpha = 0.05 / num_classes to control Family-Wise Error Rate (FWER)
+        num_classes = current.shape[1]
+        significance_level = 0.05 / num_classes
+        
         # Compare distributions using Kolmogorov-Smirnov test per class
-        for i in range(current.shape[1]):
+        for i in range(num_classes):
             stat, p_value = ks_2samp(self.baseline[:, i], current[:, i])
-            if p_value < 0.05:
-                msg = f"Significant Prediction Drift (Label Shift) detected in Class {i} (p={p_value:.4f})"
+            if p_value < significance_level:
+                msg = f"Significant Prediction Drift (Label Shift) detected in Class {i} (p={p_value:.4f}, corrected_alpha={significance_level:.4f})"
                 _send_alert("Prediction Drift", msg)
                 drift_detected = True
         

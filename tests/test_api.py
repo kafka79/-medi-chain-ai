@@ -76,7 +76,7 @@ def test_analyze_cleans_request_dir_on_success(monkeypatch):
     
     # Also mock ehr_gateway to prevent real requests
     class DummyEHR:
-        def push_report(self, fhir_json): return True
+        async def push_report(self, fhir_json, is_retry=False): return True
     monkeypatch.setattr(api_main, "ehr_gateway", DummyEHR())
     
     app = api_main.create_app()

@@ -166,15 +166,20 @@ class VisualExplainer:
         H, W = rgb_img.shape[0], rgb_img.shape[1]
         pad_top, pad_left, padded_size = pad_info["pad_top"], pad_info["pad_left"], pad_info["padded_size"]
         
-        # Resize CAM to the padded square dimensions
-        cam_padded = cv2.resize(grayscale_cam, (padded_size, padded_size))
+        # Resize CAM to the padded square dimensions using bicubic interpolation
+        cam_padded = cv2.resize(grayscale_cam, (padded_size, padded_size), interpolation=cv2.INTER_CUBIC)
         
         # Crop out padding to recover original aspect ratio
         cam_original = cam_padded[pad_top:pad_top + H, pad_left:pad_left + W]
         
         # Safety: ensure exact match (rounding can cause ±1px)
         if cam_original.shape != (H, W):
-            cam_original = cv2.resize(cam_original, (W, H))
+            cam_original = cv2.resize(cam_original, (W, H), interpolation=cv2.INTER_CUBIC)
+            
+        # Apply edge-preserving bilateral filtering to avoid blurry visual artifacts
+        cam_u8 = (cam_original * 255.0).astype(np.uint8)
+        cam_filtered = cv2.bilateralFilter(cam_u8, d=9, sigmaColor=75, sigmaSpace=75)
+        cam_original = cam_filtered.astype(np.float32) / 255.0
 
         visualization = show_cam_on_image(rgb_img, cam_original, use_rgb=True)
         

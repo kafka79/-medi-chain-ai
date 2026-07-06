@@ -207,9 +207,10 @@ def main():
                         pmid = cit.get('pmid')
                         text = cit.get("text", "")
                         
-                        # Limit to first 2 sentences to reduce cognitive load
+                        # Limit to first 2 sentences to reduce cognitive load (ignoring medical abbreviations)
                         import re
-                        sentences = re.split(r'(?<=[.!?])\s+', text)
+                        abbrevs = r"(?<!\bPt)(?<!\bDr)(?<!\bvs)(?<!\beg)(?<!\bie)(?<!\bL)(?<!\bR)(?<!\bJan)(?<!\bFeb)(?<!\bMar)(?<!\bApr)(?<!\bJun)(?<!\bJul)(?<!\bAug)(?<!\bSep)(?<!\bOct)(?<!\bNov)(?<!\bDec)"
+                        sentences = re.split(rf"{abbrevs}(?<=[.!?])\s+", text)
                         tldr = " ".join(sentences[:2]) if len(sentences) > 0 else text
                         
                         with st.expander(f"PMID {pmid} - {title}"):
@@ -241,20 +242,53 @@ def main():
                     )
                 st.success("Report Generated!")
                 
-                # Push report to EHR via Gateway
-                st.write("Transmitting to Hospital EHR...")
-                try:
-                    from src.data.fhir_formatter import EHRGateway
-                    ehr_gateway = EHRGateway()
+                # Push report to EHR via Gateway using background thread to avoid UI blocking
+                import threading
+                import asyncio
+                from streamlit.runtime.scriptrunner import get_script_run_ctx, add_script_run_ctx
+                
+                if "ehr_transmission_state" not in st.session_state:
+                    st.session_state.ehr_transmission_state = ("idle", "Not started")
+                
+                status_type, status_msg = st.session_state.ehr_transmission_state
+                ctx = get_script_run_ctx()
+                status_placeholder = st.empty()
+                
+                if status_type == "idle":
+                    if status_placeholder.button("Transmit Report to Hospital EHR"):
+                        st.session_state.ehr_transmission_state = ("pending", "Transmitting to Hospital EHR...")
+                        status_type = "pending"
+                
+                if status_type == "pending":
+                    status_placeholder.info("Transmitting to Hospital EHR in background...")
                     with open(report_bundle['fhir_path'], "r", encoding="utf-8") as f:
                         fhir_json = f.read()
-                    success = ehr_gateway.push_report(fhir_json)
-                    if success:
-                        st.success("Successfully transmitted to EHR!")
-                    else:
-                        st.warning("EHR Transmission failed. Saved to Dead Letter Queue.")
-                except Exception as e:
-                    st.error(f"EHR Integration Error: {e}")
+                    
+                    def push_worker(ctx):
+                        add_script_run_ctx(threading.current_thread(), ctx)
+                        from src.data.fhir_formatter import EHRGateway
+                        gateway = EHRGateway()
+                        try:
+                            # Run async push_report
+                            success = asyncio.run(gateway.push_report(fhir_json))
+                            if success:
+                                st.session_state.ehr_transmission_state = ("success", "Successfully transmitted to EHR!")
+                                status_placeholder.success("Successfully transmitted to EHR!")
+                            else:
+                                st.session_state.ehr_transmission_state = ("warning", "EHR Transmission failed. Saved to Dead Letter Queue.")
+                                status_placeholder.warning("EHR Transmission failed. Saved to Dead Letter Queue.")
+                        except Exception as e:
+                            st.session_state.ehr_transmission_state = ("error", f"EHR Integration Error: {e}")
+                            status_placeholder.error(f"EHR Integration Error: {e}")
+                        
+                    t = threading.Thread(target=push_worker, args=(ctx,), daemon=True)
+                    t.start()
+                elif status_type == "success":
+                    status_placeholder.success(status_msg)
+                elif status_type == "warning":
+                    status_placeholder.warning(status_msg)
+                elif status_type == "error":
+                    status_placeholder.error(status_msg)
                 
                 with open(report_bundle["fhir_path"], "rb") as fhir_handle:
                     st.download_button(

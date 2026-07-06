@@ -134,7 +134,8 @@ def test_opencv_peripheral_redaction():
         if os.path.exists(tmp_img.name):
             os.unlink(tmp_img.name)
 
-def test_local_first_dlq_fallback():
+@pytest.mark.asyncio
+async def test_local_first_dlq_fallback():
     # Use a mock EHR gateway pointing to a completely broken URL
     gateway = EHRGateway(endpoint_url="http://completely-broken-invalid-host/fhir")
     
@@ -145,7 +146,7 @@ def test_local_first_dlq_fallback():
             os.unlink(f)
             
     dummy_payload = json.dumps({"resourceType": "DiagnosticReport", "id": "123"})
-    result = gateway.push_report(dummy_payload)
+    result = await gateway.push_report(dummy_payload)
     
     # The push must return False (failure to send) but NOT raise an exception
     assert result is False

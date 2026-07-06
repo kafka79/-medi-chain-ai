@@ -139,11 +139,11 @@ class EHRGateway:
         self.logger = logging.getLogger("ehr-gateway")
         self.endpoint_url = endpoint_url or os.getenv("EHR_GATEWAY_URL", "https://mock-ehr-gateway.internal/fhir")
 
-    def validate_patient(self, patient_id: str) -> bool:
+    async def validate_patient(self, patient_id: str) -> bool:
         """Validates that the patient exists in the EHR system before posting observations.
         Makes a read request to Patient resource (GET /fhir/Patient/{id}).
         """
-        import requests
+        import httpx
         
         # If the endpoint is mock, simulate validation
         if "mock-ehr-gateway.internal" in self.endpoint_url:
@@ -156,18 +156,19 @@ class EHRGateway:
         try:
             url = f"{self.endpoint_url}/Patient/{patient_id}"
             headers = {"Accept": "application/fhir+json"}
-            response = requests.get(url, headers=headers, timeout=5)
-            if response.status_code == 200:
-                self.logger.info(f"[EHR Gateway] Successfully validated patient {patient_id} in EHR.")
-                return True
-            else:
-                self.logger.error(f"[EHR Gateway] Patient validation failed for ID {patient_id}. HTTP status: {response.status_code}")
-                return False
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url, headers=headers)
+                if response.status_code == 200:
+                    self.logger.info(f"[EHR Gateway] Successfully validated patient {patient_id} in EHR.")
+                    return True
+                else:
+                    self.logger.error(f"[EHR Gateway] Patient validation failed for ID {patient_id}. HTTP status: {response.status_code}")
+                    return False
         except Exception as e:
             self.logger.error(f"[EHR Gateway] EHR connection error during patient validation: {e}")
             return False
 
-    def push_report(self, fhir_json: str, is_retry: bool = False):
+    async def push_report(self, fhir_json: str, is_retry: bool = False):
         """Pushes the report to a hospital's FHIR server with robust retry logic."""
         # Validate patient existence before pushing report observations
         try:
@@ -175,51 +176,51 @@ class EHRGateway:
             subject_ref = report_data.get("subject", {}).get("reference", "")
             if subject_ref.startswith("Patient/"):
                 patient_id = subject_ref.split("/")[-1]
-                if not self.validate_patient(patient_id):
+                if not await self.validate_patient(patient_id):
                     self.logger.error(f"[EHR Gateway] Aborting report push: Patient ID {patient_id} is invalid.")
                     return False
         except Exception as parse_err:
             self.logger.warning(f"[EHR Gateway] Could not parse patient ID for validation: {parse_err}")
 
-        from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
-        import requests
+        from tenacity import AsyncRetrying, wait_exponential, stop_after_attempt, retry_if_exception
+        import httpx
         
         def is_retriable_error(exception):
-            if isinstance(exception, requests.exceptions.ConnectionError):
+            if isinstance(exception, httpx.ConnectError) or isinstance(exception, httpx.ConnectTimeout):
                 return True
-            if isinstance(exception, requests.exceptions.Timeout):
-                return True
-            if isinstance(exception, requests.exceptions.HTTPError):
+            if isinstance(exception, httpx.HTTPStatusError):
                 # Only retry on 5xx server errors
                 return exception.response.status_code >= 500
             return False
         
-        @retry(
-            wait=wait_exponential(multiplier=1, min=2, max=10),
-            stop=stop_after_attempt(3),
-            retry=retry_if_exception(is_retriable_error),
-            reraise=True
-        )
-        def _execute_push():
+        async def _execute_push():
             self.logger.info(f"[EHR Gateway] Connecting to {self.endpoint_url}...")
             # If the endpoint is mock, simulate transient network failures (30% rate)
             if "mock-ehr-gateway.internal" in self.endpoint_url:
                 import random
                 if random.random() < 0.3:
                     self.logger.warning("[EHR Gateway] Mock transient connection error triggered.")
-                    raise requests.exceptions.ConnectionError("Mock Connection Timeout")
+                    raise httpx.ConnectError("Mock Connection Timeout")
                 self.logger.info("[EHR Gateway] Successfully posted DiagnosticReport to Mock EHR.")
                 return True
             else:
                 # Real HTTP POST with OAuth2/mTLS headers
                 headers = {"Content-Type": "application/fhir+json"}
-                response = requests.post(self.endpoint_url, data=fhir_json, headers=headers, timeout=5)
-                response.raise_for_status()
-                self.logger.info(f"[EHR Gateway] Successfully posted DiagnosticReport to {self.endpoint_url}.")
-                return True
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    response = await client.post(self.endpoint_url, data=fhir_json, headers=headers)
+                    response.raise_for_status()
+                    self.logger.info(f"[EHR Gateway] Successfully posted DiagnosticReport to {self.endpoint_url}.")
+                    return True
                 
         try:
-            return _execute_push()
+            async for attempt in AsyncRetrying(
+                wait=wait_exponential(multiplier=1, min=2, max=10),
+                stop=stop_after_attempt(3),
+                retry=retry_if_exception(is_retriable_error),
+                reraise=True
+            ):
+                with attempt:
+                    return await _execute_push()
         except Exception as e:
             if not is_retry:
                 self.logger.error(f"[EHR Gateway] All push attempts failed: {e}. Writing to Dead Letter Queue (DLQ).")
@@ -233,6 +234,7 @@ class EHRGateway:
         import time
         import os
         import tempfile
+        import shutil
         from pathlib import Path
         
         filename = f"failed_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
@@ -241,7 +243,7 @@ class EHRGateway:
             parsed_payload = json.loads(fhir_json) if isinstance(fhir_json, str) else fhir_json
         except json.JSONDecodeError:
             parsed_payload = fhir_json  # Fallback to raw string if invalid JSON
-
+ 
         payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "error": str(exception),
@@ -252,11 +254,6 @@ class EHRGateway:
         payload_json = json.dumps(payload, indent=2)
         redis_success = False
         local_success = False
-        
-        # Flaw #7-structural Fix: Redis is the PRIMARY DLQ tier (shared across replicas).
-        # Previous code used local files with filelock as secondary — but filelock is
-        # process-local and does not coordinate across containers/replicas.
-        # Now: Redis first, local disk as emergency-only (no lock needed — atomic rename).
         
         # 1. Primary: Redis shared list (replicated across all API replicas)
         try:
@@ -287,6 +284,18 @@ class EHRGateway:
             try:
                 dlq_dir = Path(os.getenv("DLQ_DIR", "temp/dlq"))
                 dlq_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Check free space on local partition
+                total, used, free = shutil.disk_usage(dlq_dir)
+                if free < 50 * 1024 * 1024:  # Critically low if < 50 MB
+                    self.logger.critical("Local disk space is critically low. Aborting emergency local DLQ write to prevent disk exhaustion.")
+                    try:
+                        from deployment.api.main import _send_system_alert
+                        _send_system_alert("Disk Space Exhaustion", "Emergency local DLQ write aborted due to low disk space.")
+                    except Exception as alert_err:
+                        self.logger.error(f"Failed to send system alert: {alert_err}")
+                    raise RuntimeError("Critically low disk space on local partition")
+                
                 local_path = dlq_dir / filename
                 
                 # Encrypt the payload string before persisting to local disk fallback

@@ -108,7 +108,8 @@ def test_privacy_scrubber_eager_ner_failure():
             PrivacyScrubber()
         assert "Privacy scrubber failed to load the NER model at startup" in str(exc_info.value)
 
-def test_ehr_gateway_redis_dlq_fallback():
+@pytest.mark.asyncio
+async def test_ehr_gateway_redis_dlq_fallback():
     from src.data.fhir_formatter import EHRGateway
     
     mock_redis_client = MagicMock()
@@ -117,7 +118,7 @@ def test_ehr_gateway_redis_dlq_fallback():
         gateway = EHRGateway(endpoint_url="http://completely-broken-invalid-host/fhir")
         
         # Trigger EHR failure
-        result = gateway.push_report('{"resourceType": "DiagnosticReport"}')
+        result = await gateway.push_report('{"resourceType": "DiagnosticReport"}')
         
         # Should return False but not raise
         assert result is False

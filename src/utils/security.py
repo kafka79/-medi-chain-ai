@@ -6,11 +6,17 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 logger = logging.getLogger("medi-chain-security")
 
+_EPHEMERAL_KEY = AESGCM.generate_key(bit_length=256)
+
 def _get_encryption_key() -> bytes:
     key_str = os.getenv("DLQ_ENCRYPTION_KEY")
     if not key_str:
         if os.getenv("TESTING") == "true" or os.getenv("STORAGE_MODE") == "local":
-            return b"dev_key_for_medi_chain_dlq_32B_!"  # Exactly 32 bytes
+            logger.warning(
+                "WARNING: DLQ_ENCRYPTION_KEY is not set. Generating a transient ephemeral key for secure local operations. "
+                "Note: Local DLQ payloads will not be decryptable across process restarts."
+            )
+            return _EPHEMERAL_KEY
         raise RuntimeError(
             "CRITICAL: DLQ_ENCRYPTION_KEY environment variable is not set. "
             "Refusing to start with default key fallback in a production-like environment. "

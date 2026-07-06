@@ -48,6 +48,7 @@ if _USING_DEFAULT_THRESHOLDS and os.getenv("TESTING") != "true":
 
 
 class AgentState(TypedDict):
+    schema_version: int
     image_path: str
     patient_pdf_path: str
     visual_features: Any
@@ -145,6 +146,78 @@ class ClinicalAgent:
         
         self.app = self.workflow.compile()
 
+    def _ensure_current_schema(self, state: AgentState) -> AgentState:
+        # Ensure we don't modify the state dictionary in place if it's read-only
+        state_dict = dict(state)
+        current_version = state_dict.get("schema_version", 1)
+        if current_version < 2:
+            # Migrate v1 to v2: ensure all required keys exist and schema_version is set
+            if "heatmap_base64" not in state_dict:
+                state_dict["heatmap_base64"] = ""
+            state_dict["schema_version"] = 2
+            logger.info(f"[Schema Migration] Migrated AgentState from v{current_version} to v2")
+        return state_dict
+
+    def _extract_biomedical_concepts(self, chief_complaint: str, pmh: str) -> List[str]:
+        """
+        Dynamically maps text to biomedical concepts (inspired by UMLS/MeSH thesauri)
+        to build highly generalizable search queries.
+        """
+        import re
+        combined_text = f"{chief_complaint} {pmh}".lower()
+        concepts = []
+        
+        # 1. Occupational pneumoconiosis/exposure mapping
+        occupational_triggers = {
+            "asbest": "asbestosis",
+            "silic": "silicosis",
+            "coal": "coal workers' pneumoconiosis",
+            "dust": "dust exposure lung disease",
+            "quarry": "silicosis",
+            "mining": "pneumoconiosis",
+            "berylli": "berylliosis",
+            "cotton": "byssinosis",
+            "iron": "siderosis",
+            "sandblast": "silicosis"
+        }
+        for trigger, concept in occupational_triggers.items():
+            if trigger in combined_text:
+                concepts.append(concept)
+                
+        # 2. Infection, inflammation, and chronic pathology mapping
+        pathology_triggers = {
+            "pneumonia": "pneumonia",
+            "tuberculosis": "tuberculosis",
+            "tb": "tuberculosis",
+            "bronchitis": "bronchitis",
+            "sarcoid": "sarcoidosis",
+            "effusion": "pleural effusion",
+            "cancer": "lung malignancy",
+            "tumor": "lung neoplasm",
+            "nodule": "pulmonary nodule"
+        }
+        for trigger, concept in pathology_triggers.items():
+            if trigger in combined_text:
+                concepts.append(concept)
+                
+        # 3. Dynamic token filtering for technical candidate terms (concept-like tokens)
+        stop_words = {
+            "and", "the", "with", "for", "from", "on", "in", "to", "of", "a", "an", "is", "was",
+            "history", "patient", "clinical", "presentation", "years", "old", "male", "female",
+            "complains", "presenting", "reported", "shows", "findings", "reveals", "normal", "abnormal"
+        }
+        clean_text = re.sub(r"[^a-zA-Z\s]", " ", combined_text)
+        words = clean_text.split()
+        candidate_terms = [w for w in words if len(w) > 4 and w not in stop_words]
+        
+        for term in candidate_terms:
+            if len(concepts) >= 6:
+                break
+            if not any(term in c or c in term for c in concepts):
+                concepts.append(term)
+                
+        return list(set(concepts))
+
     # Node Functions
     async def node_extract_visuals(self, state: AgentState):
         logger.info("[Node] Extracting Visuals...")
@@ -187,6 +260,7 @@ class ClinicalAgent:
 
     async def node_parse_history(self, state: AgentState):
         logger.info("[Node] Parsing Patient History...")
+        state = self._ensure_current_schema(state)
         path = state['patient_pdf_path']
         loop = asyncio.get_running_loop()
         if path.lower().endswith(".json"):
@@ -203,8 +277,29 @@ class ClinicalAgent:
 
     async def node_query_pubmed(self, state: AgentState):
         logger.info("[Node] Querying PubMed...")
-        # Use chief complaint + iteration context for refined queries
-        base_query = state['history_data'].get('chief_complaint', "Chest X-ray findings")
+        state = self._ensure_current_schema(state)
+        history = state['history_data']
+        metadata = history.get('metadata', {})
+        
+        # Combine clinical history elements for a specific medical query
+        chief_complaint = history.get('chief_complaint', '')
+        pmh = history.get('past_medical_history', '')
+        occupation = metadata.get('occupation', '')
+        exposure_years = metadata.get('exposure_years', '0')
+        
+        # Build search keywords based on PMH or Chief Complaint dynamically (replaces hardcoded ontology checks)
+        keywords = self._extract_biomedical_concepts(chief_complaint, pmh)
+            
+        query_parts = []
+        if chief_complaint:
+            query_parts.append(chief_complaint)
+        if keywords:
+            query_parts.append(" AND ".join(keywords))
+        if occupation and exposure_years != "0":
+            query_parts.append(f"{occupation} exposure")
+            
+        base_query = " ".join(query_parts) if query_parts else "chest radiography diagnostic"
+        
         if state.get('iteration_count', 0) > 0:
             query = f"{base_query} differential diagnosis respiratory imaging"
         else:
@@ -219,6 +314,7 @@ class ClinicalAgent:
 
     async def node_synthesize_diagnosis(self, state: AgentState):
         logger.info("[Node] Synthesizing Diagnosis...")
+        state = self._ensure_current_schema(state)
         # Get visual features (already list from API)
         v = state['visual_features']
             
@@ -369,6 +465,7 @@ class ClinicalAgent:
         }
 
     async def node_self_verify(self, state: AgentState):
+        state = self._ensure_current_schema(state)
         logger.info(f"[Node] Self-Verifying (Confidence: {state['confidence']:.2f}, Uncertainty: {state['diagnosis']['uncertainty_std']:.4f})...")
         count = state.get('iteration_count', 0) + 1
         
@@ -403,6 +500,7 @@ class ClinicalAgent:
 
     async def run(self, image_path: str, pdf_path: str):
         initial_state = {
+            "schema_version": 2,
             "image_path": image_path,
             "patient_pdf_path": pdf_path,
             "iteration_count": 0,

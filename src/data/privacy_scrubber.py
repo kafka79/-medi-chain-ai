@@ -12,6 +12,73 @@ logger = logging.getLogger("privacy-scrubber")
 _audit_logger = logging.getLogger("phi-audit")
 _audit_logger.setLevel(logging.INFO)
 
+import hashlib
+
+class SecureAuditLogger:
+    """
+    Implements a cryptographic hash-chained, tamper-evident audit log writer
+    to meet stringent HIPAA compliance requirements.
+    """
+    def __init__(self, filepath="temp/audit.log"):
+        self.filepath = filepath
+        self._lock = threading.Lock()
+        self.last_hash = "0" * 64
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        
+        # Load the last hash from existing log file if it exists and has content
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                    if lines:
+                        last_line = lines[-1].strip()
+                        if last_line:
+                            record = json.loads(last_line)
+                            if "hash" in record:
+                                self.last_hash = record["hash"]
+            except Exception as e:
+                logger.error(f"[Secure Audit] Failed to read last hash from audit log: {e}")
+                
+        # Set file permissions to owner-read-write only (0o600)
+        try:
+            if os.path.exists(self.filepath):
+                os.chmod(self.filepath, 0o600)
+        except Exception as e:
+            logger.warning(f"[Secure Audit] Failed to restrict audit log permissions: {e}")
+
+    def log_record(self, record: Dict[str, Any]):
+        with self._lock:
+            # Add chaining metadata
+            record["previous_hash"] = self.last_hash
+            
+            # Compute current hash
+            record_str = json.dumps(record, sort_keys=True)
+            hasher = hashlib.sha256()
+            hasher.update((self.last_hash + record_str).encode("utf-8"))
+            current_hash = hasher.hexdigest()
+            record["hash"] = current_hash
+            
+            # Update in-memory pointer
+            self.last_hash = current_hash
+            
+            # Append to log file
+            try:
+                is_new = not os.path.exists(self.filepath)
+                with open(self.filepath, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record) + "\n")
+                if is_new:
+                    try:
+                        os.chmod(self.filepath, 0o600)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.critical(f"[Secure Audit] CRITICAL: Failed to write to secure audit trail: {e}")
+
+# Instantiate global secure audit logger
+secure_audit_logger = SecureAuditLogger()
+
 class PrivacyScrubber:
     """
     Addresses 'De-identification Edge Cases'.
@@ -130,15 +197,16 @@ class PrivacyScrubber:
             scrubbed = " ".join(fallback_words)
             redaction_log.append({"type": "ner_fallback_triggered", "error": str(e)})
         
-        # Flaw #23 Fix: Write audit record
-        if redaction_log:
-            audit_record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "source": source_context,
-                "operation": "text_scrub",
-                "redactions": redaction_log,
-            }
-            _audit_logger.info(json.dumps(audit_record))
+        # Flaw #23 Fix: Write audit record ALWAYS (even if redaction_log is empty) for complete HIPAA auditability
+        audit_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": source_context,
+            "operation": "text_scrub",
+            "pii_detected": len(redaction_log) > 0,
+            "redactions": redaction_log,
+        }
+        secure_audit_logger.log_record(dict(audit_record))
+        _audit_logger.info(json.dumps(audit_record))
                 
         return scrubbed
 
