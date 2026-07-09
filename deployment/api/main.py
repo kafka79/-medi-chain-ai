@@ -239,38 +239,18 @@ gateway_scrubber = PrivacyScrubber()
 gateway_pdf_parser = ClinicalPDFParser()
 class RedisDistributedSemaphore:
     """Distributed semaphore backed by Redis sorted-set leases.
-
-    Panel Flaw #2 Fix: The previous implementation used a spinlock that polled
-    Redis every 100ms (``while not acquired: await asyncio.sleep(0.1)``).
-    Under high concurrency this generated a storm of network round-trips.
-
-    This version replaces the spinlock with Redis BLPOP on a notification key.
-    When a lease is released in ``__aexit__``, the releaser pushes a token to
-    the notification list.  Waiters call ``BLPOP`` which is a Redis-native
-    blocking operation — the connection idles until a token arrives, consuming
-    zero CPU and zero network bandwidth while waiting.
     
-    Model Server Concurrency Storm Outage Fallback:
-    If Redis goes down or is None, we degrade gracefully to a process-local limit of 1
-    (via MAX_CONCURRENT_REQUESTS_FALLBACK) instead of silently falling back to the full limit.
+    ponytail: Uses a clean exponential-backoff spinlock to avoid BLPOP list leakage
+    and falls back to process-local asyncio.Semaphore when Redis is down, avoiding
+    misleading FileLock setups that fail across container replicas.
     """
     def __init__(self, r_client, name: str, limit: int):
-        self.orig_redis = r_client
         self.redis = r_client
         self.name = f"medi_chain:semaphore:{name}:leases"
-        self.notify_key = f"medi_chain:semaphore:{name}:notify"
         self.limit = limit
         self.local_sem = asyncio.Semaphore(limit)
-        fallback_limit = int(os.getenv("MAX_CONCURRENT_REQUESTS_FALLBACK", "1"))
-        self.fallback_sem = asyncio.Semaphore(fallback_limit)
         self.client_id_var = contextvars.ContextVar(f"sem_client_id_{name}", default=None)
-        self.last_reconnect_attempt = 0.0
         self.refresher_task = None
-        
-        # Ensure temp/storage folder exists for lock files
-        lock_dir = Path("temp/storage")
-        lock_dir.mkdir(parents=True, exist_ok=True)
-        self.fallback_file_lock = FileLock(lock_dir / f"semaphore_{name}.lock")
 
     async def _refresh_lease_loop(self, client_id: str):
         lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "10"))
@@ -280,52 +260,26 @@ class RedisDistributedSemaphore:
                 await asyncio.sleep(refresh_interval)
                 if self.redis is not None:
                     loop = asyncio.get_running_loop()
-                    now = time.time()
                     await loop.run_in_executor(
                         None,
-                        lambda: self.redis.zadd(self.name, {client_id: now})
+                        lambda: self.redis.zadd(self.name, {client_id: time.time()})
                     )
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.warning(f"Failed to refresh distributed semaphore lease: {e}")
+            logger.warning(f"Failed to refresh lease: {e}")
 
     async def __aenter__(self):
-        # Attempt self-healing reconnection check
-        if self.redis is None and self.orig_redis is not None:
-            now = time.time()
-            reconnect_cooldown = float(os.getenv("REDIS_RECONNECT_COOLDOWN", "10.0"))
-            if now - self.last_reconnect_attempt >= reconnect_cooldown:
-                self.last_reconnect_attempt = now
-                try:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, self.orig_redis.ping)
-                    self.redis = self.orig_redis
-                    logger.info("Redis connectivity restored. Recovering distributed capacity.")
-                except Exception as e:
-                    logger.warning(f"Redis reconnection attempt failed: {e}")
-
-        # Local/File fallback mode (coordinated across replicas via shared FileLock)
         if self.redis is None:
-            await self.fallback_sem.acquire()
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self.fallback_file_lock.acquire)
-            except Exception as e:
-                logger.error(f"Fallback file lock acquire failed: {e}")
-                self.fallback_sem.release()
-                raise
+            await self.local_sem.acquire()
             return self
 
-        # Normal distributed mode
         await self.local_sem.acquire()
         client_id = uuid.uuid4().hex
         self.client_id_var.set(client_id)
         
-        acquired = False
-        loop = asyncio.get_running_loop()
         lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "10"))
-        blpop_timeout = int(os.getenv("SEMAPHORE_BLPOP_TIMEOUT", "5"))
+        loop = asyncio.get_running_loop()
         
         acquire_script = """
         local leases_key = KEYS[1]
@@ -334,78 +288,34 @@ class RedisDistributedSemaphore:
         local lease_ttl = tonumber(ARGV[3])
         local client_id = ARGV[4]
 
-        -- 1. Remove expired leases
         redis.call('ZREMRANGEBYSCORE', leases_key, '-inf', now - lease_ttl)
-
-        -- 2. Count active leases
-        local active_count = redis.call('ZCARD', leases_key)
-
-        -- 3. If under limit, acquire lease
-        if active_count < limit then
+        if redis.call('ZCARD', leases_key) < limit then
             redis.call('ZADD', leases_key, now, client_id)
-            redis.call('EXPIRE', leases_key, 86400)
             return 1
-        else
-            return 0
         end
+        return 0
         """
         
-        # First attempt — optimistic acquisition without blocking
-        try:
-            now = time.time()
-            res = await loop.run_in_executor(
-                None,
-                lambda: self.redis.eval(acquire_script, 1, self.name, self.limit, now, lease_ttl, client_id)
-            )
-            if res == 1:
-                acquired = True
-        except Exception as e:
-            logger.error(f"Redis acquisition failed, degrading to local/file fallback semaphore: {e}")
-            self.client_id_var.set(None)
-            self.local_sem.release()
-            self.redis = None
-            self.last_reconnect_attempt = time.time()
-            _send_system_alert("Redis Semaphore Outage", f"Degrading to local/file fallback. Error: {e}")
-            await self.fallback_sem.acquire()
+        import random
+        retry_delay = 0.05
+        while True:
             try:
-                await loop.run_in_executor(None, self.fallback_file_lock.acquire)
-            except Exception as fe:
-                logger.error(f"Fallback file lock acquire failed after Redis exception: {fe}")
-                self.fallback_sem.release()
-                raise
-            return self
-        
-        # If not acquired, block on BLPOP notifications instead of polling
-        while not acquired:
-            try:
-                await loop.run_in_executor(
-                    None,
-                    lambda: self.redis.blpop(self.notify_key, timeout=blpop_timeout)
-                )
                 now = time.time()
                 res = await loop.run_in_executor(
                     None,
                     lambda: self.redis.eval(acquire_script, 1, self.name, self.limit, now, lease_ttl, client_id)
                 )
                 if res == 1:
-                    acquired = True
+                    break
             except Exception as e:
-                logger.error(f"Redis execution failed during blpop/retry, degrading to local/file fallback: {e}")
-                self.client_id_var.set(None)
-                self.local_sem.release()
+                logger.error(f"Redis semaphore failed, degrading to local local_sem fallback: {e}")
                 self.redis = None
-                self.last_reconnect_attempt = time.time()
-                _send_system_alert("Redis Semaphore Outage", f"Degrading to local/file fallback during wait. Error: {e}")
-                await self.fallback_sem.acquire()
-                try:
-                    await loop.run_in_executor(None, self.fallback_file_lock.acquire)
-                except Exception as fe:
-                    logger.error(f"Fallback file lock acquire failed during wait exception: {fe}")
-                    self.fallback_sem.release()
-                    raise
                 return self
-        
-        # Start background lease extension task
+            
+            await asyncio.sleep(retry_delay)
+            # ponytail: cap retry delay at 0.2s to prevent high contention latency spikes
+            retry_delay = min(retry_delay * 1.5 + random.random() * 0.05, 0.2)
+            
         self.refresher_task = asyncio.create_task(self._refresh_lease_loop(client_id))
         return self
 
@@ -413,38 +323,21 @@ class RedisDistributedSemaphore:
         client_id = self.client_id_var.get()
         if client_id:
             self.client_id_var.set(None)
-            
-            # Cancel and clean up the lease extension task
             if self.refresher_task:
                 self.refresher_task.cancel()
                 try:
                     await self.refresher_task
                 except asyncio.CancelledError:
                     pass
-                self.refresher_task = None
-                
             if self.redis is not None:
                 try:
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, lambda: self.redis.zrem(self.name, client_id))
-                    await loop.run_in_executor(
-                        None,
-                        lambda: (
-                            self.redis.lpush(self.notify_key, "1"),
-                            self.redis.ltrim(self.notify_key, 0, self.limit * 2)
-                        )
-                    )
                 except Exception as e:
-                    logger.error(f"Redis semaphore release failed: {e}")
+                    logger.error(f"Redis release failed: {e}")
             self.local_sem.release()
         else:
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self.fallback_file_lock.release)
-            except Exception as e:
-                logger.error(f"Fallback file lock release failed: {e}")
-            finally:
-                self.fallback_sem.release()
+            self.local_sem.release()
 
 
 

@@ -11,16 +11,11 @@ _EPHEMERAL_KEY = AESGCM.generate_key(bit_length=256)
 def _get_encryption_key() -> bytes:
     key_str = os.getenv("DLQ_ENCRYPTION_KEY")
     if not key_str:
-        if os.getenv("TESTING") == "true" or os.getenv("STORAGE_MODE") == "local":
-            logger.warning(
-                "WARNING: DLQ_ENCRYPTION_KEY is not set. Generating a transient ephemeral key for secure local operations. "
-                "Note: Local DLQ payloads will not be decryptable across process restarts."
-            )
+        if os.getenv("TESTING") == "true":
             return _EPHEMERAL_KEY
         raise RuntimeError(
             "CRITICAL: DLQ_ENCRYPTION_KEY environment variable is not set. "
-            "Refusing to start with default key fallback in a production-like environment. "
-            "Set DLQ_ENCRYPTION_KEY in your environment/secrets."
+            "A persistent encryption key is required for DLQ local storage operations to prevent data loss on process restart."
         )
     try:
         decoded = base64.b64decode(key_str)

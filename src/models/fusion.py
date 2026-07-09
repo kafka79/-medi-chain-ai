@@ -47,9 +47,9 @@ def get_model_num_classes() -> int:
 
 class AttentionFusion(nn.Module):
     """
-    Multimodal fusion utilizing Multi-Head Cross-Modal Attention.
-    Visual query attends to textual key/value, resolving the modality dominance and
-    linear combination flaws, while preserving norm1, norm2, and ffn properties.
+    Multimodal fusion utilizing Gated Multimodal Fusion.
+    For globally pooled vectors, gated fusion is mathematically sound and
+    computationally efficient, avoiding the seq_len=1 multi-head attention placeholder.
     """
     def __init__(self, vision_dim=512, text_dim=768, hidden_dim=512, num_classes=NUM_CLASSES):
         super(AttentionFusion, self).__init__()
@@ -57,9 +57,6 @@ class AttentionFusion(nn.Module):
         # Projection layers to align dimensions
         self.v_proj = nn.Linear(vision_dim, hidden_dim)
         self.t_proj = nn.Linear(text_dim, hidden_dim)
-        
-        # Cross-Attention layer: queries from vision, keys/values from text
-        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=8, batch_first=True)
         
         self.norm1 = nn.LayerNorm(hidden_dim)
         
@@ -86,16 +83,10 @@ class AttentionFusion(nn.Module):
         v = self.v_proj(vision_emb)  # Shape: (batch, hidden_dim)
         t = self.t_proj(text_emb)    # Shape: (batch, hidden_dim)
         
-        # Reshape for MultiheadAttention (seq_len = 1)
-        v_seq = v.unsqueeze(1)  # Shape: (batch, 1, hidden_dim)
-        t_seq = t.unsqueeze(1)  # Shape: (batch, 1, hidden_dim)
-        
-        # Cross-Attention (Query: vision, Key/Value: text)
-        attn_output, _ = self.cross_attn(query=v_seq, key=t_seq, value=t_seq)
-        attn_output = attn_output.squeeze(1)  # Shape: (batch, hidden_dim)
-        
-        # Additive residual connection (using vision query representation) and first layer norm
-        fused = self.norm1(attn_output + v)
+        # ponytail: for globally pooled vectors, cross-modal attention is just a costly linear projection.
+        # Gated fusion is mathematically sound and computationally efficient.
+        gate = torch.sigmoid(v + t)
+        fused = self.norm1(gate * v + (1 - gate) * t)
         
         # Feed-forward refinement and second layer norm (with residual connection)
         fused = self.norm2(fused + self.ffn(fused))

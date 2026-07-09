@@ -102,18 +102,9 @@ class UncertaintyEstimator:
         
         batch_size = vision_emb.shape[0]
         
-        # Extract prediction probabilities across passes for covariance
+        # Extract prediction probabilities across passes for prediction variance
         Y = torch.stack([stacked_probs[t, torch.arange(batch_size), pred] for t in range(num_passes)])  # (num_passes, batch)
-        X = stacked_noises  # (num_passes, batch)
-        
-        mean_Y = Y.mean(dim=0)
-        mean_X = X.mean(dim=0)
-        
         var_Y = Y.var(dim=0, unbiased=True)
-        var_X = X.var(dim=0, unbiased=True)
-        
-        # Sample covariance
-        cov_XY = torch.sum((X - mean_X) * (Y - mean_Y), dim=0) / (num_passes - 1)
         
         fusion_uncertainties = var_Y.sqrt()
         
@@ -138,31 +129,23 @@ class UncertaintyEstimator:
                 cos_sim = (vision_emb @ baseline_mean) / (torch.clamp(norm_ve, min=1e-8) * norm_bm)
                 visual_ood_distance = torch.clamp(1.0 - cos_sim, min=0.0)
 
-        # Flaw #2-structural Fix: Compute visual uncertainty score from TTA std
-        # visual_std is the per-dimension std across TTA augmented images.
+        # Compute visual uncertainty score from TTA std if available
         if visual_std is not None:
             if isinstance(visual_std, list):
                 visual_std_t = torch.tensor(visual_std, dtype=torch.float32, device=vision_emb.device)
             else:
                 visual_std_t = visual_std.to(vision_emb.device)
             visual_uncertainty = visual_std_t.norm(dim=-1) / (visual_std_t.shape[-1] ** 0.5)
-            
-            # Panel Flaw #6 Fix: Law of total variance with covariance.
-            # Var(Y) = Var_fusion + Var_visual + 2 * Cov(fusion, visual)
-            # Factor in manifold distance (visual epistemic uncertainty component)
-            import os
-            beta = float(os.getenv("UNCERTAINTY_OOD_SCALE", "0.5"))
-            manifold_var = (visual_ood_distance * beta) ** 2
-            combined_var = var_Y + var_X + 2.0 * cov_XY + manifold_var
-            combined = torch.sqrt(torch.clamp(combined_var, min=0.0))
         else:
-            # No TTA data available — report as unknown (NaN) rather than zero
             visual_uncertainty = torch.full((batch_size,), float('nan'), device=vision_emb.device)
-            import os
-            beta = float(os.getenv("UNCERTAINTY_OOD_SCALE", "0.5"))
-            manifold_var = (visual_ood_distance * beta) ** 2
-            combined_var = var_Y + manifold_var
-            combined = torch.sqrt(torch.clamp(combined_var, min=0.0))
+            
+        # ponytail: combined uncertainty is the standard deviation of prediction probabilities
+        # combined with the manifold OOD distance variance component.
+        # Dynamically scale by prediction confidence (conf) to calibrate against temperature.
+        import os
+        beta = conf * float(os.getenv("UNCERTAINTY_OOD_SCALE", "0.5"))
+        manifold_var = (visual_ood_distance * beta) ** 2
+        combined = torch.sqrt(var_Y + manifold_var)
         
         return {
             "prediction": pred,

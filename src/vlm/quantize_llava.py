@@ -1,5 +1,5 @@
 import torch
-from transformers import LlamaTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import LlavaForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 import os
 
 class LlavaMedQuantizer:
@@ -23,22 +23,22 @@ class LlavaMedQuantizer:
         )
         
         try:
-            # Note: This is a placeholder as full LLaVA-Med requires the LLaVA library
-            # Here we show the HuggingFace-compatible loading pattern for portfolio
-            model = AutoModelForCausalLM.from_pretrained(
+            # ponytail: load using the correct multimodal classes for Llava models
+            model = LlavaForConditionalGeneration.from_pretrained(
                 self.model_id,
                 quantization_config=bnb_config,
                 torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True
             )
-            return model
+            processor = AutoProcessor.from_pretrained(self.model_id)
+            return model, processor
         except Exception as e:
             print(f"Quantized loading failed: {e}")
             print("Falling back to BiomedCLIP as per plan constraints.")
-            return None
+            return None, None
 
 if __name__ == "__main__":
     # This won't run without GPU and weights, but shows infra capability
     quantizer = LlavaMedQuantizer()
-    # model = quantizer.load_quantized()
+    # model, processor = quantizer.load_quantized()
