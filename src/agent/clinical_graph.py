@@ -26,7 +26,9 @@ _DEFAULT_UNCERTAINTY = 0.15
 _DEFAULT_CALIBRATION = 1.0
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", str(_DEFAULT_CONFIDENCE)))
 UNCERTAINTY_THRESHOLD = float(os.getenv("UNCERTAINTY_THRESHOLD", str(_DEFAULT_UNCERTAINTY)))
-MAX_RETRY_ITERATIONS = int(os.getenv("MAX_RETRY_ITERATIONS", "3"))
+# ponytail: retry loop removed — identical inputs produce identical outputs, so retries were GPU waste.
+# Uncertain cases now escalate immediately.
+MC_DROPOUT_PASSES = int(os.getenv("MC_DROPOUT_PASSES", "50"))
 UNCERTAINTY_CALIBRATION_FACTOR = float(os.getenv("UNCERTAINTY_CALIBRATION_FACTOR", str(_DEFAULT_CALIBRATION)))
 
 # Flaw #8-structural Fix: Warn loudly at import time if thresholds are still uncalibrated defaults
@@ -128,21 +130,15 @@ class ClinicalAgent:
         self.workflow.add_node("self_verify", self.node_self_verify)
         
         # Define Edges
+        # ponytail: linear pipeline, no retry loop. Retry was running identical inference
+        # on unchanged tensors (PubMed citations are not fed into model inputs).
+        # Uncertain cases escalate directly to radiologist.
         self.workflow.set_entry_point("extract_visuals")
         self.workflow.add_edge("extract_visuals", "parse_history")
         self.workflow.add_edge("parse_history", "query_pubmed")
         self.workflow.add_edge("query_pubmed", "synthesize_diagnosis")
         self.workflow.add_edge("synthesize_diagnosis", "self_verify")
-        
-        # Conditional Edge: Self-Verification
-        self.workflow.add_conditional_edges(
-            "self_verify",
-            self.should_continue,
-            {
-                "retry": "query_pubmed",
-                "end": END
-            }
-        )
+        self.workflow.add_edge("self_verify", END)
         
         self.app = self.workflow.compile()
 
@@ -158,49 +154,49 @@ class ClinicalAgent:
             logger.info(f"[Schema Migration] Migrated AgentState from v{current_version} to v2")
         return state_dict
 
+    # ponytail: negation words that negate the clinical concept in a 3-word window
+    _NEGATION_CUES = {"no", "not", "never", "denies", "denied", "without", "absent", "negative", "none", "nor", "ruled"}
+
+    def _is_negated(self, trigger: str, text: str) -> bool:
+        """Check if a trigger term is preceded by a negation word within a 3-word window."""
+        idx = text.find(trigger)
+        if idx < 0:
+            return False
+        # Grab up to 40 chars before the match to get ~3 words of context
+        window_start = max(0, idx - 40)
+        preceding = text[window_start:idx].split()
+        # Check last 3 words before the trigger
+        for word in preceding[-3:]:
+            if word.strip(".,;:'\"") in self._NEGATION_CUES:
+                return True
+        return False
+
     def _extract_biomedical_concepts(self, chief_complaint: str, pmh: str) -> List[str]:
         """
-        Dynamically maps text to biomedical concepts (inspired by UMLS/MeSH thesauri)
-        to build highly generalizable search queries.
+        Negation-aware concept extraction from clinical text.
+        ponytail: added negation window check so 'no asbestos exposure' doesn't map to asbestosis.
         """
         import re
         combined_text = f"{chief_complaint} {pmh}".lower()
         concepts = []
         
-        # 1. Occupational pneumoconiosis/exposure mapping
-        occupational_triggers = {
-            "asbest": "asbestosis",
-            "silic": "silicosis",
-            "coal": "coal workers' pneumoconiosis",
-            "dust": "dust exposure lung disease",
-            "quarry": "silicosis",
-            "mining": "pneumoconiosis",
-            "berylli": "berylliosis",
-            "cotton": "byssinosis",
-            "iron": "siderosis",
-            "sandblast": "silicosis"
-        }
-        for trigger, concept in occupational_triggers.items():
-            if trigger in combined_text:
-                concepts.append(concept)
-                
-        # 2. Infection, inflammation, and chronic pathology mapping
-        pathology_triggers = {
-            "pneumonia": "pneumonia",
-            "tuberculosis": "tuberculosis",
-            "tb": "tuberculosis",
-            "bronchitis": "bronchitis",
-            "sarcoid": "sarcoidosis",
-            "effusion": "pleural effusion",
-            "cancer": "lung malignancy",
-            "tumor": "lung neoplasm",
+        all_triggers = {
+            "asbest": "asbestosis", "silic": "silicosis",
+            "coal": "coal workers' pneumoconiosis", "dust": "dust exposure lung disease",
+            "quarry": "silicosis", "mining": "pneumoconiosis",
+            "berylli": "berylliosis", "cotton": "byssinosis",
+            "iron": "siderosis", "sandblast": "silicosis",
+            "pneumonia": "pneumonia", "tuberculosis": "tuberculosis",
+            "tb": "tuberculosis", "bronchitis": "bronchitis",
+            "sarcoid": "sarcoidosis", "effusion": "pleural effusion",
+            "cancer": "lung malignancy", "tumor": "lung neoplasm",
             "nodule": "pulmonary nodule"
         }
-        for trigger, concept in pathology_triggers.items():
-            if trigger in combined_text:
+        for trigger, concept in all_triggers.items():
+            if trigger in combined_text and not self._is_negated(trigger, combined_text):
                 concepts.append(concept)
                 
-        # 3. Dynamic token filtering for technical candidate terms (concept-like tokens)
+        # Dynamic token filtering for remaining clinical terms
         stop_words = {
             "and", "the", "with", "for", "from", "on", "in", "to", "of", "a", "an", "is", "was",
             "history", "patient", "clinical", "presentation", "years", "old", "male", "female",
@@ -344,7 +340,8 @@ class ClinicalAgent:
                     "visual_features": v,
                     "visual_std": state.get("visual_std"),
                     "text_features": t,
-                    "num_passes": 20
+                    # ponytail: configurable via MC_DROPOUT_PASSES, default 50 for stable variance
+                    "num_passes": MC_DROPOUT_PASSES
                 },
             )
             resp.raise_for_status()
@@ -465,38 +462,21 @@ class ClinicalAgent:
         }
 
     async def node_self_verify(self, state: AgentState):
+        """ponytail: single-pass verify. Uncertain = escalate. No retry loop."""
         state = self._ensure_current_schema(state)
         logger.info(f"[Node] Self-Verifying (Confidence: {state['confidence']:.2f}, Uncertainty: {state['diagnosis']['uncertainty_std']:.4f})...")
-        count = state.get('iteration_count', 0) + 1
         
-        # Flaw #3 Fix: Scale standard deviation with UNCERTAINTY_CALIBRATION_FACTOR before evaluating threshold
         scaled_std = state['diagnosis']['uncertainty_std'] * UNCERTAINTY_CALIBRATION_FACTOR
-        
-        # Flaw #15 Fix: Use configurable thresholds from module-level constants
         is_uncertain = state['confidence'] < CONFIDENCE_THRESHOLD or scaled_std > UNCERTAINTY_THRESHOLD
         
-        # Flaw #5 Fix: Escalate only if OOD, or if uncertain and we have reached the max retry iterations
-        escalate = state.get('escalation_required', False) or (is_uncertain and count >= MAX_RETRY_ITERATIONS)
+        # ponytail: escalate immediately if OOD or uncertain. Retry loop removed because
+        # inputs don't change between iterations — PubMed citations are not fed to the model.
+        escalate = state.get('escalation_required', False) or is_uncertain
         if escalate:
-            logger.warning(f"--- Escalation required (OOD={state.get('escalation_required', False)}, Uncertain={is_uncertain}, iteration={count}). Ending graph. ---")
-            return {"iteration_count": count, "escalation_required": True}
+            logger.warning(f"--- Escalation required (OOD={state.get('escalation_required', False)}, Uncertain={is_uncertain}). ---")
+            return {"escalation_required": True}
             
-        return {"iteration_count": count}
-
-    def should_continue(self, state: AgentState):
-        if state.get('escalation_required', False):
-            return "end"
-        
-        confidence = state.get('confidence', 1.0)
-        diagnosis = state.get('diagnosis', {})
-        uncertainty_std = diagnosis.get('uncertainty_std', 0.0)
-        scaled_std = uncertainty_std * UNCERTAINTY_CALIBRATION_FACTOR
-        
-        is_uncertain = confidence < CONFIDENCE_THRESHOLD or scaled_std > UNCERTAINTY_THRESHOLD
-        
-        if is_uncertain and state.get('iteration_count', 0) < MAX_RETRY_ITERATIONS:
-            return "retry"
-        return "end"
+        return {}
 
     async def run(self, image_path: str, pdf_path: str):
         initial_state = {

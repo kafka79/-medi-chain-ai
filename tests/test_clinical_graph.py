@@ -39,95 +39,39 @@ def _make_agent():
     return agent
 
 
-class TestShouldContinue:
-    """Tests for the should_continue conditional edge logic."""
-    
-    def test_ends_on_high_confidence(self):
-        agent = _make_agent()
-        state = {
-            "confidence": 0.95,
-            "diagnosis": {"uncertainty_std": 0.02},
-            "iteration_count": 1,
-            "escalation_required": False,
-        }
-        assert agent.should_continue(state) == "end"
-    
-    def test_retries_on_low_confidence(self):
-        agent = _make_agent()
-        state = {
-            "confidence": 0.4,
-            "diagnosis": {"uncertainty_std": 0.05},
-            "iteration_count": 1,
-            "escalation_required": False,
-        }
-        assert agent.should_continue(state) == "retry"
-    
-    def test_retries_on_high_uncertainty(self):
-        agent = _make_agent()
-        state = {
-            "confidence": 0.8,
-            "diagnosis": {"uncertainty_std": 0.25},
-            "iteration_count": 1,
-            "escalation_required": False,
-        }
-        assert agent.should_continue(state) == "retry"
-    
-    def test_ends_after_max_retries(self):
-        agent = _make_agent()
-        state = {
-            "confidence": 0.4,
-            "diagnosis": {"uncertainty_std": 0.25},
-            "iteration_count": 3,  # MAX_RETRY_ITERATIONS default
-            "escalation_required": False,
-        }
-        assert agent.should_continue(state) == "end"
-    
-    def test_ends_immediately_on_escalation(self):
-        agent = _make_agent()
-        state = {
-            "confidence": 0.4,
-            "diagnosis": {"uncertainty_std": 0.25},
-            "iteration_count": 1,
-            "escalation_required": True,
-        }
-        assert agent.should_continue(state) == "end"
-
-
 class TestNodeSelfVerify:
-    """Tests for the self_verify node logic."""
-    
-    async def test_increments_iteration_count(self):
-        agent = _make_agent()
-        state = {
-            "confidence": 0.95,
-            "diagnosis": {"uncertainty_std": 0.01},
-            "iteration_count": 0,
-            "escalation_required": False,
-        }
-        result = await agent.node_self_verify(state)
-        assert result["iteration_count"] == 1
-    
-    async def test_triggers_escalation_after_max_retries(self):
-        agent = _make_agent()
-        state = {
-            "confidence": 0.3,
-            "diagnosis": {"uncertainty_std": 0.3},
-            "iteration_count": 2,  # Will become 3 -> max reached
-            "escalation_required": False,
-        }
-        result = await agent.node_self_verify(state)
-        assert result["escalation_required"] is True
+    """Tests for the self_verify node logic (no retry loop — uncertain = escalate)."""
     
     async def test_no_escalation_on_confident_result(self):
         agent = _make_agent()
         state = {
             "confidence": 0.95,
             "diagnosis": {"uncertainty_std": 0.01},
-            "iteration_count": 0,
             "escalation_required": False,
         }
         result = await agent.node_self_verify(state)
         assert result.get("escalation_required") is not True
+    
+    async def test_escalates_immediately_on_low_confidence(self):
+        """ponytail: retry loop removed. Low confidence = immediate escalation."""
+        agent = _make_agent()
+        state = {
+            "confidence": 0.4,
+            "diagnosis": {"uncertainty_std": 0.05},
+            "escalation_required": False,
+        }
+        result = await agent.node_self_verify(state)
+        assert result["escalation_required"] is True
+
+    async def test_escalates_immediately_on_high_uncertainty(self):
+        agent = _make_agent()
+        state = {
+            "confidence": 0.8,
+            "diagnosis": {"uncertainty_std": 0.25},
+            "escalation_required": False,
+        }
+        result = await agent.node_self_verify(state)
+        assert result["escalation_required"] is True
     
     async def test_preserves_ood_escalation(self):
         """If OOD detection already flagged escalation, self_verify should preserve it."""
@@ -135,11 +79,35 @@ class TestNodeSelfVerify:
         state = {
             "confidence": 0.95,
             "diagnosis": {"uncertainty_std": 0.01},
-            "iteration_count": 0,
             "escalation_required": True,  # Already flagged by OOD
         }
         result = await agent.node_self_verify(state)
         assert result["escalation_required"] is True
+
+
+class TestNegationAwareConceptExtraction:
+    """ponytail: tests for negation-aware biomedical concept extraction."""
+
+    def test_positive_mention_extracted(self):
+        agent = _make_agent()
+        concepts = agent._extract_biomedical_concepts("history of silicosis", "")
+        assert "silicosis" in concepts
+
+    def test_negated_mention_excluded(self):
+        agent = _make_agent()
+        concepts = agent._extract_biomedical_concepts("no history of asbestos exposure", "")
+        assert "asbestosis" not in concepts
+
+    def test_denied_mention_excluded(self):
+        agent = _make_agent()
+        concepts = agent._extract_biomedical_concepts("patient denies tuberculosis symptoms", "")
+        assert "tuberculosis" not in concepts
+
+    def test_positive_after_negated_still_works(self):
+        agent = _make_agent()
+        concepts = agent._extract_biomedical_concepts("no asbestos exposure but confirmed silicosis", "")
+        assert "asbestosis" not in concepts
+        assert "silicosis" in concepts
 
 
 class TestNodeSynthesizeDiagnosis:

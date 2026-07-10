@@ -197,7 +197,7 @@ class EstimatePayload(BaseModel):
     visual_features: Any
     visual_std: Optional[List[float]] = None
     text_features: Any
-    num_passes: int = 20
+    num_passes: int = 50  # ponytail: 50 passes for stable MC Dropout variance
 
 INTERNAL_API_KEY_HEADER = APIKeyHeader(name="X-Internal-API-Key", auto_error=False)
 

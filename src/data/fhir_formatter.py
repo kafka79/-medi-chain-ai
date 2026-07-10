@@ -287,25 +287,34 @@ class EHRGateway:
                 
                 # Check free space on local partition
                 total, used, free = shutil.disk_usage(dlq_dir)
-                if free < 50 * 1024 * 1024:  # Critically low if < 50 MB
-                    self.logger.critical("Local disk space is critically low. Aborting emergency local DLQ write to prevent disk exhaustion.")
-                    try:
-                        from deployment.api.main import _send_system_alert
-                        _send_system_alert("Disk Space Exhaustion", "Emergency local DLQ write aborted due to low disk space.")
-                    except Exception as alert_err:
-                        self.logger.error(f"Failed to send system alert: {alert_err}")
-                    raise RuntimeError("Critically low disk space on local partition")
-                
                 local_path = dlq_dir / filename
                 
-                # Encrypt the payload string before persisting to local disk fallback
-                from src.utils.security import encrypt_payload
-                encrypted_payload = encrypt_payload(payload_json)
-                wrapper = {
-                    "encrypted": True,
-                    "data": encrypted_payload
-                }
-                wrapper_json = json.dumps(wrapper, indent=2)
+                if free < 50 * 1024 * 1024:  # Critically low if < 50 MB
+                    # ponytail: never drop a medical report. Write a minimal stub so
+                    # the report's existence is recorded. Full payload was already
+                    # attempted via Redis/S3 upstream.
+                    self.logger.critical("Local disk space critically low. Writing minimal DLQ stub instead of full payload.")
+                    try:
+                        from deployment.api.main import _send_system_alert
+                        _send_system_alert("Disk Space Exhaustion", "DLQ write degraded to stub mode due to low disk space.")
+                    except Exception as alert_err:
+                        self.logger.error(f"Failed to send system alert: {alert_err}")
+                    stub = {
+                        "stub": True,
+                        "timestamp": payload.get("timestamp") if isinstance(payload, dict) else datetime.now(timezone.utc).isoformat(),
+                        "error": str(exception),
+                        "note": "Full payload omitted due to low disk. Check Redis DLQ or S3 backup."
+                    }
+                    wrapper_json = json.dumps(stub)
+                else:
+                    # Encrypt the payload string before persisting to local disk fallback
+                    from src.utils.security import encrypt_payload
+                    encrypted_payload = encrypt_payload(payload_json)
+                    wrapper = {
+                        "encrypted": True,
+                        "data": encrypted_payload
+                    }
+                    wrapper_json = json.dumps(wrapper, indent=2)
                 
                 # Atomic: write to temp file, then rename (rename is atomic on POSIX)
                 fd, tmp_path = tempfile.mkstemp(dir=str(dlq_dir), suffix=".tmp")
