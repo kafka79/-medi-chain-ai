@@ -47,9 +47,10 @@ def get_model_num_classes() -> int:
 
 class AttentionFusion(nn.Module):
     """
-    Multimodal fusion utilizing Gated Multimodal Fusion.
-    For globally pooled vectors, gated fusion is mathematically sound and
-    computationally efficient, avoiding the seq_len=1 multi-head attention placeholder.
+    Multimodal fusion utilizing Gated Multimodal Fusion (not multi-head cross-attention).
+    For globally pooled vectors (sequence length = 1), multi-head cross-attention degenerates
+    into a costly linear projection. Gated fusion is mathematically equivalent in capacity but
+    computationally far more efficient, avoiding the unnecessary multi-head overhead.
     """
     def __init__(self, vision_dim=512, text_dim=768, hidden_dim=512, num_classes=NUM_CLASSES):
         super(AttentionFusion, self).__init__()

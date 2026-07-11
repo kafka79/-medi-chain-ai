@@ -274,15 +274,14 @@ def test_uncertainty_variance_addition():
 
 
 @pytest.mark.asyncio
-async def test_redis_semaphore_blpop_usage():
-    """Verify Redis semaphore uses blpop blocking logic instead of polling sleep."""
+async def test_redis_semaphore_spinlock_usage():
+    """Verify Redis semaphore uses spinlock eval logic and asyncio.sleep instead of blocking blpop."""
     from deployment.api.main import RedisDistributedSemaphore
     import contextvars
     
     mock_redis = MagicMock()
     # Mock eval to return 0 (not acquired) first, then 1 (acquired)
     mock_redis.eval.side_effect = [0, 1]
-    mock_redis.blpop.return_value = ("channel", "1")
     
     sem = RedisDistributedSemaphore(mock_redis, "test_sem", limit=2)
     
@@ -290,16 +289,15 @@ async def test_redis_semaphore_blpop_usage():
     with patch("asyncio.sleep") as mock_sleep:
         await sem.__aenter__()
         
-        # Verify blpop was called exactly once to block-wait
-        mock_redis.blpop.assert_called_once_with(sem.notify_key, timeout=5)
-        # Verify sleep was NOT called (we replaced spinlock sleep with blpop)
-        mock_sleep.assert_not_called()
+        # Verify eval was called to acquire
+        assert mock_redis.eval.call_count == 2
+        # Verify sleep was called for spinlock backoff
+        mock_sleep.assert_called_once()
         
     # Exit the semaphore
     await sem.__aexit__(None, None, None)
-    # Verify we notify blocked waiters via lpush & ltrim
-    mock_redis.lpush.assert_called_once_with(sem.notify_key, "1")
-    mock_redis.ltrim.assert_called_once_with(sem.notify_key, 0, 4)
+    # Verify we release via zrem
+    mock_redis.zrem.assert_called_once()
 
 
 def test_s3_storage_temp_tracking_and_cleanup():
@@ -511,12 +509,12 @@ async def test_redis_semaphore_self_healing_reconnect():
     mock_redis.ping.side_effect = [Exception("Ping timeout"), True]
     mock_redis.eval.return_value = 1  # Optimistic acquisition succeeds once ping succeeds
     
-    # Start with None/offline Redis, but store mock_redis in orig_redis
-    sem = RedisDistributedSemaphore(mock_redis, "test_reconnect", limit=2)
-    sem.redis = None  # Simulate offline/fallback state
-    
     # Set short reconnect cooldown for testing
     with patch.dict("os.environ", {"REDIS_RECONNECT_COOLDOWN": "0.01", "MAX_CONCURRENT_REQUESTS_FALLBACK": "1"}):
+        # Start with None/offline Redis, but store mock_redis in orig_redis
+        sem = RedisDistributedSemaphore(mock_redis, "test_reconnect", limit=2)
+        sem.redis = None  # Simulate offline/fallback state
+        
         # 1. First enter: ping fails, so it stays in fallback mode (acquires fallback_sem)
         await sem.__aenter__()
         assert sem.redis is None
@@ -729,4 +727,44 @@ def test_roi_telemetry_custom_config(monkeypatch):
             # saved_cost = 3.73 * 150 = 559.5 USD
             assert data["saved_time_hours"] == 3.73
             assert data["saved_cost_usd"] == 559.5
+
+
+def test_check_prediction_drift_confidence_based():
+    """Verify that check_prediction_drift computes KS-test on maximum confidence scores."""
+    from src.monitoring.drift_detector import DriftDetector
+    import numpy as np
+    from unittest.mock import patch, MagicMock
+    import pytest
+    
+    with patch.dict("os.environ", {"TESTING": "false"}):
+        with patch("redis.Redis") as mock_redis_class:
+            mock_redis = MagicMock()
+            mock_redis_class.return_value = mock_redis
+            detector = DriftDetector()
+            
+    # Set up baseline probabilities (high confidence in class 0)
+    baseline_probs = np.zeros((100, 5))
+    baseline_probs[:, 0] = 0.9
+    baseline_probs[:, 1] = 0.1
+    detector.baseline = baseline_probs
+    
+    # Test case 1: identical distribution (no drift)
+    current_probs_no_drift = np.zeros((100, 5))
+    current_probs_no_drift[:, 0] = 0.9
+    current_probs_no_drift[:, 1] = 0.1
+    
+    with patch("src.monitoring.drift_detector._send_alert") as mock_alert:
+        result = detector.check_prediction_drift(current_probs_no_drift.tolist())
+        assert result is False
+        mock_alert.assert_not_called()
+        
+    # Test case 2: drifted distribution (lower confidence, e.g., 0.5 class 0)
+    current_probs_drift = np.zeros((100, 5))
+    current_probs_drift[:, 0] = 0.5
+    current_probs_drift[:, 1] = 0.5
+    
+    with patch("src.monitoring.drift_detector._send_alert") as mock_alert:
+        result = detector.check_prediction_drift(current_probs_drift.tolist())
+        assert result is True
+        mock_alert.assert_called_once()
 

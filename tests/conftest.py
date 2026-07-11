@@ -1,4 +1,42 @@
 import os
+import sys
+import typing
+
+# Patch Python 3.12 ForwardRef._evaluate compatibility with older Pydantic v1 / Langgraph
+if sys.version_info >= (3, 12):
+    original_evaluate = typing.ForwardRef._evaluate
+    def patched_evaluate(self, globalns, localns, *args, **kwargs):
+        if 'recursive_guard' in kwargs:
+            if kwargs['recursive_guard'] is None:
+                kwargs['recursive_guard'] = set()
+            return original_evaluate(self, globalns, localns, *args, **kwargs)
+            
+        if len(args) == 1:
+            rec_guard = args[0]
+            kwargs['recursive_guard'] = rec_guard
+            args = ((),)
+            
+        if 'recursive_guard' not in kwargs:
+            kwargs['recursive_guard'] = set()
+            
+        return original_evaluate(self, globalns, localns, *args, **kwargs)
+    typing.ForwardRef._evaluate = patched_evaluate
+
+# Patch httpx Client/AsyncClient init compatibility with older Starlette TestClient
+import httpx
+import inspect
+for client_cls in (httpx.Client, httpx.AsyncClient):
+    original_init = client_cls.__init__
+    def make_patched_init(orig_init):
+        def patched_init(self, *args, **kwargs):
+            if 'app' in kwargs:
+                sig = inspect.signature(orig_init)
+                if 'app' not in sig.parameters:
+                    kwargs.pop('app')
+            return orig_init(self, *args, **kwargs)
+        return patched_init
+    client_cls.__init__ = make_patched_init(original_init)
+
 import asyncio
 import inspect
 import pytest

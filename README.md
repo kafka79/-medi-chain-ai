@@ -8,7 +8,7 @@ Advanced multimodal diagnostic workflow for clinical imaging and history, built 
 - **Clinical Monitoring:** Integrated Kolmogorov-Smirnov drift detection to monitor model performance over time.
 - **Interoperability:** Built-in EHR Gateway supporting FHIR R4 standard for seamless integration with systems like Epic and Cerner.
 - **Cloud-Native Storage:** Abstracted storage layer ready for S3/Object-store migration to support horizontal scaling.
-- **Attention-Driven Fusion:** Upgraded from simple late fusion to cross-modal attention for superior feature alignment.
+- **Gated Multimodal Fusion:** Upgraded from simple late fusion to gated multimodal fusion for mathematically sound and computationally efficient feature alignment.
 
 ## System Components
 
@@ -16,7 +16,7 @@ Advanced multimodal diagnostic workflow for clinical imaging and history, built 
 - `src/monitoring/drift_detector.py`: Automated statistical monitoring of model predictions.
 - `src/utils/storage.py`: Pluggable storage provider for ephemeral and persistent artifacts.
 - `src/data/fhir_formatter.py`: FHIR R4 DiagnosticReport generator with EHR Gateway mediator.
-- `src/models/fusion.py`: Multi-head cross-attention fusion model.
+- `src/models/fusion.py`: Gated multimodal fusion model.
 
 ## Running in Production
 

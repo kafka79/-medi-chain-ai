@@ -343,7 +343,12 @@ class DriftDetector:
 
     def check_prediction_drift(self, current_probs: list):
         """
-        Monitors Prediction Drift / Label Shift P(Y_hat) using Kolmogorov-Smirnov test.
+        Monitors Prediction Drift / Label Shift P(Y_hat) using Kolmogorov-Smirnov test
+        applied to prediction confidence (maximum softmax probabilities).
+        
+        Note: Softmax outputs across classes for a single sample sum to 1 and are highly dependent.
+        Running univariate KS-tests class-by-class violates the independence assumption.
+        Comparing the univariate distributions of maximum prediction confidence scores is statistically valid.
         """
         if self.disabled or not current_probs:
             return False
@@ -366,17 +371,16 @@ class DriftDetector:
 
         drift_detected = False
         
-        # Bonferroni correction: alpha = 0.05 / num_classes to control Family-Wise Error Rate (FWER)
-        num_classes = current.shape[1]
-        significance_level = 0.05 / num_classes
+        # Extract maximum probability (confidence) score for each sample in baseline and current
+        baseline_conf = np.max(self.baseline, axis=1)
+        current_conf = np.max(current, axis=1)
         
-        # Compare distributions using Kolmogorov-Smirnov test per class
-        for i in range(num_classes):
-            stat, p_value = ks_2samp(self.baseline[:, i], current[:, i])
-            if p_value < significance_level:
-                msg = f"Significant Prediction Drift (Label Shift) detected in Class {i} (p={p_value:.4f}, corrected_alpha={significance_level:.4f})"
-                _send_alert("Prediction Drift", msg)
-                drift_detected = True
+        # Compare confidence distributions using Kolmogorov-Smirnov test
+        stat, p_value = ks_2samp(baseline_conf, current_conf)
+        if p_value < 0.05:
+            msg = f"Significant Prediction Drift detected in confidence score distributions (p={p_value:.4f}, threshold=0.05)"
+            _send_alert("Prediction Drift", msg)
+            drift_detected = True
         
         return drift_detected
 

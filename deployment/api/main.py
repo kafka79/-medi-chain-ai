@@ -41,10 +41,22 @@ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_
 from fastapi import Response
 
 # Prometheus metrics
-PROM_CASES_PROCESSED = Counter("medi_chain_cases_processed_total", "Total number of clinical cases processed.")
-PROM_ESCALATIONS = Counter("medi_chain_escalations_total", "Total number of clinical cases escalated.")
-PROM_FEEDBACK = Counter("medi_chain_feedback_total", "Clinician feedback verdicts.", ["verdict"])
-PROM_SIGN_OFF_TIME = Histogram(
+from prometheus_client import REGISTRY
+
+def _get_or_create_counter(name, documentation, labelnames=()):
+    if name in REGISTRY._names_to_collectors:
+        return REGISTRY._names_to_collectors[name]
+    return Counter(name, documentation, labelnames)
+
+def _get_or_create_histogram(name, documentation, buckets):
+    if name in REGISTRY._names_to_collectors:
+        return REGISTRY._names_to_collectors[name]
+    return Histogram(name, documentation, buckets=buckets)
+
+PROM_CASES_PROCESSED = _get_or_create_counter("medi_chain_cases_processed_total", "Total number of clinical cases processed.")
+PROM_ESCALATIONS = _get_or_create_counter("medi_chain_escalations_total", "Total number of clinical cases escalated.")
+PROM_FEEDBACK = _get_or_create_counter("medi_chain_feedback_total", "Clinician feedback verdicts.", ["verdict"])
+PROM_SIGN_OFF_TIME = _get_or_create_histogram(
     "medi_chain_sign_off_time_seconds", 
     "Radiologist sign-off time in seconds.",
     buckets=(10, 30, 45, 60, 120, 180, 300, 600, 1200, 3600)
@@ -105,6 +117,7 @@ def save_heatmap_from_base64(heatmap_base64: str, job_id: str) -> Optional[str]:
         return None
     try:
         import base64
+        import io
         from pathlib import Path
         
         # Decode base64 image
@@ -114,14 +127,20 @@ def save_heatmap_from_base64(heatmap_base64: str, job_id: str) -> Optional[str]:
             data = heatmap_base64
         img_bytes = base64.b64decode(data)
         
-        # Save to outputs/heatmaps/
-        output_dir = Path("outputs/heatmaps")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{job_id}.png"
-        with open(output_path, "wb") as f:
-            f.write(img_bytes)
-        logger.info(f"Saved heatmap PNG to persistent path: {output_path}")
-        return str(output_path)
+        relative_path = f"heatmaps/{job_id}.png"
+        if storage_mode == "s3":
+            storage.save(io.BytesIO(img_bytes), relative_path)
+            logger.info(f"Saved heatmap PNG to S3: {relative_path}")
+            return relative_path
+        else:
+            # Save to outputs/heatmaps/
+            output_dir = Path("outputs/heatmaps")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f"{job_id}.png"
+            with open(output_path, "wb") as f:
+                f.write(img_bytes)
+            logger.info(f"Saved heatmap PNG to persistent path: {output_path}")
+            return str(output_path)
     except Exception as e:
         logger.error(f"Failed to save heatmap PNG for job {job_id}: {e}")
         return None
@@ -245,12 +264,18 @@ class RedisDistributedSemaphore:
     misleading FileLock setups that fail across container replicas.
     """
     def __init__(self, r_client, name: str, limit: int):
+        self.orig_redis = r_client
         self.redis = r_client
         self.name = f"medi_chain:semaphore:{name}:leases"
         self.limit = limit
         self.local_sem = asyncio.Semaphore(limit)
+        
+        fallback_limit = int(os.getenv("MAX_CONCURRENT_REQUESTS_FALLBACK", str(limit)))
+        self.fallback_sem = asyncio.Semaphore(fallback_limit)
+        
         self.client_id_var = contextvars.ContextVar(f"sem_client_id_{name}", default=None)
         self.refresher_task = None
+        self.last_reconnect_attempt = 0
 
     async def _refresh_lease_loop(self, client_id: str):
         lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "10"))
@@ -270,8 +295,22 @@ class RedisDistributedSemaphore:
             logger.warning(f"Failed to refresh lease: {e}")
 
     async def __aenter__(self):
+        # Self-healing check: if redis is offline but original client exists, try to reconnect
+        if self.redis is None and self.orig_redis is not None:
+            now = time.time()
+            cooldown = float(os.getenv("REDIS_RECONNECT_COOLDOWN", "30.0"))
+            if now - self.last_reconnect_attempt > cooldown:
+                self.last_reconnect_attempt = now
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self.orig_redis.ping)
+                    self.redis = self.orig_redis
+                    logger.info("Redis connection self-healed, returning to distributed semaphore.")
+                except Exception as reconnect_err:
+                    logger.warning(f"Redis self-healing reconnect attempt failed: {reconnect_err}")
+
         if self.redis is None:
-            await self.local_sem.acquire()
+            await self.fallback_sem.acquire()
             return self
 
         await self.local_sem.acquire()
@@ -310,6 +349,13 @@ class RedisDistributedSemaphore:
             except Exception as e:
                 logger.error(f"Redis semaphore failed, degrading to local local_sem fallback: {e}")
                 self.redis = None
+                self.client_id_var.set(None)
+                _send_system_alert(
+                    "Redis Semaphore Connection Outage",
+                    f"Degrading to local fallback semaphore: {e}"
+                )
+                await self.fallback_sem.acquire()
+                self.local_sem.release()
                 return self
             
             await asyncio.sleep(retry_delay)
@@ -337,8 +383,7 @@ class RedisDistributedSemaphore:
                     logger.error(f"Redis release failed: {e}")
             self.local_sem.release()
         else:
-            self.local_sem.release()
-
+            self.fallback_sem.release()
 
 
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
@@ -1083,21 +1128,61 @@ def create_app() -> FastAPI:
     ):
         from fastapi.responses import FileResponse
         from pathlib import Path
+        import io
         
-        png_path = Path("outputs/heatmaps") / f"{job_id}.png"
-        if not png_path.exists():
-            raise HTTPException(status_code=404, detail="Heatmap not found for this job ID.")
+        relative_png_path = f"heatmaps/{job_id}.png"
+        relative_dcm_path = f"heatmaps/{job_id}.dcm"
+        
+        if storage_mode == "s3":
+            try:
+                await asyncio.to_thread(storage.client.stat_object, storage.bucket, relative_png_path)
+            except Exception:
+                raise HTTPException(status_code=404, detail="Heatmap not found for this job ID.")
+            
+            png_path_str = await asyncio.to_thread(storage.load, relative_png_path)
+            png_path = Path(png_path_str)
+        else:
+            png_path = Path("outputs/heatmaps") / f"{job_id}.png"
+            if not png_path.exists():
+                raise HTTPException(status_code=404, detail="Heatmap not found for this job ID.")
             
         if format.lower() == "dicom":
-            dcm_path = Path("outputs/heatmaps") / f"{job_id}.dcm"
-            if not dcm_path.exists():
+            if storage_mode == "s3":
+                exists_dcm = False
                 try:
-                    from src.data.dicom_handler import create_secondary_capture
-                    await asyncio.to_thread(create_secondary_capture, None, str(png_path), str(dcm_path))
-                except Exception as e:
-                    logger.error(f"Failed to generate Secondary Capture DICOM: {e}")
-                    raise HTTPException(status_code=500, detail=f"Failed to generate DICOM: {e}")
-                    
+                    await asyncio.to_thread(storage.client.stat_object, storage.bucket, relative_dcm_path)
+                    exists_dcm = True
+                except Exception:
+                    pass
+                
+                if exists_dcm:
+                    dcm_path_str = await asyncio.to_thread(storage.load, relative_dcm_path)
+                    dcm_path = Path(dcm_path_str)
+                else:
+                    import tempfile
+                    fd, temp_dcm_name = tempfile.mkstemp(suffix=".dcm")
+                    os.close(fd)
+                    try:
+                        from src.data.dicom_handler import create_secondary_capture
+                        await asyncio.to_thread(create_secondary_capture, None, str(png_path), temp_dcm_name)
+                        with open(temp_dcm_name, "rb") as f:
+                            await asyncio.to_thread(storage.save, f, relative_dcm_path)
+                        dcm_path = Path(temp_dcm_name)
+                    except Exception as e:
+                        if os.path.exists(temp_dcm_name):
+                            os.unlink(temp_dcm_name)
+                        logger.error(f"Failed to generate Secondary Capture DICOM: {e}")
+                        raise HTTPException(status_code=500, detail=f"Failed to generate DICOM: {e}")
+            else:
+                dcm_path = Path("outputs/heatmaps") / f"{job_id}.dcm"
+                if not dcm_path.exists():
+                    try:
+                        from src.data.dicom_handler import create_secondary_capture
+                        await asyncio.to_thread(create_secondary_capture, None, str(png_path), str(dcm_path))
+                    except Exception as e:
+                        logger.error(f"Failed to generate Secondary Capture DICOM: {e}")
+                        raise HTTPException(status_code=500, detail=f"Failed to generate DICOM: {e}")
+                        
             return FileResponse(
                 path=str(dcm_path),
                 media_type="application/dicom",

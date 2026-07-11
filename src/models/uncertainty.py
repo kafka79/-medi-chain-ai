@@ -7,16 +7,19 @@ class UncertaintyEstimator:
 
     def estimate_uncertainty(self, vision_emb, text_emb, num_passes=20, visual_std=None):
         """
-        Run MC Dropout to estimate prediction mean and standard deviation.
+        Run MC Dropout combined with Test-Time Augmentation (TTA) input perturbation
+        to estimate prediction mean and variance.
         Keeps model in .eval() to avoid BatchNorm errors with batch size 1,
         but explicitly enables Dropout layers.
         
-        Flaw #2-structural Fix (MC Dropout Illusion):
-        We now compute and return THREE separate uncertainty metrics:
-        1. fusion_head_variance — epistemic uncertainty from the classification head only.
+        Note (Intellectual Honesty):
+        We compute and return three separate uncertainty metrics:
+        1. fusion_head_variance — epistemic uncertainty from the classification head only (via MC Dropout).
         2. visual_uncertainty_score — input-space uncertainty from TTA visual_std.
-        3. combined_uncertainty — computed via the Law of Total Variance factoring in covariance
-           between the visual input noise and classification output variation.
+        3. combined_uncertainty — computed using a heuristic combination of the epistemic classification
+           variance (var_Y) and a manifold-space out-of-distribution (OOD) distance metric (visual_ood_distance).
+           This is a practical engineering heuristic combining input out-of-distribution distance with head variance,
+           rather than a strict, closed-form implementation of the Law of Total Variance.
         """
         self.model.eval()
         
@@ -139,8 +142,9 @@ class UncertaintyEstimator:
         else:
             visual_uncertainty = torch.full((batch_size,), float('nan'), device=vision_emb.device)
             
-        # ponytail: combined uncertainty is the standard deviation of prediction probabilities
-        # combined with the manifold OOD distance variance component.
+        # Note: This is an empirical heuristic combining classification variance (from head dropout)
+        # and manifold OOD distance (from input cosine similarity). It is not a closed-form derivation
+        # of the Law of Total Variance but serves as a practical uncertainty score for out-of-distribution inputs.
         # Dynamically scale by prediction confidence (conf) to calibrate against temperature.
         import os
         beta = conf * float(os.getenv("UNCERTAINTY_OOD_SCALE", "0.5"))

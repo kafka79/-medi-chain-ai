@@ -177,9 +177,14 @@ class VisualExplainer:
             cam_original = cv2.resize(cam_original, (W, H), interpolation=cv2.INTER_CUBIC)
             
         # Apply edge-preserving bilateral filtering to avoid blurry visual artifacts
-        cam_u8 = (cam_original * 255.0).astype(np.uint8)
-        cam_filtered = cv2.bilateralFilter(cam_u8, d=9, sigmaColor=75, sigmaSpace=75)
-        cam_original = cam_filtered.astype(np.float32) / 255.0
+        # Note (Clinical Safety): We use conservative parameters (d=5, sigmaColor=30, sigmaSpace=30) by default
+        # to ensure that tiny high-contrast clinical features (like nodules or calcifications) are not smoothed away.
+        # It can also be disabled completely by setting EXPLAINABILITY_SMOOTHING=false.
+        use_filter = os.getenv("EXPLAINABILITY_SMOOTHING", "true").lower() == "true"
+        if use_filter:
+            cam_u8 = (cam_original * 255.0).astype(np.uint8)
+            cam_filtered = cv2.bilateralFilter(cam_u8, d=5, sigmaColor=30, sigmaSpace=30)
+            cam_original = cam_filtered.astype(np.float32) / 255.0
 
         visualization = show_cam_on_image(rgb_img, cam_original, use_rgb=True)
         

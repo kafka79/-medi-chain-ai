@@ -210,7 +210,8 @@ class ClinicalAgent:
             if len(concepts) >= 6:
                 break
             if not any(term in c or c in term for c in concepts):
-                concepts.append(term)
+                if not self._is_negated(term, combined_text):
+                    concepts.append(term)
                 
         return list(set(concepts))
 
