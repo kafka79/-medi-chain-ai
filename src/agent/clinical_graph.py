@@ -419,13 +419,46 @@ class ClinicalAgent:
         except Exception as e:
             logger.error(f"Error running distance-based OOD detector: {e}")
 
-        # Flaw #6 Fix: OOD detection — reject predictions where max softmax is below threshold or visual distance check fails
-        ood_flag = (max_softmax < OOD_CONFIDENCE_THRESHOLD) or visual_ood_detected
+        # Distance-based text OOD detection to close the text-branch OOD blindspot
+        text_ood_detected = False
+        try:
+            text_baseline_path = Path("temp/drift/text_baseline_cache.json")
+            if text_baseline_path.exists():
+                with open(text_baseline_path, "r") as f:
+                    text_baseline_features = json.load(f)
+                
+                if text_baseline_features and len(text_baseline_features) > 0:
+                    text_baseline_arr = np.array(text_baseline_features)  # (N, 768)
+                    current_text_arr = np.array(t)                        # (1, 768)
+                    
+                    mean_baseline_text = np.mean(text_baseline_arr, axis=0)
+                    mean_current_text = np.mean(current_text_arr, axis=0)
+                    
+                    norm_b_text = np.linalg.norm(mean_baseline_text)
+                    norm_c_text = np.linalg.norm(mean_current_text)
+                    
+                    if norm_b_text > 0 and norm_c_text > 0:
+                        cos_sim_t = np.dot(mean_baseline_text, mean_current_text) / (norm_b_text * norm_c_text)
+                        
+                        # Dynamic or static threshold for text OOD check
+                        cos_sim_threshold_t = float(os.getenv("OOD_TEXT_COSINE_THRESHOLD", "0.82"))
+                        if cos_sim_t < cos_sim_threshold_t:
+                            text_ood_detected = True
+                            logger.warning(
+                                f"[OOD Detection] Distance-based text OOD check failed: "
+                                f"cosine similarity = {cos_sim_t:.4f} < threshold {cos_sim_threshold_t}."
+                            )
+        except Exception as e:
+            logger.error(f"Error running distance-based text OOD detector: {e}")
+
+        # OOD detection — reject predictions where max softmax is below threshold or visual/text distance check fails
+        ood_flag = (max_softmax < OOD_CONFIDENCE_THRESHOLD) or visual_ood_detected or text_ood_detected
         if ood_flag:
             logger.warning(
                 f"[OOD Detection] OOD check triggered. "
                 f"max(softmax) = {max_softmax:.4f} (threshold {OOD_CONFIDENCE_THRESHOLD}), "
-                f"visual_ood_detected = {visual_ood_detected}. Flagging for escalation."
+                f"visual_ood_detected = {visual_ood_detected}, "
+                f"text_ood_detected = {text_ood_detected}. Flagging for escalation."
             )
             top_finding = "Out-of-Distribution"
             # Overwrite uncertainty to a high value to reflect OOD
@@ -460,6 +493,8 @@ class ClinicalAgent:
             "confidence": mean_confidence,
             # Flaw #6: If OOD detected, force escalation
             "escalation_required": ood_flag,
+            "visual_features": v,
+            "text_features": t[0] if isinstance(t, list) else t.tolist(),
         }
 
     async def node_self_verify(self, state: AgentState):

@@ -1,5 +1,5 @@
 import pydicom
-from typing import Optional
+from typing import Optional, Any
 import numpy as np
 from PIL import Image
 import os
@@ -51,7 +51,7 @@ class DICOMProcessor:
         return save_path
 
 
-def create_secondary_capture(original_dcm_path: Optional[str], heatmap_png_path: str, output_dcm_path: str) -> str:
+def create_secondary_capture(original_dcm_metadata_or_path: Optional[Any], heatmap_png_path: str, output_dcm_path: str) -> str:
     """
     Generate a DICOM Secondary Capture image dataset using metadata from the original uploaded scan.
     Converts visual PNG overlay output into an standard-compliant DICOM dataset.
@@ -67,11 +67,23 @@ def create_secondary_capture(original_dcm_path: Optional[str], heatmap_png_path:
     img = Image.open(heatmap_png_path).convert("RGB")
     pixel_data = np.array(img)
 
-    # Attempt to load metadata from original scan
-    ds = None
-    if original_dcm_path and os.path.exists(original_dcm_path):
+    # Attempt to extract metadata
+    metadata = {}
+    if isinstance(original_dcm_metadata_or_path, dict):
+        metadata = original_dcm_metadata_or_path
+    elif original_dcm_metadata_or_path and isinstance(original_dcm_metadata_or_path, str) and os.path.exists(original_dcm_metadata_or_path):
         try:
-            ds = pydicom.dcmread(original_dcm_path)
+            ds = pydicom.dcmread(original_dcm_metadata_or_path)
+            metadata = {
+                "PatientName": str(getattr(ds, "PatientName", "REDACTED_PATIENTNAME")),
+                "PatientID": str(getattr(ds, "PatientID", "REDACTED_PATIENTID")),
+                "PatientBirthDate": str(getattr(ds, "PatientBirthDate", "")),
+                "PatientSex": str(getattr(ds, "PatientSex", "")),
+                "StudyInstanceUID": str(getattr(ds, "StudyInstanceUID", "")),
+                "SeriesInstanceUID": str(getattr(ds, "SeriesInstanceUID", "")),
+                "StudyID": str(getattr(ds, "StudyID", "")),
+                "AccessionNumber": str(getattr(ds, "AccessionNumber", ""))
+            }
         except Exception:
             pass
 
@@ -89,21 +101,15 @@ def create_secondary_capture(original_dcm_path: Optional[str], heatmap_png_path:
     new_ds.is_little_endian = True
     new_ds.is_implicit_VR = False
 
-    # Extract/populate identity headers
-    if ds:
-        new_ds.PatientName = getattr(ds, "PatientName", "REDACTED_PATIENTNAME")
-        new_ds.PatientID = getattr(ds, "PatientID", "REDACTED_PATIENTID")
-        new_ds.PatientBirthDate = getattr(ds, "PatientBirthDate", "")
-        new_ds.PatientSex = getattr(ds, "PatientSex", "")
-        new_ds.StudyInstanceUID = getattr(ds, "StudyInstanceUID", generate_uid())
-        new_ds.SeriesInstanceUID = getattr(ds, "SeriesInstanceUID", generate_uid())
-        new_ds.StudyID = getattr(ds, "StudyID", "")
-        new_ds.AccessionNumber = getattr(ds, "AccessionNumber", "")
-    else:
-        new_ds.PatientName = "REDACTED_PATIENTNAME"
-        new_ds.PatientID = "REDACTED_PATIENTID"
-        new_ds.StudyInstanceUID = generate_uid()
-        new_ds.SeriesInstanceUID = generate_uid()
+    # Populate identity headers from metadata (with secure/consistent defaults if absent)
+    new_ds.PatientName = metadata.get("PatientName", "REDACTED_PATIENTNAME")
+    new_ds.PatientID = metadata.get("PatientID", "REDACTED_PATIENTID")
+    new_ds.PatientBirthDate = metadata.get("PatientBirthDate", "")
+    new_ds.PatientSex = metadata.get("PatientSex", "")
+    new_ds.StudyInstanceUID = metadata.get("StudyInstanceUID") or generate_uid()
+    new_ds.SeriesInstanceUID = metadata.get("SeriesInstanceUID") or generate_uid()
+    new_ds.StudyID = metadata.get("StudyID", "")
+    new_ds.AccessionNumber = metadata.get("AccessionNumber", "")
 
     new_ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.7'
     new_ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID

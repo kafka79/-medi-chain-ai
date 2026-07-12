@@ -275,29 +275,50 @@ def test_uncertainty_variance_addition():
 
 @pytest.mark.asyncio
 async def test_redis_semaphore_spinlock_usage():
-    """Verify Redis semaphore uses spinlock eval logic and asyncio.sleep instead of blocking blpop."""
-    from deployment.api.main import RedisDistributedSemaphore
-    import contextvars
+    """Verify Redis semaphore uses Pub/Sub wait and event notifications instead of spin-sleep polling."""
+    from deployment.api.main import RedisDistributedSemaphore, SEMAPHORE_WAITERS, SEMAPHORE_LISTENER_TASKS
+    import unittest
     
     mock_redis = MagicMock()
     # Mock eval to return 0 (not acquired) first, then 1 (acquired)
     mock_redis.eval.side_effect = [0, 1]
     
+    # Mock pipeline for release
+    mock_pipeline = MagicMock()
+    mock_redis.pipeline.return_value = mock_pipeline
+    mock_pipeline.zrem.return_value = mock_pipeline
+    mock_pipeline.publish.return_value = mock_pipeline
+    
     sem = RedisDistributedSemaphore(mock_redis, "test_sem", limit=2)
     
-    # Enter the semaphore
-    with patch("asyncio.sleep") as mock_sleep:
-        await sem.__aenter__()
-        
+    # Mock the background listener task creation
+    with patch("deployment.api.main._start_semaphore_listener") as mock_listener_func:
+        # To simulate the event being set (e.g. by pubsub message) and prevent waiting the full 2.0s
+        async def mock_wait_for(fut, timeout):
+            # Find the event in SEMAPHORE_WAITERS and set it immediately
+            waiters = SEMAPHORE_WAITERS.get(sem.name, [])
+            for event in waiters:
+                event.set()
+            return True
+            
+        with patch("asyncio.wait_for", side_effect=mock_wait_for):
+            await sem.__aenter__()
+            
         # Verify eval was called to acquire
         assert mock_redis.eval.call_count == 2
-        # Verify sleep was called for spinlock backoff
-        mock_sleep.assert_called_once()
         
     # Exit the semaphore
     await sem.__aexit__(None, None, None)
-    # Verify we release via zrem
-    mock_redis.zrem.assert_called_once()
+    
+    # Verify pipeline was used to release and publish
+    mock_pipeline.zrem.assert_called_once_with(sem.name, unittest.mock.ANY)
+    mock_pipeline.publish.assert_called_once_with(f"{sem.name}:released", "released")
+    mock_pipeline.execute.assert_called_once()
+    
+    # Clean up any listener task
+    task = SEMAPHORE_LISTENER_TASKS.get(sem.name)
+    if task:
+        task.cancel()
 
 
 def test_s3_storage_temp_tracking_and_cleanup():

@@ -59,6 +59,10 @@ class AttentionFusion(nn.Module):
         self.v_proj = nn.Linear(vision_dim, hidden_dim)
         self.t_proj = nn.Linear(text_dim, hidden_dim)
         
+        # Distinct linear layers for gating decisions to maximize representational capacity
+        self.v_gate = nn.Linear(vision_dim, hidden_dim)
+        self.t_gate = nn.Linear(text_dim, hidden_dim)
+        
         self.norm1 = nn.LayerNorm(hidden_dim)
         
         # Standard Transformer Feed-Forward Network (FFN)
@@ -84,9 +88,8 @@ class AttentionFusion(nn.Module):
         v = self.v_proj(vision_emb)  # Shape: (batch, hidden_dim)
         t = self.t_proj(text_emb)    # Shape: (batch, hidden_dim)
         
-        # ponytail: for globally pooled vectors, cross-modal attention is just a costly linear projection.
-        # Gated fusion is mathematically sound and computationally efficient.
-        gate = torch.sigmoid(v + t)
+        # Compute the gate using independent linear projections to ensure representational capacity
+        gate = torch.sigmoid(self.v_gate(vision_emb) + self.t_gate(text_emb))
         fused = self.norm1(gate * v + (1 - gate) * t)
         
         # Feed-forward refinement and second layer norm (with residual connection)

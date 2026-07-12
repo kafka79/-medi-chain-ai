@@ -16,7 +16,7 @@ import re
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, BackgroundTasks, Security, Depends
 from fastapi.responses import JSONResponse
-from fastapi.security import APIKeyHeader
+from fastapi.security import APIKeyHeader, SecurityScopes
 import secrets
 from filelock import FileLock
 import uvicorn
@@ -256,6 +256,48 @@ ehr_gateway = EHRGateway()
 feedback_logger = FeedbackLogger(redis_client=redis_client, storage_provider=storage)
 gateway_scrubber = PrivacyScrubber()
 gateway_pdf_parser = ClinicalPDFParser()
+SEMAPHORE_WAITERS = {}
+SEMAPHORE_LISTENER_TASKS = {}
+
+async def _start_semaphore_listener(r_client, semaphore_name: str):
+    """Background task to listen for semaphore release events in Redis and notify local waiters."""
+    pubsub_name = f"{semaphore_name}:released"
+    try:
+        pubsub = r_client.pubsub()
+        pubsub.subscribe(pubsub_name)
+        
+        loop = asyncio.get_running_loop()
+        while True:
+            # Read message from pubsub using run_in_executor to avoid blocking the event loop
+            message = await loop.run_in_executor(
+                None,
+                lambda: pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            )
+            if message:
+                waiters = SEMAPHORE_WAITERS.get(semaphore_name, [])
+                SEMAPHORE_WAITERS[semaphore_name] = []
+                for event in waiters:
+                    if not event.is_set():
+                        event.set()
+            await asyncio.sleep(0.1)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"Error in semaphore listener for {semaphore_name}: {e}")
+        # Wake up all waiters immediately to fail-fast during Redis connection drop
+        waiters = SEMAPHORE_WAITERS.get(semaphore_name, [])
+        SEMAPHORE_WAITERS[semaphore_name] = []
+        for event in waiters:
+            if not event.is_set():
+                event.set()
+    finally:
+        try:
+            pubsub.unsubscribe(pubsub_name)
+            pubsub.close()
+        except Exception:
+            pass
+        SEMAPHORE_LISTENER_TASKS.pop(semaphore_name, None)
+
 class RedisDistributedSemaphore:
     """Distributed semaphore backed by Redis sorted-set leases.
     
@@ -320,6 +362,11 @@ class RedisDistributedSemaphore:
         lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "10"))
         loop = asyncio.get_running_loop()
         
+        # Start global pub/sub listener task for this semaphore if not already running
+        if self.name not in SEMAPHORE_LISTENER_TASKS:
+            task = asyncio.create_task(_start_semaphore_listener(self.redis, self.name))
+            SEMAPHORE_LISTENER_TASKS[self.name] = task
+            
         acquire_script = """
         local leases_key = KEYS[1]
         local limit = tonumber(ARGV[1])
@@ -335,8 +382,6 @@ class RedisDistributedSemaphore:
         return 0
         """
         
-        import random
-        retry_delay = 0.05
         while True:
             try:
                 now = time.time()
@@ -358,9 +403,17 @@ class RedisDistributedSemaphore:
                 self.local_sem.release()
                 return self
             
-            await asyncio.sleep(retry_delay)
-            # ponytail: cap retry delay at 0.2s to prevent high contention latency spikes
-            retry_delay = min(retry_delay * 1.5 + random.random() * 0.05, 0.2)
+            # Register local waiter event and wait to be notified by Pub/Sub event
+            event = asyncio.Event()
+            if self.name not in SEMAPHORE_WAITERS:
+                SEMAPHORE_WAITERS[self.name] = []
+            SEMAPHORE_WAITERS[self.name].append(event)
+            
+            try:
+                # Suspend waiter with a 2.0s safety timeout to catch any missed/dropped events
+                await asyncio.wait_for(event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
             
         self.refresher_task = asyncio.create_task(self._refresh_lease_loop(client_id))
         return self
@@ -378,7 +431,14 @@ class RedisDistributedSemaphore:
             if self.redis is not None:
                 try:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, lambda: self.redis.zrem(self.name, client_id))
+                    # Release lock and publish release event atomically
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self.redis.pipeline()
+                        .zrem(self.name, client_id)
+                        .publish(f"{self.name}:released", "released")
+                        .execute()
+                    )
                 except Exception as e:
                     logger.error(f"Redis release failed: {e}")
             self.local_sem.release()
@@ -401,7 +461,8 @@ MODEL_CHECKPOINT = os.getenv("MODEL_CHECKPOINT", "models/fusion_model.pt")
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
+async def verify_api_key(security_scopes: SecurityScopes, api_key: str = Security(API_KEY_HEADER)):
+    import hashlib
     # Flaw #2 Fix: No hardcoded default. If env var is missing in dev/test, use a test-only key.
     expected_key = os.getenv("API_KEY")
     if not expected_key:
@@ -409,8 +470,38 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
             expected_key = "test-key-for-ci"
         else:
             raise HTTPException(status_code=500, detail="Server misconfiguration: API_KEY not set.")
-    if not api_key or not secrets.compare_digest(api_key, expected_key):
+
+    key_scopes_map = {}
+    if expected_key:
+        # Hashed expected key to avoid memory plaintext comparisons
+        h_expected = hashlib.sha256(expected_key.encode("utf-8")).hexdigest()
+        key_scopes_map[h_expected] = ["cases:write", "cases:read", "metrics:read", "feedback:write", "feedback:read"]
+
+    # Load dynamic hashed keys config if present
+    config_json = os.getenv("API_KEYS_CONFIG")
+    if config_json:
+        try:
+            config = json.loads(config_json)
+            for k_hash, scopes in config.get("keys", {}).items():
+                key_scopes_map[k_hash] = scopes
+        except Exception as e:
+            logger.error(f"Failed to parse API_KEYS_CONFIG: {e}")
+
+    if not api_key:
+        raise HTTPException(status_code=401, detail="X-API-Key header is missing")
+
+    # Hash incoming key
+    h_incoming = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    if h_incoming not in key_scopes_map:
         raise HTTPException(status_code=403, detail="Invalid API Key")
+
+    allowed_scopes = key_scopes_map[h_incoming]
+    for scope in security_scopes.scopes:
+        if scope not in allowed_scopes:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not enough permissions. Required scope: {scope}"
+            )
     return api_key
 
 def build_agent() -> ClinicalAgent:
@@ -807,7 +898,20 @@ async def _update_job_status(job_id: str, status: str, result: dict = None, erro
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     if result is not None:
-        data["result"] = result
+        # Deep copy to avoid mutating the original payload returned over HTTP sync channel
+        result_copy = json.loads(json.dumps(result))
+        if "dicom_metadata" in result_copy and result_copy["dicom_metadata"] is not None:
+            try:
+                from src.utils.security import encrypt_payload
+                plain_str = json.dumps(result_copy["dicom_metadata"])
+                encrypted_str = encrypt_payload(plain_str)
+                result_copy["dicom_metadata"] = {
+                    "encrypted": True,
+                    "data": encrypted_str
+                }
+            except Exception as encrypt_err:
+                logger.error(f"Failed to encrypt DICOM metadata for storage: {encrypt_err}")
+        data["result"] = result_copy
     if error is not None:
         data["error"] = error
         
@@ -826,7 +930,8 @@ async def process_analyze_job(
     local_img_path: str,
     local_pdf_path: str,
     request_temp_dir: str,
-    agent: ClinicalAgent
+    agent: ClinicalAgent,
+    dicom_metadata: Optional[dict] = None
 ):
     await _update_job_status(job_id, "running")
     try:
@@ -864,6 +969,7 @@ async def process_analyze_job(
             "escalation_required": escalation,
             "iteration_count": result.get("iteration_count", 0),
             "model_metadata": get_model_metadata(),
+            "dicom_metadata": dicom_metadata,
         }
         await _update_job_status(job_id, "completed", result=response_payload)
     except Exception as exc:
@@ -883,6 +989,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         description="Enterprise-ready multimodal diagnostic API."
     )
+    app.state.started_at = time.time()
     
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -928,7 +1035,7 @@ def create_app() -> FastAPI:
         image: UploadFile = File(...),
         history: UploadFile = File(...),
         sync: bool = False,
-        api_key: str = Depends(verify_api_key)
+        api_key: str = Security(verify_api_key, scopes=["cases:write"])
     ):
         if image.content_type not in ["image/jpeg", "image/png", "application/dicom"]:
             raise HTTPException(415, "Unsupported image type. Use JPEG, PNG, or DICOM.")
@@ -970,6 +1077,25 @@ def create_app() -> FastAPI:
                 # 2. Save uploaded PDF to raw temp file
                 with open(raw_pdf_temp_name, "wb") as f:
                     shutil.copyfileobj(history.file, f)
+
+                # Extract DICOM metadata before raw image scrubbing
+                dicom_metadata = None
+                if image.content_type == "application/dicom" or raw_img_temp_name.lower().endswith(('.dcm', '.dicom')):
+                    try:
+                        import pydicom
+                        ds = pydicom.dcmread(raw_img_temp_name, stop_before_pixels=True)
+                        dicom_metadata = {
+                            "PatientName": str(getattr(ds, "PatientName", "REDACTED_PATIENTNAME")),
+                            "PatientID": str(getattr(ds, "PatientID", "REDACTED_PATIENTID")),
+                            "PatientBirthDate": str(getattr(ds, "PatientBirthDate", "")),
+                            "PatientSex": str(getattr(ds, "PatientSex", "")),
+                            "StudyInstanceUID": str(getattr(ds, "StudyInstanceUID", "")),
+                            "SeriesInstanceUID": str(getattr(ds, "SeriesInstanceUID", "")),
+                            "StudyID": str(getattr(ds, "StudyID", "")),
+                            "AccessionNumber": str(getattr(ds, "AccessionNumber", ""))
+                        }
+                    except Exception as e:
+                        logger.error(f"Failed to extract DICOM metadata at gateway: {e}")
 
                 # 3. De-identify the image at the gateway level
                 sanitized_img_path = await asyncio.to_thread(gateway_scrubber.mask_burned_in_text, raw_img_temp_name)
@@ -1064,7 +1190,11 @@ def create_app() -> FastAPI:
                     "escalation_required": escalation,
                     "iteration_count": result.get("iteration_count", 0),
                     "model_metadata": get_model_metadata(),
+                    "dicom_metadata": dicom_metadata,
                 }
+                
+                # Persist sync payload in jobs database to allow heatmap endpoints to retrieve metadata
+                await _update_job_status(request_id, "completed", result=response_payload)
 
                 if escalation:
                     logger.warning(f"[{request_id}] Escalation triggered — insufficient evidence for automated diagnosis.")
@@ -1081,7 +1211,8 @@ def create_app() -> FastAPI:
                     local_img_path,
                     local_pdf_path,
                     request_temp_dir,
-                    agent
+                    agent,
+                    dicom_metadata
                 )
                 
                 status_payload = {
@@ -1124,7 +1255,7 @@ def create_app() -> FastAPI:
         job_id: str,
         request: Request,
         format: str = "png",
-        api_key: str = Depends(verify_api_key)
+        api_key: str = Security(verify_api_key, scopes=["cases:read"])
     ):
         from fastapi.responses import FileResponse
         from pathlib import Path
@@ -1147,6 +1278,32 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="Heatmap not found for this job ID.")
             
         if format.lower() == "dicom":
+            # Retrieve stored patient metadata from the jobs database to prevent PACS integration identity loss
+            job_data = None
+            if use_redis and redis_client:
+                try:
+                    raw = await asyncio.to_thread(redis_client.get, f"medi_chain:jobs:{job_id}")
+                    if raw:
+                        job_data = json.loads(raw)
+                except Exception as e:
+                    logger.error(f"Failed to read job {job_id} from Redis: {e}")
+            if job_data is None:
+                async with _jobs_db_lock:
+                    job_data = _jobs_db.get(job_id)
+            
+            dicom_metadata = None
+            if job_data and "result" in job_data:
+                raw_meta = job_data["result"].get("dicom_metadata")
+                if isinstance(raw_meta, dict) and raw_meta.get("encrypted"):
+                    try:
+                        from src.utils.security import decrypt_payload
+                        decrypted_str = decrypt_payload(raw_meta["data"])
+                        dicom_metadata = json.loads(decrypted_str)
+                    except Exception as decrypt_err:
+                        logger.error(f"Failed to decrypt DICOM metadata for heatmap: {decrypt_err}")
+                else:
+                    dicom_metadata = raw_meta
+
             if storage_mode == "s3":
                 exists_dcm = False
                 try:
@@ -1164,7 +1321,7 @@ def create_app() -> FastAPI:
                     os.close(fd)
                     try:
                         from src.data.dicom_handler import create_secondary_capture
-                        await asyncio.to_thread(create_secondary_capture, None, str(png_path), temp_dcm_name)
+                        await asyncio.to_thread(create_secondary_capture, dicom_metadata, str(png_path), temp_dcm_name)
                         with open(temp_dcm_name, "rb") as f:
                             await asyncio.to_thread(storage.save, f, relative_dcm_path)
                         dcm_path = Path(temp_dcm_name)
@@ -1178,7 +1335,7 @@ def create_app() -> FastAPI:
                 if not dcm_path.exists():
                     try:
                         from src.data.dicom_handler import create_secondary_capture
-                        await asyncio.to_thread(create_secondary_capture, None, str(png_path), str(dcm_path))
+                        await asyncio.to_thread(create_secondary_capture, dicom_metadata, str(png_path), str(dcm_path))
                     except Exception as e:
                         logger.error(f"Failed to generate Secondary Capture DICOM: {e}")
                         raise HTTPException(status_code=500, detail=f"Failed to generate DICOM: {e}")
@@ -1200,7 +1357,7 @@ def create_app() -> FastAPI:
     async def get_job_status(
         job_id: str,
         request: Request,
-        api_key: str = Depends(verify_api_key)
+        api_key: str = Security(verify_api_key, scopes=["cases:read"])
     ):
         job_data = None
         if use_redis and redis_client:
@@ -1217,6 +1374,18 @@ def create_app() -> FastAPI:
                 
         if job_data is None:
             raise HTTPException(status_code=404, detail="Job not found")
+            
+        # Decrypt DICOM patient metadata if encrypted
+        if job_data and "result" in job_data:
+            job_data = json.loads(json.dumps(job_data))
+            raw_meta = job_data["result"].get("dicom_metadata")
+            if isinstance(raw_meta, dict) and raw_meta.get("encrypted"):
+                try:
+                    from src.utils.security import decrypt_payload
+                    decrypted_str = decrypt_payload(raw_meta["data"])
+                    job_data["result"]["dicom_metadata"] = json.loads(decrypted_str)
+                except Exception as decrypt_err:
+                    logger.error(f"Failed to decrypt DICOM metadata for status: {decrypt_err}")
             
         return JSONResponse(content=job_data)
 
@@ -1265,7 +1434,7 @@ def create_app() -> FastAPI:
         request: Request,
         background_tasks: BackgroundTasks,
         payload: FeedbackPayload,
-        api_key: str = Depends(verify_api_key)
+        api_key: str = Security(verify_api_key, scopes=["feedback:write"])
     ):
         try:
             agreement = payload.verdict in {"agree", "match"}
@@ -1298,12 +1467,12 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error(f"Feedback logging failed: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to log feedback: {e}")
-
+ 
     @app.get("/feedback/discrepancies")
     @limiter.limit("10/minute")
     async def get_discrepancies(
         request: Request,
-        api_key: str = Depends(verify_api_key)
+        api_key: str = Security(verify_api_key, scopes=["feedback:read"])
     ):
         """Retrieves aggregated discrepancy records across all stateless replicas using Redis/S3."""
         try:
@@ -1339,9 +1508,36 @@ def create_app() -> FastAPI:
     @limiter.limit("10/minute")
     async def get_telemetry_metrics(
         request: Request,
-        api_key: str = Depends(verify_api_key)
+        baseline_minutes: Optional[int] = None,
+        automated_minutes: Optional[int] = None,
+        hourly_rate: Optional[float] = None,
+        gpu_hourly_cost: Optional[float] = None,
+        api_key: str = Security(verify_api_key, scopes=["metrics:read"])
     ):
         """Returns production telemetry metrics including the real-world escalation rate and clinician override rates."""
+        # Resolve inputs with environment fallback
+        b_mins = baseline_minutes if baseline_minutes is not None else int(os.getenv("TELEMETRY_BASELINE_MINUTES", "18"))
+        a_mins = automated_minutes if automated_minutes is not None else int(os.getenv("TELEMETRY_AUTOMATED_MINUTES", "1"))
+        h_rate = hourly_rate if hourly_rate is not None else float(os.getenv("TELEMETRY_HOURLY_RATE", "250.0"))
+        gpu_cost = gpu_hourly_cost if gpu_hourly_cost is not None else float(os.getenv("GPU_HOURLY_COST", "0.0" if os.getenv("TESTING") == "true" else "0.90"))
+
+        # Validate inputs to enforce standard business boundaries and prevent logical/arithmetic errors
+        if b_mins <= 0 or b_mins > 1440:
+            raise HTTPException(status_code=400, detail="baseline_minutes must be between 1 and 1440 (24 hours).")
+        if a_mins < 0 or a_mins >= b_mins:
+            raise HTTPException(status_code=400, detail="automated_minutes must be non-negative and less than baseline_minutes.")
+        if h_rate < 0.0 or h_rate > 10000.0:
+            raise HTTPException(status_code=400, detail="hourly_rate must be between 0.0 and 10000.0.")
+        if gpu_cost < 0.0 or gpu_cost > 1000.0:
+            raise HTTPException(status_code=400, detail="gpu_hourly_cost must be between 0.0 and 1000.0.")
+
+        # Calculate elapsed runtime of the API container to factor in continuous GPU hosting cost
+        started_at = getattr(request.app.state, "started_at", None)
+        if started_at is None:
+            started_at = time.time() - 3600 # Default to 1 hour if not recorded
+        elapsed_hours = max(0.01, (time.time() - started_at) / 3600.0)
+        infra_cost = round(elapsed_hours * gpu_cost, 2)
+
         # Calculate feedback metrics first
         feedback_total = 0
         agreements = 0
@@ -1396,6 +1592,10 @@ def create_app() -> FastAPI:
                 "total_cases": 0,
                 "escalated_cases": 0,
                 "escalation_rate": 0.0,
+                "saved_time_hours": 0.0,
+                "saved_cost_usd": 0.0,
+                "infrastructure_cost_usd": infra_cost,
+                "net_saved_cost_usd": round(-infra_cost, 2),
                 "feedback_total_cases": feedback_total,
                 "feedback_agreements": agreements,
                 "feedback_disagreements": disagreements,
@@ -1410,13 +1610,10 @@ def create_app() -> FastAPI:
             rate = escalated / total if total > 0 else 0.0
             
             # ROI Calculations (factor in manual radiologist baseline vs automated with escalation)
-            base_mins = int(os.getenv("TELEMETRY_BASELINE_MINUTES", "18"))
-            auto_mins = int(os.getenv("TELEMETRY_AUTOMATED_MINUTES", "1"))
-            hourly_rate = float(os.getenv("TELEMETRY_HOURLY_RATE", "250.0"))
-            
-            saved_minutes = (total - escalated) * (base_mins - auto_mins)
+            saved_minutes = (total - escalated) * (b_mins - a_mins)
             saved_hours = round(saved_minutes / 60, 2)
-            saved_cost = round(saved_hours * hourly_rate, 2)
+            saved_cost = round(saved_hours * h_rate, 2)
+            net_saved_cost = round(saved_cost - infra_cost, 2)
             
             return {
                 "total_cases": total,
@@ -1424,6 +1621,8 @@ def create_app() -> FastAPI:
                 "escalation_rate": round(rate, 4),
                 "saved_time_hours": saved_hours,
                 "saved_cost_usd": saved_cost,
+                "infrastructure_cost_usd": infra_cost,
+                "net_saved_cost_usd": net_saved_cost,
                 "feedback_total_cases": feedback_total,
                 "feedback_agreements": agreements,
                 "feedback_disagreements": disagreements,

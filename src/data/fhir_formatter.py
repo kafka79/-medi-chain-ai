@@ -289,32 +289,22 @@ class EHRGateway:
                 total, used, free = shutil.disk_usage(dlq_dir)
                 local_path = dlq_dir / filename
                 
-                if free < 50 * 1024 * 1024:  # Critically low if < 50 MB
-                    # ponytail: never drop a medical report. Write a minimal stub so
-                    # the report's existence is recorded. Full payload was already
-                    # attempted via Redis/S3 upstream.
-                    self.logger.critical("Local disk space critically low. Writing minimal DLQ stub instead of full payload.")
+                if free < 50 * 1024 * 1024:  # Warning if < 50 MB
+                    self.logger.critical("Local disk space critically low. Attempting to write full payload despite space warning.")
                     try:
                         from deployment.api.main import _send_system_alert
-                        _send_system_alert("Disk Space Exhaustion", "DLQ write degraded to stub mode due to low disk space.")
+                        _send_system_alert("Disk Space Exhaustion", "DLQ write warning: low disk space on host partition.")
                     except Exception as alert_err:
                         self.logger.error(f"Failed to send system alert: {alert_err}")
-                    stub = {
-                        "stub": True,
-                        "timestamp": payload.get("timestamp") if isinstance(payload, dict) else datetime.now(timezone.utc).isoformat(),
-                        "error": str(exception),
-                        "note": "Full payload omitted due to low disk. Check Redis DLQ or S3 backup."
-                    }
-                    wrapper_json = json.dumps(stub)
-                else:
-                    # Encrypt the payload string before persisting to local disk fallback
-                    from src.utils.security import encrypt_payload
-                    encrypted_payload = encrypt_payload(payload_json)
-                    wrapper = {
-                        "encrypted": True,
-                        "data": encrypted_payload
-                    }
-                    wrapper_json = json.dumps(wrapper, indent=2)
+                
+                # Encrypt the payload string before persisting to local disk fallback
+                from src.utils.security import encrypt_payload
+                encrypted_payload = encrypt_payload(payload_json)
+                wrapper = {
+                    "encrypted": True,
+                    "data": encrypted_payload
+                }
+                wrapper_json = json.dumps(wrapper, indent=2)
                 
                 # Atomic: write to temp file, then rename (rename is atomic on POSIX)
                 fd, tmp_path = tempfile.mkstemp(dir=str(dlq_dir), suffix=".tmp")

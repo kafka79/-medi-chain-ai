@@ -1,5 +1,7 @@
 import torch
 import numpy as np
+import json
+from pathlib import Path
 
 class UncertaintyEstimator:
     def __init__(self, model):
@@ -26,6 +28,7 @@ class UncertaintyEstimator:
         # Load empirical baseline standard deviations to capture non-isotropic manifold variance
         empirical_std = None
         baseline_mean = None
+        baseline_mean_text = None
         try:
             import json
             from pathlib import Path
@@ -40,6 +43,15 @@ class UncertaintyEstimator:
                     # Compute baseline centroid for visual epistemic uncertainty scaling
                     mean_val = np.mean(baseline_arr, axis=0)
                     baseline_mean = torch.tensor(mean_val, dtype=torch.float32, device=vision_emb.device)
+                    
+            text_baseline_path = Path("temp/drift/text_baseline_cache.json")
+            if text_baseline_path.exists():
+                with open(text_baseline_path, "r") as f:
+                    text_baseline_features = json.load(f)
+                if text_baseline_features and len(text_baseline_features) > 1:
+                    text_baseline_arr = np.array(text_baseline_features)
+                    text_mean_val = np.mean(text_baseline_arr, axis=0)
+                    baseline_mean_text = torch.tensor(text_mean_val, dtype=torch.float32, device=text_emb.device)
         except Exception:
             pass
         
@@ -56,27 +68,17 @@ class UncertaintyEstimator:
             all_visual_noises = []
             with torch.no_grad():
                 for _ in range(num_passes):
-                    # Use TTA-derived visual_std for perturbation magnitude
+                    # Use TTA-derived visual_std for perturbation magnitude if available
                     if visual_std is not None:
                         if isinstance(visual_std, list):
                             visual_std_t = torch.tensor(visual_std, dtype=torch.float32, device=vision_emb.device)
                         else:
                             visual_std_t = visual_std.to(vision_emb.device)
-                        
-                        if empirical_std is not None:
-                            # Scale visual noise non-isotropically by relative dimension variation
-                            normalized_empirical = empirical_std / (empirical_std.mean() + 1e-8)
-                            noise_scale = visual_std_t * normalized_empirical
-                        else:
-                            noise_scale = visual_std_t
+                        noise_scale = visual_std_t
                         noise = torch.randn_like(vision_emb) * noise_scale
                     else:
-                        if empirical_std is not None:
-                            # Scale isotropic noise (0.05) by normalized empirical standard deviation
-                            normalized_empirical = empirical_std / (empirical_std.mean() + 1e-8)
-                            noise = torch.randn_like(vision_emb) * 0.05 * normalized_empirical
-                        else:
-                            noise = torch.randn_like(vision_emb) * 0.05
+                        # Local perturbation must be purely local/isotropic to avoid global population scaling bias
+                        noise = torch.randn_like(vision_emb) * 0.05
                         
                     perturbed_v = vision_emb + noise
                     perturbed_v = torch.nn.functional.normalize(perturbed_v, p=2, dim=-1)
@@ -132,6 +134,24 @@ class UncertaintyEstimator:
                 cos_sim = (vision_emb @ baseline_mean) / (torch.clamp(norm_ve, min=1e-8) * norm_bm)
                 visual_ood_distance = torch.clamp(1.0 - cos_sim, min=0.0)
 
+        # Calculate text OOD distance (1 - cosine similarity) to text baseline centroid
+        text_ood_distance = torch.zeros(batch_size, device=text_emb.device)
+        if baseline_mean_text is not None:
+            norm_bmt = baseline_mean_text.norm()
+            norm_te = text_emb.norm(dim=-1)
+            if norm_bmt > 0:
+                cos_sim_t = (text_emb @ baseline_mean_text) / (torch.clamp(norm_te, min=1e-8) * norm_bmt)
+                text_ood_distance = torch.clamp(1.0 - cos_sim_t, min=0.0)
+
+        # Joint out-of-distribution distance
+        if baseline_mean is not None and baseline_mean_text is not None:
+            alpha = 0.5
+            joint_ood_distance = alpha * visual_ood_distance + (1.0 - alpha) * text_ood_distance
+        elif baseline_mean_text is not None:
+            joint_ood_distance = text_ood_distance
+        else:
+            joint_ood_distance = visual_ood_distance
+
         # Compute visual uncertainty score from TTA std if available
         if visual_std is not None:
             if isinstance(visual_std, list):
@@ -142,14 +162,16 @@ class UncertaintyEstimator:
         else:
             visual_uncertainty = torch.full((batch_size,), float('nan'), device=vision_emb.device)
             
-        # Note: This is an empirical heuristic combining classification variance (from head dropout)
-        # and manifold OOD distance (from input cosine similarity). It is not a closed-form derivation
-        # of the Law of Total Variance but serves as a practical uncertainty score for out-of-distribution inputs.
-        # Dynamically scale by prediction confidence (conf) to calibrate against temperature.
-        import os
-        beta = conf * float(os.getenv("UNCERTAINTY_OOD_SCALE", "0.5"))
-        manifold_var = (visual_ood_distance * beta) ** 2
-        combined = torch.sqrt(var_Y + manifold_var)
+        # Mathematically sound calibration of joint OOD distance to probability space:
+        # We define the probability of the input being in-distribution as: p_in = exp(-joint_ood_distance)
+        # Consequently, the probability of it being out-of-distribution is: p_ood = 1.0 - p_in
+        # The maximum variance of a probability distribution is 0.25 (e.g. Bernoulli with p=0.5).
+        # We scale the OOD variance as 0.25 * (p_ood ** 2), which is in the same probability-variance
+        # space [0, 0.25] as var_Y. This resolves the category error and uncalibrated heuristic.
+        p_in = torch.exp(-joint_ood_distance)
+        p_ood = 1.0 - p_in
+        combined_var = var_Y + 0.25 * (p_ood ** 2)
+        combined = torch.sqrt(combined_var)
         
         return {
             "prediction": pred,

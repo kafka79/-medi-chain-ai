@@ -55,6 +55,7 @@ class DriftDetector:
         self.baseline_key = "medi_chain:drift:baseline"
         self.features_window_key = "medi_chain:drift:features_window"
         self.features_baseline_key = "medi_chain:drift:features_baseline"
+        self.text_baseline_key = "medi_chain:drift:text_baseline"
         self.processing_window_key = "medi_chain:drift:window:processing"
         self.processing_features_window_key = "medi_chain:drift:features_window:processing"
         # Flaw #9 Fix: Performance drift feedback stored in Redis, not local disk
@@ -63,6 +64,7 @@ class DriftDetector:
         self.redis_client = None
         self.baseline = None
         self.features_baseline = None
+        self.text_baseline = None
 
         # Lua script to atomically push elements, set TTL, check count, and conditionally rename both windows to processing keys
         self.lua_push_and_check = """
@@ -152,6 +154,7 @@ class DriftDetector:
         
         self.baseline = self._load_baseline()
         self.features_baseline = self._load_features_baseline()
+        self.text_baseline = self._load_text_baseline()
 
     def _write_local_cache(self, filename: str, data: Any):
         try:
@@ -261,6 +264,43 @@ class DriftDetector:
         self._write_local_cache("features_baseline_cache.json", features)
         self.features_baseline = np.array(features)
 
+    def _load_text_baseline(self):
+        data = None
+        if self.redis_client is not None:
+            try:
+                data = self.redis_client.get(self.text_baseline_key)
+            except Exception as e:
+                logger.error(f"Failed to load text features baseline from Redis: {e}")
+                
+        if data:
+            try:
+                parsed = json.loads(data)
+                self._write_local_cache("text_baseline_cache.json", parsed)
+                return np.array(parsed)
+            except Exception as e:
+                logger.error(f"Failed to process Redis text features baseline: {e}")
+                
+        logger.warning("Attempting local cache backup fallback for text features baseline.")
+        cached_data = self._read_local_cache("text_baseline_cache.json")
+        if cached_data:
+            logger.info("Successfully loaded text features baseline from local cache backup.")
+            return np.array(cached_data)
+        return None
+
+    def _save_text_baseline(self, features: list):
+        if self.redis_client is not None:
+            try:
+                self.redis_client.set(self.text_baseline_key, json.dumps(features))
+                now_str = datetime.now(timezone.utc).isoformat()
+                self.redis_client.set("medi_chain:drift:baseline:updated_at", now_str)
+                self._last_baseline_update = now_str
+                logger.info("Saved new global text features baseline (covariate shift) to Redis.")
+            except Exception as e:
+                logger.error(f"Failed to save text features baseline to Redis: {e}")
+                
+        self._write_local_cache("text_baseline_cache.json", features)
+        self.text_baseline = np.array(features)
+
     def _refresh_baselines_if_changed(self):
         if self.redis_client is None:
             return
@@ -271,27 +311,35 @@ class DriftDetector:
                     logger.info("New baseline detected in Redis. Reloading baselines.")
                     self.baseline = self._load_baseline()
                     self.features_baseline = self._load_features_baseline()
+                    self.text_baseline = self._load_text_baseline()
                     self._last_baseline_update = redis_timestamp
         except Exception as e:
             logger.error(f"Error checking baseline update status: {e}")
 
-    async def add_prediction(self, probs: list, visual_features: list = None):
+    async def add_prediction(self, probs: list, visual_features: list = None, text_features: list = None):
         """Adds current prediction probabilities and visual features to persistent distributed windows.
         Offloads Redis operations and CPU-bound statistical tests to a separate thread pool."""
         if self.disabled:
             return
 
         try:
-            await asyncio.to_thread(self._add_prediction_sync, probs, visual_features)
+            await asyncio.to_thread(self._add_prediction_sync, probs, visual_features, text_features)
         except Exception as e:
             logger.error(f"Failed to monitor drift: {e}")
 
-    def _add_prediction_sync(self, probs: list, visual_features: list = None):
+    def _add_prediction_sync(self, probs: list, visual_features: list = None, text_features: list = None):
         """Synchronous implementation of add_prediction to be run in asyncio.to_thread."""
         try:
             self._refresh_baselines_if_changed()
             val_probs = json.dumps(probs)
             val_features = json.dumps(visual_features) if visual_features is not None else ""
+            
+            if text_features is not None and self.redis_client is not None:
+                try:
+                    self.redis_client.rpush("medi_chain:drift:text_window", json.dumps(text_features))
+                    self.redis_client.ltrim("medi_chain:drift:text_window", -100, -1)
+                except Exception as text_err:
+                    logger.error(f"Failed to push text features to Redis: {text_err}")
             
             # Execute Lua script to push and conditionally retrieve expired lists atomically
             result = self.redis_client.eval(

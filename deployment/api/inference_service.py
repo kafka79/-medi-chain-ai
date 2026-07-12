@@ -52,8 +52,16 @@ class InferenceService:
         self.fusion = LateFusionModel()
         checkpoint_path = MODEL_CHECKPOINT
         if os.path.exists(checkpoint_path):
-            self.fusion.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
-            print(f"Loaded weights from {checkpoint_path}")
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            # Copy v_proj and t_proj weights to gates if gates are missing in checkpoint to prevent random initialization degradation
+            if "v_gate.weight" not in state_dict and "v_proj.weight" in state_dict:
+                state_dict["v_gate.weight"] = state_dict["v_proj.weight"].clone()
+                state_dict["v_gate.bias"] = state_dict["v_proj.bias"].clone()
+            if "t_gate.weight" not in state_dict and "t_proj.weight" in state_dict:
+                state_dict["t_gate.weight"] = state_dict["t_proj.weight"].clone()
+                state_dict["t_gate.bias"] = state_dict["t_proj.bias"].clone()
+            self.fusion.load_state_dict(state_dict, strict=False)
+            print(f"Loaded weights from {checkpoint_path} (backward-compatible mode)")
         else:
             print(f"WARNING: Checkpoint {checkpoint_path} not found! Using random weights.")
             
