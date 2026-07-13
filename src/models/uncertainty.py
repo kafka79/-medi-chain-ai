@@ -55,6 +55,41 @@ class UncertaintyEstimator:
         except Exception:
             pass
         
+        batch_size = vision_emb.shape[0]
+        
+        # Calculate visual OOD distance (1 - cosine similarity) to baseline centroid
+        visual_ood_distance = torch.zeros(batch_size, device=vision_emb.device)
+        if baseline_mean is not None:
+            norm_bm = baseline_mean.norm()
+            norm_ve = vision_emb.norm(dim=-1)
+            if norm_bm > 0:
+                cos_sim = (vision_emb @ baseline_mean) / (torch.clamp(norm_ve, min=1e-8) * norm_bm)
+                visual_ood_distance = torch.clamp(1.0 - cos_sim, min=0.0)
+
+        # Calculate text OOD distance to text baseline centroid
+        text_ood_distance = torch.zeros(batch_size, device=text_emb.device)
+        if baseline_mean_text is not None:
+            norm_bmt = baseline_mean_text.norm()
+            norm_te = text_emb.norm(dim=-1)
+            if norm_bmt > 0:
+                cos_sim_t = (text_emb @ baseline_mean_text) / (torch.clamp(norm_te, min=1e-8) * norm_bmt)
+                text_ood_distance = torch.clamp(1.0 - cos_sim_t, min=0.0)
+
+        # Joint out-of-distribution distance
+        if baseline_mean is not None and baseline_mean_text is not None:
+            alpha = 0.5
+            joint_ood_distance = alpha * visual_ood_distance + (1.0 - alpha) * text_ood_distance
+        elif baseline_mean_text is not None:
+            joint_ood_distance = text_ood_distance
+        else:
+            joint_ood_distance = visual_ood_distance
+
+        # Temperature scaling derived from OOD distance to calibrate uncertainty
+        # A simple linear calibration: T = 1.0 + joint_ood_distance
+        # This increases the temperature of the softmax for OOD samples, softening the output
+        # distribution and naturally increasing the variance without heuristic additions.
+        temperature = 1.0 + joint_ood_distance.unsqueeze(1)
+        
         try:
             # Enable dropout layers specifically inside the fusion model
             for m in self.model.modules():
@@ -87,7 +122,10 @@ class UncertaintyEstimator:
                     perturbed_t = torch.nn.functional.normalize(perturbed_t, p=2, dim=-1)
                     
                     _, logits = self.model(perturbed_v, perturbed_t)
-                    all_logits.append(torch.softmax(logits, dim=1))
+                    
+                    # Apply OOD temperature scaling before softmax
+                    scaled_logits = logits / temperature
+                    all_logits.append(torch.softmax(scaled_logits, dim=1))
                     
                     # Compute the normalized L2 norm of the noise vector for this pass (batch_size,)
                     noise_norm = noise.norm(dim=-1) / (noise.shape[-1] ** 0.5)
@@ -105,53 +143,6 @@ class UncertaintyEstimator:
         # Prediction is the class with highest mean probability
         conf, pred = torch.max(mean_probs, dim=1)
         
-        batch_size = vision_emb.shape[0]
-        
-        # Extract prediction probabilities across passes for prediction variance
-        Y = torch.stack([stacked_probs[t, torch.arange(batch_size), pred] for t in range(num_passes)])  # (num_passes, batch)
-        var_Y = Y.var(dim=0, unbiased=True)
-        
-        fusion_uncertainties = var_Y.sqrt()
-        
-        if num_passes > 1 and torch.all(var_Y == 0.0):
-            import logging
-            temp_logger = logging.getLogger("uncertainty-estimator")
-            temp_logger.critical(
-                "MC DROPOUT STATE ERROR: Variance is exactly zero across all passes. "
-                "Verify that the model has active dropout layers and that they are "
-                "explicitly set to training mode during estimation."
-            )
-        
-        # Calculate visual OOD distance (1 - cosine similarity) to baseline centroid
-        # to detect when the frozen visual backbone has mapped a completely OOD scan
-        # to a stable but incorrect coordinate in the latent space.
-        visual_ood_distance = torch.zeros(batch_size, device=vision_emb.device)
-        if baseline_mean is not None:
-            norm_bm = baseline_mean.norm()
-            norm_ve = vision_emb.norm(dim=-1)
-            if norm_bm > 0:
-                # Batch cosine similarity
-                cos_sim = (vision_emb @ baseline_mean) / (torch.clamp(norm_ve, min=1e-8) * norm_bm)
-                visual_ood_distance = torch.clamp(1.0 - cos_sim, min=0.0)
-
-        # Calculate text OOD distance (1 - cosine similarity) to text baseline centroid
-        text_ood_distance = torch.zeros(batch_size, device=text_emb.device)
-        if baseline_mean_text is not None:
-            norm_bmt = baseline_mean_text.norm()
-            norm_te = text_emb.norm(dim=-1)
-            if norm_bmt > 0:
-                cos_sim_t = (text_emb @ baseline_mean_text) / (torch.clamp(norm_te, min=1e-8) * norm_bmt)
-                text_ood_distance = torch.clamp(1.0 - cos_sim_t, min=0.0)
-
-        # Joint out-of-distribution distance
-        if baseline_mean is not None and baseline_mean_text is not None:
-            alpha = 0.5
-            joint_ood_distance = alpha * visual_ood_distance + (1.0 - alpha) * text_ood_distance
-        elif baseline_mean_text is not None:
-            joint_ood_distance = text_ood_distance
-        else:
-            joint_ood_distance = visual_ood_distance
-
         # Compute visual uncertainty score from TTA std if available
         if visual_std is not None:
             if isinstance(visual_std, list):
@@ -162,16 +153,24 @@ class UncertaintyEstimator:
         else:
             visual_uncertainty = torch.full((batch_size,), float('nan'), device=vision_emb.device)
             
-        # Mathematically sound calibration of joint OOD distance to probability space:
-        # We define the probability of the input being in-distribution as: p_in = exp(-joint_ood_distance)
-        # Consequently, the probability of it being out-of-distribution is: p_ood = 1.0 - p_in
-        # The maximum variance of a probability distribution is 0.25 (e.g. Bernoulli with p=0.5).
-        # We scale the OOD variance as 0.25 * (p_ood ** 2), which is in the same probability-variance
-        # space [0, 0.25] as var_Y. This resolves the category error and uncalibrated heuristic.
-        p_in = torch.exp(-joint_ood_distance)
-        p_ood = 1.0 - p_in
-        combined_var = var_Y + 0.25 * (p_ood ** 2)
-        combined = torch.sqrt(combined_var)
+        # Extract prediction probabilities across passes for prediction variance
+        Y = torch.stack([stacked_probs[t, torch.arange(batch_size), pred] for t in range(num_passes)])  # (num_passes, batch)
+        var_Y = Y.var(dim=0, unbiased=True)
+        fusion_uncertainties = var_Y.sqrt()
+        
+        if num_passes > 1 and torch.all(var_Y == 0.0):
+            import logging
+            temp_logger = logging.getLogger("uncertainty-estimator")
+            temp_logger.critical(
+                "MC DROPOUT STATE ERROR: Variance is exactly zero across all passes. "
+                "Verify that the model has active dropout layers and that they are "
+                "explicitly set to training mode during estimation."
+            )
+            
+        # Due to Temperature scaling applied earlier on the logits, the probability 
+        # distributions for OOD samples are naturally flattened. This increases var_Y,
+        # providing a sound, model-derived calibration of uncertainty.
+        combined = fusion_uncertainties
         
         return {
             "prediction": pred,

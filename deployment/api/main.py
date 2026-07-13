@@ -55,6 +55,7 @@ def _get_or_create_histogram(name, documentation, buckets):
 
 PROM_CASES_PROCESSED = _get_or_create_counter("medi_chain_cases_processed_total", "Total number of clinical cases processed.")
 PROM_ESCALATIONS = _get_or_create_counter("medi_chain_escalations_total", "Total number of clinical cases escalated.")
+PROM_FAILURES = _get_or_create_counter("medi_chain_failures_total", "Total number of clinical cases failed.")
 PROM_FEEDBACK = _get_or_create_counter("medi_chain_feedback_total", "Clinician feedback verdicts.", ["verdict"])
 PROM_SIGN_OFF_TIME = _get_or_create_histogram(
     "medi_chain_sign_off_time_seconds", 
@@ -975,6 +976,18 @@ async def process_analyze_job(
     except Exception as exc:
         logger.error(f"Async job {job_id} failed: {exc}")
         await _update_job_status(job_id, "failed", error=str(exc))
+        
+        # Flaw #4 Fix: Telemetry Resource Accounting Gap - track compute costs of failed runs
+        PROM_CASES_PROCESSED.inc() 
+        PROM_FAILURES.inc()
+        if use_redis and redis_client:
+            try:
+                pipeline = redis_client.pipeline()
+                pipeline.incr("medi_chain:telemetry:total_cases")
+                pipeline.incr("medi_chain:telemetry:failed_cases")
+                await asyncio.to_thread(pipeline.execute)
+            except Exception as telemetry_err:
+                logger.error(f"Failed to update failed cases telemetry: {telemetry_err}")
     finally:
         if request_temp_dir and os.path.exists(request_temp_dir):
             try:

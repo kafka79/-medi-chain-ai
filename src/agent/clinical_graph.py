@@ -55,6 +55,7 @@ class AgentState(TypedDict):
     patient_pdf_path: str
     visual_features: Any
     visual_std: Any
+    text_features: Any
     history_data: Dict[str, Any]
     pubmed_citations: List[Dict[str, Any]]
     diagnosis: Dict[str, Any]
@@ -524,6 +525,7 @@ class ClinicalAgent:
             "pubmed_citations": [],
             "visual_features": None,
             "visual_std": None,
+            "text_features": None,
             "history_data": {},
             "diagnosis": {},
             "confidence": 0.0,

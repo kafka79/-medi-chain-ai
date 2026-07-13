@@ -433,21 +433,15 @@ class DriftDetector:
         return drift_detected
 
     def _compute_mmd(self, X: np.ndarray, Y: np.ndarray, gamma: float = None) -> float:
-        """Linear-time unbiased MMD² estimator (Gretton et al. 2012, Section 6).
+        """Hybrid unbiased MMD² estimator (Gretton et al. 2012).
 
         Panel Flaw #5 Fix: The previous O(N²) implementation computed full
-        pairwise distance matrices (N×N, N×M, M×M) which blocked the Python
-        GIL for the entire computation, freezing concurrent async workers.
+        pairwise distance matrices which blocked the Python GIL for the entire computation,
+        freezing concurrent async workers. A pure linear estimator had high variance for small N.
 
-        This estimator pairs samples 1:1 and computes kernel differences in
-        O(N) time using the h-statistic:
-            h_i = k(x_{2i}, x_{2i+1}) + k(y_{2i}, y_{2i+1})
-                - k(x_{2i}, y_{2i+1}) - k(x_{2i+1}, y_{2i})
-            MMD² ≈ (1/m) Σ h_i   where m = floor(N/2)
-
-        This is unbiased and consistent, with variance O(1/N) vs O(1/N²) for
-        the quadratic estimator — a modest statistical trade-off for a massive
-        computational speedup under production traffic.
+        This uses a hybrid approach:
+        - For N < 100: Uses the O(N²) quadratic unbiased estimator for statistical efficiency.
+        - For N >= 100: Uses the O(N) linear-time estimator to avoid GIL blocks.
         """
         n = min(X.shape[0], Y.shape[0])
         if n < 4:
@@ -460,15 +454,10 @@ class DriftDetector:
         perm = rng.permutation(n)
         X, Y = X[perm], Y[perm]
 
-        # Use only even number of samples for clean pairing
-        m = n // 2
-        X_even, X_odd = X[:m], X[m:2*m]
-        Y_even, Y_odd = Y[:m], Y[m:2*m]
-
         # Estimate gamma from a small subsample if not provided
         if gamma is None:
-            subsample_size = min(m, 50)
-            dists = np.sum((X_even[:subsample_size] - Y_even[:subsample_size]) ** 2, axis=1)
+            subsample_size = min(n, 50)
+            dists = np.sum((X[:subsample_size] - Y[:subsample_size]) ** 2, axis=1)
             median_dist = np.median(dists)
             gamma = 1.0 / (median_dist + 1e-8)
 
@@ -477,13 +466,36 @@ class DriftDetector:
             sq_dists = np.sum((a - b) ** 2, axis=1)
             return np.exp(-gamma * sq_dists)
 
-        # h_i = k(x_even, x_odd) + k(y_even, y_odd) - k(x_even, y_odd) - k(x_odd, y_even)
-        h = (rbf_kernel(X_even, X_odd)
-             + rbf_kernel(Y_even, Y_odd)
-             - rbf_kernel(X_even, Y_odd)
-             - rbf_kernel(X_odd, Y_even))
-
-        return float(np.mean(h))
+        if n < 100:
+            # O(N^2) quadratic unbiased estimator
+            def rbf_kernel_matrix(a, b):
+                sq_dists = np.sum((a[:, np.newaxis, :] - b[np.newaxis, :, :]) ** 2, axis=2)
+                return np.exp(-gamma * sq_dists)
+                
+            K_xx = rbf_kernel_matrix(X, X)
+            K_yy = rbf_kernel_matrix(Y, Y)
+            K_xy = rbf_kernel_matrix(X, Y)
+            
+            # Remove diagonal for unbiased estimator
+            np.fill_diagonal(K_xx, 0)
+            np.fill_diagonal(K_yy, 0)
+            
+            m_val = n * (n - 1)
+            return float(np.sum(K_xx) / m_val + np.sum(K_yy) / m_val - 2 * np.sum(K_xy) / (n * n))
+        else:
+            # O(N) linear-time unbiased estimator
+            # Use only even number of samples for clean pairing
+            m = n // 2
+            X_even, X_odd = X[:m], X[m:2*m]
+            Y_even, Y_odd = Y[:m], Y[m:2*m]
+    
+            # h_i = k(x_even, x_odd) + k(y_even, y_odd) - k(x_even, y_odd) - k(x_odd, y_even)
+            h = (rbf_kernel(X_even, X_odd)
+                 + rbf_kernel(Y_even, Y_odd)
+                 - rbf_kernel(X_even, Y_odd)
+                 - rbf_kernel(X_odd, Y_even))
+    
+            return float(np.mean(h))
 
     def check_covariate_shift(self, current_features: list):
         """

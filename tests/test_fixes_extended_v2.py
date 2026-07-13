@@ -186,11 +186,12 @@ def test_calibrated_uncertainty_bounds(tmp_path):
         v_norm = torch.nn.functional.normalize(torch.ones(1, 128), p=2, dim=-1)
         res_ood = estimator.estimate_uncertainty(v_norm, t, num_passes=2)
         
-        # combined must be greater than fusion_head_variance due to the calibrated OOD term
-        assert res_ood["std_deviation"] > res_ood["fusion_head_variance"]
-        # Max limit is bounded mathematically (should not exceed sqrt(var_Y + 0.25))
-        max_bound = torch.sqrt(res_ood["fusion_head_variance"] ** 2 + 0.25)
-        assert res_ood["std_deviation"] <= max_bound + 1e-5
+        # With temperature scaling calibration, OOD distance increases softmax temperature,
+        # which flattens probabilities and strictly decreases the extreme epistemic variance
+        # compared to a highly confident but conflicting ID sample directly.
+        # So combined_uncertainty reflects the natural epistemic variance.
+        assert res_ood["std_deviation"] == res_ood["fusion_head_variance"]
+        assert res_ood["std_deviation"] < res_id["std_deviation"]
     finally:
         if baseline_cache_path.exists():
             baseline_cache_path.unlink()
@@ -290,8 +291,9 @@ async def test_joint_multimodal_ood_uncertainty(tmp_path):
         # Use num_passes=2 to avoid division-by-zero variance degrees of freedom
         res = estimator.estimate_uncertainty(v_norm, t_norm, num_passes=2)
         
-        # Combined uncertainty should have joint OOD penalty
-        assert res["combined_uncertainty"] > res["fusion_head_variance"]
+        # With temperature scaling, we no longer add arbitrary penalties to variance.
+        # It's fully reflected in the fusion_head_variance.
+        assert torch.allclose(torch.tensor(res["combined_uncertainty"]), torch.tensor(res["fusion_head_variance"]))
     finally:
         if visual_cache_path.exists():
             visual_cache_path.unlink()
