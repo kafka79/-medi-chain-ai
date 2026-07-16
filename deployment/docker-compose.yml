@@ -1,4 +1,3 @@
-
 services:
   etcd:
     container_name: milvus-etcd
@@ -16,7 +15,6 @@ services:
     container_name: milvus-minio
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     environment:
-      # Flaw #1 Fix: Credentials sourced from .env file, not hardcoded
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set in .env}
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set in .env}
     volumes:
@@ -51,41 +49,19 @@ services:
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
     depends_on:
-      - "etcd"
-      - "minio"
+      - etcd
+      - minio
     networks:
       - internal
 
-  medi-ui:
-    container_name: medi-chain-ui
-    image: saya2572/medi-chain-ui:v1.0
-    build:
-      context: ..
-      dockerfile: deployment/Dockerfile
-    ports:
-      - "8501:8501"
-    volumes:
-      - ..:/app
-      - /app/data
-    environment:
-      - MILVUS_HOST=standalone
-    stdin_open: true
-    tty: true
-    depends_on:
-      - standalone
-      - nginx
-    networks:
-      - internal
-
+  # Primary inference API
   inference-api:
-    container_name: medi-chain-inference
+    container_name: medi-chain-inference-primary
     image: saya2572/medi-chain-inference:v1.0
     build:
       context: ..
       dockerfile: deployment/Dockerfile
     command: ["uvicorn", "deployment.api.inference_service:app", "--host", "0.0.0.0", "--port", "8001"]
-    # Flaw #18 Partial Fix: inference-api no longer exposed to host — only reachable via internal network
-    # Removed: ports: - "8001:8001"
     expose:
       - "8001"
     volumes:
@@ -93,6 +69,9 @@ services:
       - shared-scans:/app/shared_scans
     environment:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY:?INTERNAL_API_KEY must be set in .env}
+      - INFERENCE_MAX_WORKERS=1
+      - INFERENCE_REQUEST_TIMEOUT_SECONDS=30
+      - MODEL_CHECKPOINT=/app/models/fusion_model.pt
     deploy:
       resources:
         reservations:
@@ -101,10 +80,62 @@ services:
               count: 1
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/docs"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
       timeout: 10s
       retries: 3
+    networks:
+      - internal
+
+  # Canary inference API (5% traffic)
+  inference-api-canary:
+    container_name: medi-chain-inference-canary
+    image: saya2572/medi-chain-inference:v1.0
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    command: ["uvicorn", "deployment.api.inference_service:app", "--host", "0.0.0.0", "--port", "8001"]
+    expose:
+      - "8001"
+    volumes:
+      - ..:/app
+      - shared-scans:/app/shared_scans
+    environment:
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:?INTERNAL_API_KEY must be set in .env}
+      - INFERENCE_MAX_WORKERS=1
+      - INFERENCE_REQUEST_TIMEOUT_SECONDS=30
+      - MODEL_CHECKPOINT=/app/models/fusion_model_canary.pt
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - internal
+
+  # HAProxy for API and Inference Load Balancing
+  haproxy:
+    image: haproxy:2.8-alpine
+    container_name: medi-chain-haproxy
+    ports:
+      - "8000:80"
+      - "8001:8001"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      inference-api:
+        condition: service_healthy
+      inference-api-canary:
+        condition: service_healthy
+      medi-api:
+        condition: service_healthy
     networks:
       - internal
 
@@ -113,9 +144,7 @@ services:
     build:
       context: ..
       dockerfile: deployment/Dockerfile
-    # Use gunicorn for process management in production
     command: ["gunicorn", "deployment.api.main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
-    # Flaw #3 Fix: No host port binding — traffic routed through Nginx load balancer
     expose:
       - "8000"
     volumes:
@@ -123,43 +152,77 @@ services:
       - shared-scans:/app/shared_scans
     environment:
       - MILVUS_HOST=standalone
-      - MAX_CONCURRENT_REQUESTS=1
+      - MAX_CONCURRENT_REQUESTS=2
       - API_KEY=${API_KEY:?API_KEY must be set in .env}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY:?INTERNAL_API_KEY must be set in .env}
       - REDIS_URL=redis://redis:6379/0
       - MINIO_ENDPOINT=minio:9000
       - S3_ACCESS_KEY=${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set in .env}
-      - INFERENCE_API_URL=http://inference-api:8001
+      - INFERENCE_API_URL=http://haproxy:8001
       - RUN_BACKGROUND_WORKERS_IN_API=false
+      # Clinical thresholds (calibrated via CLI)
+      - CLINICAL_CONFIDENCE_THRESHOLD=0.6
+      - CLINICAL_UNCERTAINTY_THRESHOLD=0.15
+      - CLINICAL_UNCERTAINTY_CALIBRATION_FACTOR=1.0
+      - CLINICAL_OOD_CONFIDENCE_THRESHOLD=0.4
+      - CLINICAL_OOD_USE_STATIC_THRESHOLD=true
+      - CLINICAL_OOD_COSINE_THRESHOLD=0.82
+      - CLINICAL_OOD_TEXT_COSINE_THRESHOLD=0.82
+      - CLINICAL_MC_DROPOUT_PASSES=50
+      - CLINICAL_THRESHOLDS_VALIDATED=false
+      # Semaphore config
+      - SEMAPHORE_LEASE_TTL_SECONDS=30
+      - SEMAPHORE_RECONNECT_COOLDOWN_SECONDS=30
+      - SEMAPHORE_MAX_LEASE_REFRESH_RETRIES=3
+      # Drift config
+      - DRIFT_KEY_TTL_SECONDS=86400
+      - DRIFT_MIN_CASES=50
+      - DRIFT_AGREEMENT_THRESHOLD=0.95
+      - DRIFT_ALERT_WEBHOOK_URL=${DRIFT_ALERT_WEBHOOK_URL:-}
+      # Security
+      - SECURITY_DLQ_ENCRYPTION_KEY=${SECURITY_DLQ_ENCRYPTION_KEY:?SECURITY_DLQ_ENCRYPTION_KEY must be set in .env}
+      - SECURITY_DICOM_ENCRYPTION_KEY=${SECURITY_DICOM_ENCRYPTION_KEY:?SECURITY_DICOM_ENCRYPTION_KEY must be set in .env}
+      - SECURITY_INTERNAL_API_KEY=${INTERNAL_API_KEY:?INTERNAL_API_KEY must be set in .env}
+      - SECURITY_API_KEYS_CONFIG=${SECURITY_API_KEYS_CONFIG:-}
+      # API config
+      - API_VERSION=1.3.0
+      - API_RATE_LIMIT_PER_MINUTE=10
+      - API_ENABLE_BACKGROUND_WORKERS=false
+      # Storage
+      - STORAGE_MODE=s3
+      - STORAGE_MINIO_ENDPOINT=minio:9000
+      - STORAGE_MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set in .env}
+      - STORAGE_MINIO_SECRET_KEY=${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set in .env}
+      - STORAGE_CLEANUP_MAX_AGE_SECONDS=3600
+      # App settings
+      - MODEL_CHECKPOINT=models/fusion_model.pt
+      - EHR_GATEWAY_URL=https://mock-ehr-gateway.internal/fhir
+      - MILVUS_HOST=standalone
+      - MILVUS_PORT=19530
+      - DLQ_DIR=temp/dlq
+      - DRIFT_CACHE_DIR=temp/drift
+      - PRIVACY_NER_MODEL_PATH=dslim/bert-base-NER
+      - PRIVACY_NER_LAZY_LOAD=true
+      - PRIVACY_FALLBACK_REDACTION_AGGRESSIVE=true
+      # Telemetry
+      - TELEMETRY_BASELINE_MINUTES=18
+      - TELEMETRY_HOURLY_RATE=250.0
+      - GPU_HOURLY_COST=0.90
     deploy:
       replicas: 3
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
       interval: 30s
       timeout: 10s
       retries: 3
     depends_on:
       standalone:
         condition: service_healthy
-      inference-api:
+      haproxy:
         condition: service_healthy
       redis:
         condition: service_healthy
       minio:
-        condition: service_healthy
-    networks:
-      - internal
-
-  # Flaw #3 Fix: Nginx reverse proxy for load balancing across medi-api replicas
-  nginx:
-    image: nginx:alpine
-    container_name: medi-chain-nginx
-    ports:
-      - "8000:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      medi-api:
         condition: service_healthy
     networks:
       - internal
@@ -182,12 +245,23 @@ services:
       - MINIO_ENDPOINT=minio:9000
       - S3_ACCESS_KEY=${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set in .env}
       - S3_SECRET_KEY=${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set in .env}
-      - INFERENCE_API_URL=http://inference-api:8001
+      - INFERENCE_API_URL=http://haproxy:8001
       - RUN_BACKGROUND_WORKERS_IN_API=false
+      - CLINICAL_THRESHOLDS_VALIDATED=false
+      - SEMAPHORE_LEASE_TTL_SECONDS=30
+      - DRIFT_KEY_TTL_SECONDS=86400
+      - DRIFT_MIN_CASES=50
+      - DRIFT_AGREEMENT_THRESHOLD=0.95
+      - SECURITY_DLQ_ENCRYPTION_KEY=${SECURITY_DLQ_ENCRYPTION_KEY:?SECURITY_DLQ_ENCRYPTION_KEY must be set in .env}
+      - SECURITY_DICOM_ENCRYPTION_KEY=${SECURITY_DICOM_ENCRYPTION_KEY:?SECURITY_DICOM_ENCRYPTION_KEY must be set in .env}
+      - STORAGE_MODE=s3
+      - STORAGE_MINIO_ENDPOINT=minio:9000
+      - STORAGE_MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set in .env}
+      - STORAGE_MINIO_SECRET_KEY=${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set in .env}
     depends_on:
       standalone:
         condition: service_healthy
-      inference-api:
+      haproxy:
         condition: service_healthy
       redis:
         condition: service_healthy

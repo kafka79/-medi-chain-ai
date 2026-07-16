@@ -11,11 +11,12 @@ import uuid
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 import re
+from dataclasses import dataclass, asdict
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, BackgroundTasks, Security, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import APIKeyHeader, SecurityScopes
 import secrets
 from filelock import FileLock
@@ -24,19 +25,27 @@ import contextvars
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from pydantic import BaseModel, Field, field_validator
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+from src.config.settings import (
+    validate_production_config, dump_all_configs,
+    get_clinical_thresholds, get_inference_config, get_semaphore_config,
+    get_drift_config, get_redis_config, get_storage_config,
+    get_api_config, get_security_config, get_app_settings
+)
 from src.agent.clinical_graph import ClinicalAgent
 from src.data.pdf_parser import ClinicalPDFParser
 from src.data.privacy_scrubber import PrivacyScrubber
-from src.data.fhir_formatter import EHRGateway
+from src.data.fhir_formatter import EHRGateway, MockEHRGateway
 from src.rag.evaluator import RAGEvaluator
-from src.utils.storage import S3StorageProvider
+from src.utils.storage import S3StorageProvider, LocalStorageProvider
 from src.monitoring.drift_detector import DriftDetector
 from src.utils.feedback_logger import FeedbackLogger
-from pydantic import BaseModel, Field, field_validator
+from src.utils.secrets_manager import SecretsManager
+from src.utils.security import encrypt_payload, decrypt_payload
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import Response
 
@@ -62,6 +71,16 @@ PROM_SIGN_OFF_TIME = _get_or_create_histogram(
     "Radiologist sign-off time in seconds.",
     buckets=(10, 30, 45, 60, 120, 180, 300, 600, 1200, 3600)
 )
+PROM_PROCESSING_TIME = _get_or_create_histogram(
+    "medi_chain_processing_duration_seconds",
+    "Processing time of the /analyze endpoint in seconds.",
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 30, 60)
+)
+PROM_GPU_HEALTH = _get_or_create_histogram(
+    "medi_chain_gpu_health",
+    "GPU health metrics",
+    buckets=(0, 1, 2, 3, 4, 5)
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -71,7 +90,6 @@ audit_logger.setLevel(logging.INFO)
 
 
 def _configure_audit_logger():
-    """Configure container-native stdout audit logging, falling back to local file if explicitly requested."""
     audit_logger.handlers = []
     audit_logger.propagate = False
     
@@ -121,7 +139,6 @@ def save_heatmap_from_base64(heatmap_base64: str, job_id: str) -> Optional[str]:
         import io
         from pathlib import Path
         
-        # Decode base64 image
         if "," in heatmap_base64:
             header, data = heatmap_base64.split(",", 1)
         else:
@@ -134,7 +151,6 @@ def save_heatmap_from_base64(heatmap_base64: str, job_id: str) -> Optional[str]:
             logger.info(f"Saved heatmap PNG to S3: {relative_path}")
             return relative_path
         else:
-            # Save to outputs/heatmaps/
             output_dir = Path("outputs/heatmaps")
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / f"{job_id}.png"
@@ -149,33 +165,75 @@ def save_heatmap_from_base64(heatmap_base64: str, job_id: str) -> Optional[str]:
 
 _configure_audit_logger()
 
-# Flaw #2 Fix: Fail fast if API_KEY is not set in production
-_api_key = os.getenv("API_KEY")
-if not _api_key and os.getenv("TESTING") != "true" and os.getenv("STORAGE_MODE") != "local":
+# Load unified configuration
+clinical_config = get_clinical_thresholds()
+inference_config = get_inference_config()
+semaphore_config = get_semaphore_config()
+drift_config = get_drift_config()
+redis_config = get_redis_config()
+storage_config = get_storage_config()
+api_config = get_api_config()
+security_config = get_security_config()
+app_settings = get_app_settings()
+
+# Validate production config
+errors = validate_production_config()
+if errors:
+    for err in errors:
+        logger.critical(f"CONFIG ERROR: {err}")
+    if not app_settings.testing and app_settings.storage_mode != "local":
+        raise RuntimeError("Production config validation failed: " + "; ".join(errors))
+
+# Extract commonly used settings
+TESTING = app_settings.testing
+STORAGE_MODE = app_settings.storage_mode
+MODEL_CHECKPOINT = app_settings.model_checkpoint
+APP_VERSION = api_config.version
+MAX_CONCURRENT_REQUESTS = api_config.max_concurrent_requests
+EHR_GATEWAY_URL = app_settings.ehr_gateway_url
+DRIFT_ALERT_WEBHOOK_URL = drift_config.alert_webhook_url
+DLQ_DIR = app_settings.dlq_dir
+DRIFT_CACHE_DIR = app_settings.drift_cache_dir
+
+# API Key validation (fail-fast in production)
+_api_key = SecretsManager.get_secret("API_KEY")
+if not _api_key and not TESTING and STORAGE_MODE != "local":
     raise RuntimeError(
         "CRITICAL: API_KEY environment variable is not set. "
         "Refusing to start with default credentials in a production-like environment. "
         "Set API_KEY in your .env file."
     )
 
-# Security Fail-Fast: Fail fast if DLQ_ENCRYPTION_KEY is not set in production
-_dlq_encryption_key = os.getenv("DLQ_ENCRYPTION_KEY")
-if not _dlq_encryption_key and os.getenv("TESTING") != "true" and os.getenv("STORAGE_MODE") != "local":
+# DLQ Encryption Key validation
+_dlq_encryption_key = security_config.dlq_encryption_key
+if not _dlq_encryption_key and not TESTING and STORAGE_MODE != "local":
     raise RuntimeError(
-        "CRITICAL: DLQ_ENCRYPTION_KEY environment variable is not set. "
+        "CRITICAL: SECURITY_DLQ_ENCRYPTION_KEY environment variable is not set. "
         "Refusing to start with default key fallback in a production-like environment. "
-        "Set DLQ_ENCRYPTION_KEY in your .env file."
+        "Set SECURITY_DLQ_ENCRYPTION_KEY in your .env file."
     )
 
-# Check if Redis is actually responsive before using it for rate limiting
-redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+# DICOM Encryption Key validation (separate from DLQ)
+_dicom_encryption_key = security_config.dicom_encryption_key
+if not _dicom_encryption_key and not TESTING and STORAGE_MODE != "local":
+    raise RuntimeError(
+        "CRITICAL: SECURITY_DICOM_ENCRYPTION_KEY environment variable is not set. "
+        "Set SECURITY_DICOM_ENCRYPTION_KEY in your .env file."
+    )
+
+# Internal API Key validation
+_internal_api_key = security_config.internal_api_key or app_settings.internal_api_key
+if not _internal_api_key and not TESTING:
+    raise RuntimeError("INTERNAL_API_KEY environment variable is required.")
+
+# Redis connection with HA support
+redis_url = redis_config.url
 use_redis = False
 redis_client = None
-is_production = os.getenv("TESTING") != "true" and os.getenv("STORAGE_MODE") != "local"
+is_production = not TESTING and STORAGE_MODE != "local"
 
-# Support Redis Sentinel or Redis Cluster for High Availability (removes SPOF)
-sentinel_hosts_str = os.getenv("REDIS_SENTINEL_HOSTS", "")
-cluster_nodes_str = os.getenv("REDIS_CLUSTER_NODES", "")
+sentinel_hosts_str = redis_config.sentinel_hosts
+cluster_nodes_str = redis_config.cluster_nodes
 
 if sentinel_hosts_str or cluster_nodes_str or redis_url.startswith("redis://") or redis_url.startswith("rediss://"):
     try:
@@ -189,9 +247,9 @@ if sentinel_hosts_str or cluster_nodes_str or redis_url.startswith("redis://") o
                     sentinels.append((host, int(port)))
                 else:
                     sentinels.append((s, 26379))
-            service_name = os.getenv("REDIS_SENTINEL_SERVICE_NAME", "mymaster")
-            sentinel_client = Sentinel(sentinels, socket_connect_timeout=1, decode_responses=True)
-            redis_client = sentinel_client.master_for(service_name, socket_connect_timeout=1, decode_responses=True)
+            service_name = redis_config.sentinel_service_name
+            sentinel_client = Sentinel(sentinels, socket_connect_timeout=redis_config.socket_connect_timeout, decode_responses=True)
+            redis_client = sentinel_client.master_for(service_name, socket_connect_timeout=redis_config.socket_connect_timeout, decode_responses=True)
             logger.info("Successfully configured Redis Sentinel for High Availability.")
         elif cluster_nodes_str:
             from redis.cluster import RedisCluster, ClusterNode
@@ -202,10 +260,10 @@ if sentinel_hosts_str or cluster_nodes_str or redis_url.startswith("redis://") o
                     nodes.append(ClusterNode(host, int(port)))
                 else:
                     nodes.append(ClusterNode(node, 6379))
-            redis_client = RedisCluster(startup_nodes=nodes, socket_connect_timeout=1, decode_responses=True)
+            redis_client = RedisCluster(startup_nodes=nodes, socket_connect_timeout=redis_config.socket_connect_timeout, decode_responses=True)
             logger.info("Successfully configured Redis Cluster for High Availability.")
         else:
-            redis_client = redis.from_url(redis_url, socket_connect_timeout=1)
+            redis_client = redis.from_url(redis_url, socket_connect_timeout=redis_config.socket_connect_timeout)
             
         redis_client.ping()
         use_redis = True
@@ -228,21 +286,20 @@ if not use_redis:
 limiter = Limiter(
     key_func=get_remote_address,
     storage_uri=redis_url,
-    enabled=os.getenv("TESTING") != "true",
+    enabled=not TESTING,
 )
 
-# Global dependencies (Ready for DI)
+# Global dependencies
 TEMP_ROOT = Path("temp/storage")
 
-# Initialize storage provider: fail fast on MinIO connection failures in production-like environments
-storage_mode = os.getenv("STORAGE_MODE", "s3")
-if storage_mode == "local" or os.getenv("TESTING") == "true":
-    from src.utils.storage import LocalStorageProvider
+# Initialize storage provider
+storage_mode = STORAGE_MODE
+if storage_mode == "local" or TESTING:
     storage = LocalStorageProvider()
     logger.info("Using Local Storage Provider for testing/local development.")
 else:
     try:
-        s3_storage = S3StorageProvider(endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"))
+        s3_storage = S3StorageProvider(endpoint=storage_config.minio_endpoint)
         if s3_storage.client is not None:
             storage = s3_storage
             logger.info("Using S3/MinIO Storage Provider.")
@@ -253,12 +310,19 @@ else:
         raise RuntimeError(f"S3 storage initialization failed: {e}")
 
 drift_detector = DriftDetector()
-ehr_gateway = EHRGateway()
+
+if "mock-ehr-gateway.internal" in EHR_GATEWAY_URL:
+    ehr_gateway = MockEHRGateway(endpoint_url=EHR_GATEWAY_URL)
+else:
+    ehr_gateway = EHRGateway(endpoint_url=EHR_GATEWAY_URL)
+
 feedback_logger = FeedbackLogger(redis_client=redis_client, storage_provider=storage)
 gateway_scrubber = PrivacyScrubber()
 gateway_pdf_parser = ClinicalPDFParser()
+
 SEMAPHORE_WAITERS = {}
 SEMAPHORE_LISTENER_TASKS = {}
+
 
 async def _start_semaphore_listener(r_client, semaphore_name: str):
     """Background task to listen for semaphore release events in Redis and notify local waiters."""
@@ -269,7 +333,6 @@ async def _start_semaphore_listener(r_client, semaphore_name: str):
         
         loop = asyncio.get_running_loop()
         while True:
-            # Read message from pubsub using run_in_executor to avoid blocking the event loop
             message = await loop.run_in_executor(
                 None,
                 lambda: pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
@@ -285,7 +348,6 @@ async def _start_semaphore_listener(r_client, semaphore_name: str):
         pass
     except Exception as e:
         logger.error(f"Error in semaphore listener for {semaphore_name}: {e}")
-        # Wake up all waiters immediately to fail-fast during Redis connection drop
         waiters = SEMAPHORE_WAITERS.get(semaphore_name, [])
         SEMAPHORE_WAITERS[semaphore_name] = []
         for event in waiters:
@@ -299,13 +361,10 @@ async def _start_semaphore_listener(r_client, semaphore_name: str):
             pass
         SEMAPHORE_LISTENER_TASKS.pop(semaphore_name, None)
 
+
 class RedisDistributedSemaphore:
-    """Distributed semaphore backed by Redis sorted-set leases.
+    """Distributed semaphore backed by Redis sorted-set leases with proper lease TTL management."""
     
-    ponytail: Uses a clean exponential-backoff spinlock to avoid BLPOP list leakage
-    and falls back to process-local asyncio.Semaphore when Redis is down, avoiding
-    misleading FileLock setups that fail across container replicas.
-    """
     def __init__(self, r_client, name: str, limit: int):
         self.orig_redis = r_client
         self.redis = r_client
@@ -313,36 +372,48 @@ class RedisDistributedSemaphore:
         self.limit = limit
         self.local_sem = asyncio.Semaphore(limit)
         
-        fallback_limit = int(os.getenv("MAX_CONCURRENT_REQUESTS_FALLBACK", str(limit)))
+        expected_replicas = int(os.getenv("EXPECTED_NUM_REPLICAS", "5"))
+        safe_fallback = max(1, limit // expected_replicas)
+        fallback_limit = int(os.getenv("MAX_CONCURRENT_REQUESTS_FALLBACK", str(safe_fallback)))
         self.fallback_sem = asyncio.Semaphore(fallback_limit)
         
         self.client_id_var = contextvars.ContextVar(f"sem_client_id_{name}", default=None)
         self.refresher_task = None
         self.last_reconnect_attempt = 0
+        self.lease_ttl = semaphore_config.lease_ttl_seconds
+        self.refresh_interval = max(1, self.lease_ttl // 3)
+        self.reconnect_cooldown = semaphore_config.reconnect_cooldown_seconds
+        self.max_refresh_retries = semaphore_config.max_lease_refresh_retries
 
     async def _refresh_lease_loop(self, client_id: str):
-        lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "10"))
-        refresh_interval = max(1, lease_ttl // 3)
         try:
             while True:
-                await asyncio.sleep(refresh_interval)
+                await asyncio.sleep(self.refresh_interval)
                 if self.redis is not None:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        None,
-                        lambda: self.redis.zadd(self.name, {client_id: time.time()})
-                    )
+                    for attempt in range(self.max_refresh_retries):
+                        try:
+                            await loop.run_in_executor(
+                                None,
+                                lambda: self.redis.zadd(self.name, {client_id: time.time()})
+                            )
+                            break
+                        except Exception as e:
+                            if attempt == self.max_refresh_retries - 1:
+                                logger.warning(f"Failed to refresh lease after {self.max_refresh_retries} attempts: {e}")
+                                self.redis = None
+                            else:
+                                await asyncio.sleep(0.5 * (attempt + 1))
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.warning(f"Failed to refresh lease: {e}")
+            logger.warning(f"Lease refresh loop error: {e}")
 
     async def __aenter__(self):
-        # Self-healing check: if redis is offline but original client exists, try to reconnect
+        # Self-healing check
         if self.redis is None and self.orig_redis is not None:
             now = time.time()
-            cooldown = float(os.getenv("REDIS_RECONNECT_COOLDOWN", "30.0"))
-            if now - self.last_reconnect_attempt > cooldown:
+            if now - self.last_reconnect_attempt > self.reconnect_cooldown:
                 self.last_reconnect_attempt = now
                 try:
                     loop = asyncio.get_running_loop()
@@ -360,15 +431,11 @@ class RedisDistributedSemaphore:
         client_id = uuid.uuid4().hex
         self.client_id_var.set(client_id)
         
-        lease_ttl = int(os.getenv("SEMAPHORE_LEASE_TTL", "10"))
-        loop = asyncio.get_running_loop()
-        
-        # Start global pub/sub listener task for this semaphore if not already running
         if self.name not in SEMAPHORE_LISTENER_TASKS:
             task = asyncio.create_task(_start_semaphore_listener(self.redis, self.name))
             SEMAPHORE_LISTENER_TASKS[self.name] = task
             
-        acquire_script = """
+        acquire_script = f"""
         local leases_key = KEYS[1]
         local limit = tonumber(ARGV[1])
         local now = tonumber(ARGV[2])
@@ -383,17 +450,18 @@ class RedisDistributedSemaphore:
         return 0
         """
         
+        loop = asyncio.get_running_loop()
         while True:
             try:
                 now = time.time()
                 res = await loop.run_in_executor(
                     None,
-                    lambda: self.redis.eval(acquire_script, 1, self.name, self.limit, now, lease_ttl, client_id)
+                    lambda: self.redis.eval(acquire_script, 1, self.name, self.limit, now, self.lease_ttl, client_id)
                 )
                 if res == 1:
                     break
             except Exception as e:
-                logger.error(f"Redis semaphore failed, degrading to local local_sem fallback: {e}")
+                logger.error(f"Redis semaphore failed, degrading to local fallback: {e}")
                 self.redis = None
                 self.client_id_var.set(None)
                 _send_system_alert(
@@ -404,14 +472,12 @@ class RedisDistributedSemaphore:
                 self.local_sem.release()
                 return self
             
-            # Register local waiter event and wait to be notified by Pub/Sub event
             event = asyncio.Event()
             if self.name not in SEMAPHORE_WAITERS:
                 SEMAPHORE_WAITERS[self.name] = []
             SEMAPHORE_WAITERS[self.name].append(event)
             
             try:
-                # Suspend waiter with a 2.0s safety timeout to catch any missed/dropped events
                 await asyncio.wait_for(event.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 pass
@@ -432,7 +498,6 @@ class RedisDistributedSemaphore:
             if self.redis is not None:
                 try:
                     loop = asyncio.get_running_loop()
-                    # Release lock and publish release event atomically
                     await loop.run_in_executor(
                         None,
                         lambda: self.redis.pipeline()
@@ -447,39 +512,33 @@ class RedisDistributedSemaphore:
             self.fallback_sem.release()
 
 
-MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
+# Global semaphore for model inference with proper lease TTL
+inference_semaphore = RedisDistributedSemaphore(
+    redis_client if use_redis else None, 
+    "inference", 
+    MAX_CONCURRENT_REQUESTS
+)
 
-# Global semaphore for model inference (distributed when Redis is active)
-if use_redis and redis_client:
-    inference_semaphore = RedisDistributedSemaphore(redis_client, "inference", MAX_CONCURRENT_REQUESTS)
-else:
-    inference_semaphore = RedisDistributedSemaphore(None, "inference", MAX_CONCURRENT_REQUESTS)
-
-
-# Flaw #17: Application-level version metadata for audit trail
-APP_VERSION = "1.3.0"
-MODEL_CHECKPOINT = os.getenv("MODEL_CHECKPOINT", "models/fusion_model.pt")
 
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+IDEMPOTENCY_KEY_HEADER = APIKeyHeader(name="X-Idempotency-Key", auto_error=False)
+
 
 async def verify_api_key(security_scopes: SecurityScopes, api_key: str = Security(API_KEY_HEADER)):
     import hashlib
-    # Flaw #2 Fix: No hardcoded default. If env var is missing in dev/test, use a test-only key.
-    expected_key = os.getenv("API_KEY")
+    expected_key = SecretsManager.get_secret("API_KEY")
     if not expected_key:
-        if os.getenv("TESTING") == "true":
+        if TESTING:
             expected_key = "test-key-for-ci"
         else:
             raise HTTPException(status_code=500, detail="Server misconfiguration: API_KEY not set.")
 
     key_scopes_map = {}
     if expected_key:
-        # Hashed expected key to avoid memory plaintext comparisons
         h_expected = hashlib.sha256(expected_key.encode("utf-8")).hexdigest()
         key_scopes_map[h_expected] = ["cases:write", "cases:read", "metrics:read", "feedback:write", "feedback:read"]
 
-    # Load dynamic hashed keys config if present
-    config_json = os.getenv("API_KEYS_CONFIG")
+    config_json = security_config.api_keys_config
     if config_json:
         try:
             config = json.loads(config_json)
@@ -491,7 +550,6 @@ async def verify_api_key(security_scopes: SecurityScopes, api_key: str = Securit
     if not api_key:
         raise HTTPException(status_code=401, detail="X-API-Key header is missing")
 
-    # Hash incoming key
     h_incoming = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
     if h_incoming not in key_scopes_map:
         raise HTTPException(status_code=403, detail="Invalid API Key")
@@ -504,6 +562,7 @@ async def verify_api_key(security_scopes: SecurityScopes, api_key: str = Securit
                 detail=f"Not enough permissions. Required scope: {scope}"
             )
     return api_key
+
 
 def build_agent() -> ClinicalAgent:
     logger.info("Initializing ClinicalAgent with remote inference API...")
@@ -519,19 +578,16 @@ def build_agent() -> ClinicalAgent:
         inference_api_url=os.getenv("INFERENCE_API_URL", "http://inference-api:8001")
     )
 
-# Flaw #11 Fix: Circuit breaker — alert after consecutive failures, but don't terminate loop
+
 MAX_CLEANUP_FAILURES = 5
 
 async def cleanup_old_temp_files():
-    """Background task to clean up storage older than 1 hour.
-    Implements exponential backoff on consecutive failures to prevent permanent shutdown
-    if the remote storage (e.g. MinIO) is transiently unavailable."""
+    """Background task to clean up storage older than configured max age.
+    Implements exponential backoff on consecutive failures."""
     consecutive_failures = 0
-    base_sleep = 600
-    cleanup_file_lock = None
+    base_sleep = storage_config.cleanup_max_age_seconds
     while True:
         run_cleanup = True
-        file_lock_acquired = False
         if use_redis and redis_client:
             try:
                 loop = asyncio.get_running_loop()
@@ -546,19 +602,16 @@ async def cleanup_old_temp_files():
                 logger.critical(f"Failed to acquire Redis cleanup lock: {e}. Skipping cleanup task as fallback to avoid concurrent write races on shared volumes.")
                 run_cleanup = False
         else:
-            # Fallback to local execution without FileLock: stagger executions
-            # across replicas using randomized jitter to prevent write races on S3/MinIO
             run_cleanup = True
             logger.info("Redis is down. Running staggered temp file cleanup without distributed lock.")
         
         if run_cleanup:
             try:
-                await asyncio.to_thread(storage.cleanup, max_age_seconds=3600)
-                consecutive_failures = 0  # Reset on success
+                await asyncio.to_thread(storage.cleanup, max_age_seconds=storage_config.cleanup_max_age_seconds)
+                consecutive_failures = 0
                 sleep_time = base_sleep
             except Exception as e:
                 consecutive_failures += 1
-                # Exponential backoff: 600s, 1200s, 2400s, maxing out at 3600s (1 hour)
                 sleep_time = min(base_sleep * (2 ** (consecutive_failures - 1)), 3600)
                 logger.error(f"Error in cleanup task ({consecutive_failures} consecutive failures). Retrying in {sleep_time} seconds: {e}")
                 if consecutive_failures >= MAX_CLEANUP_FAILURES:
@@ -570,17 +623,17 @@ async def cleanup_old_temp_files():
             sleep_time = base_sleep
             
         import random
-        # Stagger executions across replicas by adding a random jitter of up to 60 seconds
-        is_testing = os.getenv("TESTING") == "true"
+        is_testing = TESTING
         actual_sleep = sleep_time + (random.randint(0, 60) if not (use_redis and redis_client) and not is_testing else 0)
         await asyncio.sleep(actual_sleep)
+
 
 import concurrent.futures
 _alert_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="system-alert-sender")
 
 def _send_system_alert_sync(title: str, message: str):
     logger.critical(f"CRITICAL SYSTEM ALERT: {title} — {message}")
-    webhook_url = os.getenv("DRIFT_ALERT_WEBHOOK_URL", "")
+    webhook_url = DRIFT_ALERT_WEBHOOK_URL
     if webhook_url:
         try:
             import requests
@@ -592,19 +645,15 @@ def _send_system_alert_sync(title: str, message: str):
             logger.error(f"Failed to send connection alert webhook: {e}")
 
 def _send_system_alert(title: str, message: str):
-    """Flaw #2 Fix: Send system alert asynchronously via a thread pool to avoid blocking execution."""
     _alert_executor.submit(_send_system_alert_sync, title, message)
 
 
 async def reconcile_dlq_task():
-    """Background task that polls the Redis DLQ 'medi_chain:dlq' and the local disk folder 'temp/dlq'
-    and retries pushes to the EHR. Resolves Flaws #4 and #5 by supporting both Redis and local disk DLQs,
-    and running up to 5 concurrent pushes using asyncio task scheduling and semaphores."""
+    """Background task that polls the Redis DLQ and local disk DLQ and retries pushes to the EHR."""
     
     r = None
     if use_redis:
         import redis
-        redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
         try:
             r = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=2)
             logger.info("[DLQ Reconciler] Connected to Redis for DLQ reconciliation.")
@@ -617,147 +666,136 @@ async def reconcile_dlq_task():
     loop = asyncio.get_running_loop()
     active_tasks = set()
     
+    # Rate limiter for EHR pushes to prevent thundering herd
+    ehr_rate_limiter = asyncio.Semaphore(3)
+    
     async def process_reconciliation(item: dict, source_type: str, identifier: Optional[str], item_raw_json: Optional[str] = None):
-        try:
-            payload = item.get("payload")
-            if not payload:
-                if source_type == "redis" and r and item_raw_json:
-                    await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
-                return
-            
-            if not isinstance(payload, str):
-                fhir_json = json.dumps(payload)
-            else:
-                fhir_json = payload
-                
-            logger.info(f"[DLQ Reconciler] Attempting to reconcile report from {source_type}...")
-            
-            # Pass is_retry=True to avoid duplicate DLQ writes inside push_report
-            success = await ehr_gateway.push_report(fhir_json, True)
-            
-            if success:
-                logger.info(f"[DLQ Reconciler] Successfully reconciled report from {source_type}.")
-                if source_type == "local" and identifier:
-                    try:
-                        file_path = Path(identifier)
-                        if file_path.exists():
-                            file_path.unlink()
-                    except Exception as e:
-                        logger.error(f"[DLQ Reconciler] Failed to delete resolved local DLQ file {identifier}: {e}")
-                elif source_type == "redis" and r and item_raw_json:
-                    try:
+        async with ehr_rate_limiter:
+            try:
+                payload = item.get("payload")
+                if not payload:
+                    if source_type == "redis" and r and item_raw_json:
                         await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
-                    except Exception as e:
-                        logger.error(f"[DLQ Reconciler] Failed to remove processed item from Redis processing queue: {e}")
-            else:
-                retry_count = item.get("retry_count", 0) + 1
-                item["retry_count"] = retry_count
+                    return
                 
-                if retry_count >= 3:
-                    logger.critical(f"[DLQ Reconciler] Report push failed {retry_count} times. Routing to POISON DLQ.")
+                if not isinstance(payload, str):
+                    fhir_json = json.dumps(payload)
+                else:
+                    fhir_json = payload
                     
-                    # Escalation path 1: save locally under temp/dlq/poison/
-                    try:
-                        dlq_base = os.getenv("DLQ_DIR", "temp/dlq")
-                        poison_dir = Path(dlq_base) / "poison"
-                        poison_dir.mkdir(parents=True, exist_ok=True)
-                        filename = f"poison_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
-                        local_path = poison_dir / filename
-                        from src.utils.security import encrypt_payload
-                        payload_json = json.dumps(item, indent=2)
-                        encrypted_payload = encrypt_payload(payload_json)
-                        wrapper = {
-                            "encrypted": True,
-                            "data": encrypted_payload
-                        }
-                        with open(local_path, "w") as f:
-                            json.dump(wrapper, f, indent=2)
-                        logger.info(f"[DLQ Reconciler] Saved poison report locally to {local_path}")
-                    except Exception as local_err:
-                        logger.error(f"[DLQ Reconciler] Failed to save poison report locally: {local_err}")
-                    
-                    # Escalation path 2: push to Redis poison DLQ if Redis is enabled
-                    if use_redis and r:
-                        try:
-                            await loop.run_in_executor(None, r.rpush, "medi_chain:dlq:poison", json.dumps(item))
-                            if item_raw_json:
-                                await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
-                        except Exception as redis_err:
-                            logger.error(f"[DLQ Reconciler] Failed to push to Redis poison DLQ: {redis_err}")
-                    
-                    # Escalation path 3: Delete local file if it was a local item
+                logger.info(f"[DLQ Reconciler] Attempting to reconcile report from {source_type}...")
+                
+                success = await ehr_gateway.push_report(fhir_json, True)
+                
+                if success:
+                    logger.info(f"[DLQ Reconciler] Successfully reconciled report from {source_type}.")
                     if source_type == "local" and identifier:
                         try:
                             file_path = Path(identifier)
                             if file_path.exists():
                                 file_path.unlink()
                         except Exception as e:
-                            logger.error(f"[DLQ Reconciler] Failed to delete poisoned local DLQ file {identifier}: {e}")
-                    
-                    _send_system_alert(
-                        "DLQ Poison Threshold Exceeded",
-                        f"Report push failed {retry_count} times and has been escalated to poison DLQ. Error: {item.get('error')}"
-                    )
+                            logger.error(f"[DLQ Reconciler] Failed to delete resolved local DLQ file {identifier}: {e}")
+                    elif source_type == "redis" and r and item_raw_json:
+                        try:
+                            await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
+                        except Exception as e:
+                            logger.error(f"[DLQ Reconciler] Failed to remove processed item from Redis processing queue: {e}")
                 else:
-                    if source_type == "redis" and r:
-                        logger.warning(f"[DLQ Reconciler] Re-push failed. Pushing payload back to the tail of the Redis DLQ (Retry count: {retry_count}).")
+                    retry_count = item.get("retry_count", 0) + 1
+                    item["retry_count"] = retry_count
+                    
+                    if retry_count >= 3:
+                        logger.critical(f"[DLQ Reconciler] Report push failed {retry_count} times. Routing to POISON DLQ.")
+                        
+                        # Escalation path 1: save locally under temp/dlq/poison/
                         try:
-                            await loop.run_in_executor(None, r.rpush, "medi_chain:dlq", json.dumps(item))
-                            if item_raw_json:
-                                await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
-                        except Exception as redis_err:
-                            logger.error(f"[DLQ Reconciler] Failed to re-queue back to Redis DLQ: {redis_err}")
-                    elif source_type == "local" and identifier:
-                        logger.warning(f"[DLQ Reconciler] Local re-push failed. Saving updated retry count to local file {identifier}.")
-                        try:
-                            import tempfile
-                            import shutil
-                            from src.utils.security import encrypt_payload
-                            
+                            poison_dir = Path(DLQ_DIR) / "poison"
+                            poison_dir.mkdir(parents=True, exist_ok=True)
+                            filename = f"poison_report_{int(time.time())}_{uuid.uuid4().hex[:6]}.json"
+                            local_path = poison_dir / filename
                             payload_json = json.dumps(item, indent=2)
                             encrypted_payload = encrypt_payload(payload_json)
-                            wrapper = {
-                                "encrypted": True,
-                                "data": encrypted_payload
-                            }
-                            wrapper_json = json.dumps(wrapper, indent=2)
-                            
-                            target_path = Path(identifier).with_suffix(".json")
-                            dlq_dir = target_path.parent
-                            
-                            # Validate disk space before writing
-                            total, used, free = shutil.disk_usage(dlq_dir)
-                            if free < 50 * 1024 * 1024:
-                                raise RuntimeError("Critically low disk space on local partition")
-                                
-                            fd, tmp_path = tempfile.mkstemp(dir=str(dlq_dir), suffix=".tmp")
-                            try:
-                                with os.fdopen(fd, "w") as f:
-                                    f.write(wrapper_json)
-                                    f.flush()
-                                    os.fsync(f.fileno())
-                                os.replace(tmp_path, str(target_path))
-                            except Exception:
-                                if os.path.exists(tmp_path):
-                                    os.remove(tmp_path)
-                                raise
-                                
-                            # Safely delete processing file only after new .json file is durable
-                            Path(identifier).unlink(missing_ok=True)
-                            logger.info(f"[DLQ Reconciler] Successfully saved updated retry count to local DLQ file {target_path.name}")
+                            wrapper = {"encrypted": True, "data": encrypted_payload}
+                            with open(local_path, "w") as f:
+                                json.dump(wrapper, f, indent=2)
+                            logger.info(f"[DLQ Reconciler] Saved poison report locally to {local_path}")
                         except Exception as local_err:
-                            logger.error(f"[DLQ Reconciler] Failed to write updated local DLQ retry count: {local_err}")
-        except Exception as err:
-            logger.error(f"[DLQ Reconciler] Error processing DLQ item: {err}")
-        finally:
-            dlq_semaphore.release()
+                            logger.error(f"[DLQ Reconciler] Failed to save poison report locally: {local_err}")
+                        
+                        # Escalation path 2: push to Redis poison DLQ if Redis is enabled
+                        if use_redis and r:
+                            try:
+                                await loop.run_in_executor(None, r.rpush, "medi_chain:dlq:poison", json.dumps(item))
+                                if item_raw_json:
+                                    await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
+                            except Exception as redis_err:
+                                logger.error(f"[DLQ Reconciler] Failed to push to Redis poison DLQ: {redis_err}")
+                        
+                        # Escalation path 3: Delete local file if it was a local item
+                        if source_type == "local" and identifier:
+                            try:
+                                file_path = Path(identifier)
+                                if file_path.exists():
+                                    file_path.unlink()
+                            except Exception as e:
+                                logger.error(f"[DLQ Reconciler] Failed to delete poisoned local DLQ file {identifier}: {e}")
+                        
+                        _send_system_alert(
+                            "DLQ Poison Threshold Exceeded",
+                            f"Report push failed {retry_count} times and has been escalated to poison DLQ. Error: {item.get('error')}"
+                        )
+                    else:
+                        if source_type == "redis" and r:
+                            logger.warning(f"[DLQ Reconciler] Re-push failed. Pushing payload back to the tail of the Redis DLQ (Retry count: {retry_count}).")
+                            try:
+                                await loop.run_in_executor(None, r.rpush, "medi_chain:dlq", json.dumps(item))
+                                if item_raw_json:
+                                    await loop.run_in_executor(None, r.lrem, "medi_chain:dlq:processing", 1, item_raw_json)
+                            except Exception as redis_err:
+                                logger.error(f"[DLQ Reconciler] Failed to re-queue back to Redis DLQ: {redis_err}")
+                        elif source_type == "local" and identifier:
+                            logger.warning(f"[DLQ Reconciler] Local re-push failed. Saving updated retry count to local file {identifier}.")
+                            try:
+                                import tempfile
+                                payload_json = json.dumps(item, indent=2)
+                                encrypted_payload = encrypt_payload(payload_json)
+                                wrapper = {"encrypted": True, "data": encrypted_payload}
+                                wrapper_json = json.dumps(wrapper, indent=2)
+                                
+                                target_path = Path(identifier).with_suffix(".json")
+                                dlq_dir = target_path.parent
+                                
+                                total, used, free = shutil.disk_usage(dlq_dir)
+                                if free < 50 * 1024 * 1024:
+                                    raise RuntimeError("Critically low disk space on local partition")
+                                    
+                                fd, tmp_path = tempfile.mkstemp(dir=str(dlq_dir), suffix=".tmp")
+                                try:
+                                    with os.fdopen(fd, "w") as f:
+                                        f.write(wrapper_json)
+                                        f.flush()
+                                        os.fsync(f.fileno())
+                                    os.replace(tmp_path, str(target_path))
+                                except Exception:
+                                    if os.path.exists(tmp_path):
+                                        os.remove(tmp_path)
+                                    raise
+                                
+                                Path(identifier).unlink(missing_ok=True)
+                                logger.info(f"[DLQ Reconciler] Successfully saved updated retry count to local DLQ file {target_path.name}")
+                            except Exception as local_err:
+                                logger.error(f"[DLQ Reconciler] Failed to write updated local DLQ retry count: {local_err}")
+            except Exception as err:
+                logger.error(f"[DLQ Reconciler] Error processing DLQ item: {err}")
+            finally:
+                dlq_semaphore.release()
             
     while True:
         try:
             run_reconcile = True
             if use_redis and r:
                 try:
-                    # Acquire lock to run DLQ reconciliation loop (lease of 30 seconds)
                     acquired = await loop.run_in_executor(
                         None,
                         lambda: r.set("medi_chain:locks:dlq_reconciler", "locked", ex=30, nx=True)
@@ -771,7 +809,6 @@ async def reconcile_dlq_task():
                 await asyncio.sleep(10)
                 continue
 
-            # Wait until a semaphore slot is available
             await dlq_semaphore.acquire()
             
             item_found = False
@@ -791,11 +828,10 @@ async def reconcile_dlq_task():
                     
             # 2. Try to fetch from local DLQ files if no Redis item was found
             if not item_found:
-                dlq_dir = Path(os.getenv("DLQ_DIR", "temp/dlq"))
+                dlq_dir = Path(DLQ_DIR)
                 if dlq_dir.exists() and dlq_dir.is_dir():
                     try:
                         from itertools import islice
-                        # Limit to 50 files per iteration to avoid globbing thousands of files
                         local_files = [f for f in islice(dlq_dir.glob("failed_report_*.json"), 50)]
                     except Exception as glob_err:
                         logger.error(f"[DLQ Reconciler] Glob error: {glob_err}")
@@ -804,10 +840,8 @@ async def reconcile_dlq_task():
                     for file_path in local_files:
                         processing_path = file_path.with_suffix(".processing")
                         try:
-                            # Atomic rename to claim the file without OS locks
                             file_path.rename(processing_path)
                         except FileNotFoundError:
-                            # Another process/thread claimed it or it was deleted
                             continue
                         except Exception as e:
                             logger.error(f"[DLQ Reconciler] Failed to rename local DLQ file {file_path.name}: {e}")
@@ -817,7 +851,6 @@ async def reconcile_dlq_task():
                             with open(processing_path, "r") as f:
                                 wrapper = json.load(f)
                             if isinstance(wrapper, dict) and wrapper.get("encrypted"):
-                                from src.utils.security import decrypt_payload
                                 decrypted_data = decrypt_payload(wrapper["data"])
                                 item = json.loads(decrypted_data)
                             else:
@@ -830,13 +863,11 @@ async def reconcile_dlq_task():
                         except Exception as e:
                             logger.error(f"[DLQ Reconciler] Failed to read local DLQ file {processing_path.name}: {e}")
                             try:
-                                # Revert rename on failure to read
                                 processing_path.rename(file_path)
                             except Exception:
                                 pass
                                     
             if not item_found:
-                # Release semaphore and sleep if no work
                 dlq_semaphore.release()
                 await asyncio.sleep(10)
         except asyncio.CancelledError:
@@ -851,7 +882,6 @@ async def reconcile_dlq_task():
                     pass
             await asyncio.sleep(10)
 
-    # Await any remaining active tasks to ensure graceful shutdown and test synchronization
     if active_tasks:
         logger.info(f"[DLQ Reconciler] Awaiting {len(active_tasks)} pending reconciliation tasks...")
         await asyncio.gather(*active_tasks, return_exceptions=True)
@@ -859,11 +889,16 @@ async def reconcile_dlq_task():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Log configuration audit on startup
+    logger.info("Configuration audit dump:")
+    audit_config = dump_all_configs()
+    logger.info(json.dumps(audit_config, indent=2, default=str))
+    
     # Eagerly initialize the agent
     app.state.agent = build_agent()
     
     # Conditionally start background tasks
-    run_workers = os.getenv("RUN_BACKGROUND_WORKERS_IN_API", "false").lower() == "true"
+    run_workers = api_config.enable_background_workers
     cleanup_task = None
     dlq_task = None
     
@@ -872,7 +907,7 @@ async def lifespan(app: FastAPI):
         dlq_task = asyncio.create_task(reconcile_dlq_task())
         logger.info("Background cleanup and DLQ tasks started inside the API process.")
     else:
-        logger.info("Background tasks are disabled inside the API process (RUN_BACKGROUND_WORKERS_IN_API=false).")
+        logger.info("Background tasks are disabled inside the API process (API_ENABLE_BACKGROUND_WORKERS=false).")
         
     yield
     
@@ -881,7 +916,7 @@ async def lifespan(app: FastAPI):
     if dlq_task:
         dlq_task.cancel()
         
-    # Flaw #5-structural Fix: Gracefully close the agent's persistent httpx client
+    # Gracefully close the agent's persistent httpx client
     if app.state.agent and hasattr(app.state.agent, 'close'):
         try:
             await app.state.agent.close()
@@ -889,8 +924,16 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Error closing agent HTTP client: {e}")
     app.state.agent = None
 
+
+# In-memory job store (fallback when Redis unavailable)
 _jobs_db = {}
 _jobs_db_lock = asyncio.Lock()
+
+# Idempotency store
+_idempotency_store = {}
+_idempotency_lock = asyncio.Lock()
+IDEMPOTENCY_TTL_SECONDS = 86400  # 24 hours
+
 
 async def _update_job_status(job_id: str, status: str, result: dict = None, error: str = None):
     data = {
@@ -899,11 +942,9 @@ async def _update_job_status(job_id: str, status: str, result: dict = None, erro
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     if result is not None:
-        # Deep copy to avoid mutating the original payload returned over HTTP sync channel
         result_copy = json.loads(json.dumps(result))
         if "dicom_metadata" in result_copy and result_copy["dicom_metadata"] is not None:
             try:
-                from src.utils.security import encrypt_payload
                 plain_str = json.dumps(result_copy["dicom_metadata"])
                 encrypted_str = encrypt_payload(plain_str)
                 result_copy["dicom_metadata"] = {
@@ -918,7 +959,6 @@ async def _update_job_status(job_id: str, status: str, result: dict = None, erro
         
     if use_redis and redis_client:
         try:
-            # We wrap the synchronous Redis set in asyncio.to_thread to avoid blocking the event loop
             await asyncio.to_thread(redis_client.set, f"medi_chain:jobs:{job_id}", json.dumps(data), ex=86400)
         except Exception as e:
             logger.error(f"Failed to update job {job_id} in Redis: {e}")
@@ -926,18 +966,44 @@ async def _update_job_status(job_id: str, status: str, result: dict = None, erro
     async with _jobs_db_lock:
         _jobs_db[job_id] = data
 
+
+async def _check_idempotency(idempotency_key: str) -> Optional[dict]:
+    """Check if idempotency key exists and return cached result."""
+    async with _idempotency_lock:
+        if idempotency_key in _idempotency_store:
+            entry = _idempotency_store[idempotency_key]
+            if time.time() - entry["timestamp"] < IDEMPOTENCY_TTL_SECONDS:
+                return entry["result"]
+            else:
+                del _idempotency_store[idempotency_key]
+    return None
+
+
+async def _store_idempotency(idempotency_key: str, result: dict):
+    """Store result for idempotency key."""
+    async with _idempotency_lock:
+        _idempotency_store[idempotency_key] = {
+            "result": result,
+            "timestamp": time.time()
+        }
+
+
 async def process_analyze_job(
     job_id: str,
     local_img_path: str,
     local_pdf_path: str,
     request_temp_dir: str,
     agent: ClinicalAgent,
-    dicom_metadata: Optional[dict] = None
+    dicom_metadata: Optional[dict] = None,
+    idempotency_key: Optional[str] = None
 ):
     await _update_job_status(job_id, "running")
     try:
+        start_t = time.time()
         async with inference_semaphore:
-            result = await agent.run(local_img_path, local_pdf_path)
+            result = await agent.run(local_img_path, local_pdf_path, idempotency_key=idempotency_key)
+        processing_time = time.time() - start_t
+        PROM_PROCESSING_TIME.observe(processing_time)
             
         await drift_detector.add_prediction(
             result['diagnosis']['probabilities'],
@@ -954,18 +1020,20 @@ async def process_analyze_job(
                 pipeline.incr("medi_chain:telemetry:total_cases")
                 if escalation:
                     pipeline.incr("medi_chain:telemetry:escalated_cases")
+                    pipeline.zadd("medi_chain:review_queue", {job_id: time.time()})
                 await asyncio.to_thread(pipeline.execute)
             except Exception as telemetry_err:
                 logger.error(f"Failed to update escalation telemetry: {telemetry_err}")
                 
         # Save heatmap persistently
-        save_heatmap_from_base64(result.get("heatmap_base64", ""), job_id)
+        heatmap_path = save_heatmap_from_base64(result.get("heatmap_base64", ""), job_id)
+        heatmap_url = storage.get_download_url(heatmap_path) if heatmap_path else ""
 
         response_payload = {
             "request_id": job_id,
             "diagnosis": result.get("diagnosis", {}),
             "confidence": result.get("confidence", 0.0),
-            "heatmap_base64": result.get("heatmap_base64", ""),
+            "heatmap_url": heatmap_url,
             "pubmed_citations": result.get("pubmed_citations", []),
             "escalation_required": escalation,
             "iteration_count": result.get("iteration_count", 0),
@@ -973,11 +1041,14 @@ async def process_analyze_job(
             "dicom_metadata": dicom_metadata,
         }
         await _update_job_status(job_id, "completed", result=response_payload)
+        
+        # Store for idempotency
+        if idempotency_key:
+            await _store_idempotency(idempotency_key, response_payload)
     except Exception as exc:
         logger.error(f"Async job {job_id} failed: {exc}")
         await _update_job_status(job_id, "failed", error=str(exc))
         
-        # Flaw #4 Fix: Telemetry Resource Accounting Gap - track compute costs of failed runs
         PROM_CASES_PROCESSED.inc() 
         PROM_FAILURES.inc()
         if use_redis and redis_client:
@@ -995,12 +1066,16 @@ async def process_analyze_job(
             except Exception as cleanup_err:
                 logger.error(f"Failed to clean up temporary directory {request_temp_dir}: {cleanup_err}")
 
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="MEdi Chain AI - API", 
         version=APP_VERSION, 
         lifespan=lifespan,
-        description="Enterprise-ready multimodal diagnostic API."
+        description="Enterprise-ready multimodal diagnostic API with clinical validation.",
+        docs_url="/v1/docs",
+        redoc_url="/v1/redoc",
+        openapi_url="/v1/openapi.json",
     )
     app.state.started_at = time.time()
     
@@ -1040,7 +1115,7 @@ def create_app() -> FastAPI:
                 "error_type": error_type,
             })
 
-    @app.post("/analyze")
+    @app.post("/v1/analyze")
     @limiter.limit("10/minute")
     async def analyze_case(
         request: Request,
@@ -1048,6 +1123,7 @@ def create_app() -> FastAPI:
         image: UploadFile = File(...),
         history: UploadFile = File(...),
         sync: bool = False,
+        idempotency_key: Optional[str] = Security(IDEMPOTENCY_KEY_HEADER),
         api_key: str = Security(verify_api_key, scopes=["cases:write"])
     ):
         if image.content_type not in ["image/jpeg", "image/png", "application/dicom"]:
@@ -1061,21 +1137,23 @@ def create_app() -> FastAPI:
         request_id = getattr(request.state, "request_id", uuid.uuid4().hex)
         request_temp_dir = None
 
+        # Check idempotency
+        if idempotency_key:
+            cached_result = await _check_idempotency(idempotency_key)
+            if cached_result:
+                logger.info(f"Returning cached result for idempotency key: {idempotency_key}")
+                return JSONResponse(content=cached_result, headers={"X-Request-ID": request_id})
+
         try:
-            # Ensure the base temp dir exists
             TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-            # Create a request-specific temporary folder in temp/storage
             request_temp_dir = tempfile.mkdtemp(dir=str(TEMP_ROOT))
             
-            # Form clean request-scoped local file paths
-            # Note: since the history is parsed and scrubbed, we write a JSON file to local_pdf_path
             history_filename = Path(history.filename or "history.pdf").name
             history_json_name = Path(history_filename).with_suffix(".json").name
             local_img_path = os.path.join(request_temp_dir, Path(image.filename or "image.jpg").name)
             local_pdf_path = os.path.join(request_temp_dir, history_json_name)
 
-            # Gateway-Level De-identification:
-            # Write uploaded raw files to transient system-level temp files that are immediately scrubbed and deleted
+            # Gateway-Level De-identification
             raw_img_temp = tempfile.NamedTemporaryFile(suffix=Path(image.filename or "image.jpg").suffix, delete=False)
             raw_pdf_temp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
             raw_img_temp_name = raw_img_temp.name
@@ -1084,10 +1162,8 @@ def create_app() -> FastAPI:
             raw_pdf_temp.close()
 
             try:
-                # 1. Save uploaded image to raw temp file
                 with open(raw_img_temp_name, "wb") as f:
                     shutil.copyfileobj(image.file, f)
-                # 2. Save uploaded PDF to raw temp file
                 with open(raw_pdf_temp_name, "wb") as f:
                     shutil.copyfileobj(history.file, f)
 
@@ -1104,101 +1180,58 @@ def create_app() -> FastAPI:
                             "PatientSex": str(getattr(ds, "PatientSex", "")),
                             "StudyInstanceUID": str(getattr(ds, "StudyInstanceUID", "")),
                             "SeriesInstanceUID": str(getattr(ds, "SeriesInstanceUID", "")),
-                            "StudyID": str(getattr(ds, "StudyID", "")),
-                            "AccessionNumber": str(getattr(ds, "AccessionNumber", ""))
                         }
                     except Exception as e:
-                        logger.error(f"Failed to extract DICOM metadata at gateway: {e}")
+                        logger.warning(f"Failed to extract DICOM metadata: {e}")
 
-                # 3. De-identify the image at the gateway level
-                sanitized_img_path = await asyncio.to_thread(gateway_scrubber.mask_burned_in_text, raw_img_temp_name)
-                # Copy sanitized image to request temp dir
-                shutil.copy2(sanitized_img_path, local_img_path)
-                # Clean up sanitized image temp file if a copy was created
-                if sanitized_img_path != raw_img_temp_name and os.path.exists(sanitized_img_path):
-                    try:
-                        os.unlink(sanitized_img_path)
-                    except Exception:
-                        pass
+                # Scrub PHI from raw files
+                scrubbed_img_path = gateway_scrubber.mask_burned_in_text(raw_img_temp_name)
+                scrubbed_pdf_path = gateway_scrubber.scrub_pdf(raw_pdf_temp_name)
 
-                # 4. De-identify and parse the PDF history at the gateway level
-                try:
-                    raw_history = await asyncio.to_thread(gateway_pdf_parser.parse_pdf, raw_pdf_temp_name)
-                    scrubbed_history = await asyncio.to_thread(gateway_scrubber.scrub_history_data, raw_history)
-                except Exception as parse_err:
-                    if os.getenv("TESTING") == "true":
-                        logger.warning(
-                            f"Failed to parse clinical history PDF at gateway ({parse_err}). "
-                            f"Falling back to placeholder history layout for compatibility in testing."
-                        )
-                        # Safe basic layout expected by downstream models
-                        scrubbed_history = {
-                            "chief_complaint": "Not found",
-                            "history_present_illness": "Not found",
-                            "past_medical_history": "Not found",
-                            "social_history": "Not found",
-                            "review_of_systems": "Not found",
-                            "labs": "Not found",
-                            "metadata": {
-                                "age": "Unknown",
-                                "gender": "Unknown",
-                                "occupation": "Unknown",
-                                "exposure_years": "0"
-                            }
-                        }
-                    else:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Failed to parse clinical history PDF: {parse_err}"
-                        )
-                # Save the scrubbed history as a JSON file in the request temp dir
-                with open(local_pdf_path, "w", encoding="utf-8") as f:
-                    json.dump(scrubbed_history, f, indent=4)
+                # Move scrubbed files to request temp dir
+                shutil.move(scrubbed_img_path, local_img_path)
+                shutil.move(scrubbed_pdf_path, local_pdf_path)
+
             finally:
-                # Clean up raw temp files immediately so they never linger
-                if os.path.exists(raw_img_temp_name):
+                # Always clean up raw temp files
+                for tmp_path in [raw_img_temp_name, raw_pdf_temp_name]:
                     try:
-                        os.unlink(raw_img_temp_name)
-                    except Exception:
-                        pass
-                if os.path.exists(raw_pdf_temp_name):
-                    try:
-                        os.unlink(raw_pdf_temp_name)
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
                     except Exception:
                         pass
 
             if sync:
-                # Synchronous path: execute agent run blocking the endpoint until completion
-                async with inference_semaphore:
-                    result = await agent.run(local_img_path, local_pdf_path)
-                    
-                # Monitor for drift (prediction drift and covariate shift)
-                background_tasks.add_task(drift_detector.add_prediction, result['diagnosis']['probabilities'], result.get('visual_features'))
+                result = await agent.run(local_img_path, local_pdf_path, idempotency_key=idempotency_key)
+                
+                await drift_detector.add_prediction(
+                    result['diagnosis']['probabilities'],
+                    result.get('visual_features')
+                )
                 
                 PROM_CASES_PROCESSED.inc()
                 escalation = result.get('escalation_required', False)
                 if escalation:
                     PROM_ESCALATIONS.inc()
-
-                # Telemetry for escalation rates
                 if use_redis and redis_client:
                     try:
                         pipeline = redis_client.pipeline()
                         pipeline.incr("medi_chain:telemetry:total_cases")
                         if escalation:
                             pipeline.incr("medi_chain:telemetry:escalated_cases")
+                            pipeline.zadd("medi_chain:review_queue", {request_id: time.time()})
                         await asyncio.to_thread(pipeline.execute)
                     except Exception as telemetry_err:
                         logger.error(f"Failed to update escalation telemetry: {telemetry_err}")
-
-                # Save heatmap persistently
-                save_heatmap_from_base64(result.get("heatmap_base64", ""), request_id)
+                
+                heatmap_path = save_heatmap_from_base64(result.get("heatmap_base64", ""), request_id)
+                heatmap_url = storage.get_download_url(heatmap_path) if heatmap_path else ""
 
                 response_payload = {
                     "request_id": request_id,
                     "diagnosis": result.get("diagnosis", {}),
                     "confidence": result.get("confidence", 0.0),
-                    "heatmap_base64": result.get("heatmap_base64", ""),
+                    "heatmap_url": heatmap_url,
                     "pubmed_citations": result.get("pubmed_citations", []),
                     "escalation_required": escalation,
                     "iteration_count": result.get("iteration_count", 0),
@@ -1206,166 +1239,43 @@ def create_app() -> FastAPI:
                     "dicom_metadata": dicom_metadata,
                 }
                 
-                # Persist sync payload in jobs database to allow heatmap endpoints to retrieve metadata
-                await _update_job_status(request_id, "completed", result=response_payload)
-
-                if escalation:
-                    logger.warning(f"[{request_id}] Escalation triggered — insufficient evidence for automated diagnosis.")
-
-                return JSONResponse(content=response_payload)
-            else:
-                # Asynchronous path: record pending state and offload run to BackgroundTasks
-                job_id = request_id
-                await _update_job_status(job_id, "pending")
+                if idempotency_key:
+                    await _store_idempotency(idempotency_key, response_payload)
                 
+                return JSONResponse(content=response_payload, headers={"X-Request-ID": request_id})
+            else:
                 background_tasks.add_task(
                     process_analyze_job,
-                    job_id,
+                    request_id,
                     local_img_path,
                     local_pdf_path,
                     request_temp_dir,
                     agent,
-                    dicom_metadata
+                    dicom_metadata,
+                    idempotency_key
                 )
-                
-                status_payload = {
-                    "job_id": job_id,
-                    "status": "pending",
-                    "status_url": f"/analyze/status/{job_id}"
-                }
-                return JSONResponse(status_code=202, content=status_payload)
-                
-        except HTTPException as http_exc:
-            logger.warning(f"HTTPException in analysis: {http_exc.detail}")
-            if sync or request_temp_dir is not None:
-                if request_temp_dir and os.path.exists(request_temp_dir):
-                    try:
-                        shutil.rmtree(request_temp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-            return JSONResponse(status_code=http_exc.status_code, content={"detail": http_exc.detail})
+                return JSONResponse(
+                    content={"request_id": request_id, "status": "accepted", "message": "Analysis queued for processing."},
+                    headers={"X-Request-ID": request_id}
+                )
+        except ValueError as ve:
+            logger.error(f"Validation error for request {request_id}: {ve}")
+            if request_temp_dir and os.path.exists(request_temp_dir):
+                try:
+                    shutil.rmtree(request_temp_dir, ignore_errors=True)
+                except Exception as cleanup_err:
+                    logger.error(f"Failed to clean up temporary directory {request_temp_dir}: {cleanup_err}")
+            raise HTTPException(status_code=400, detail=str(ve))
         except Exception as exc:
-            logger.error(f"Analysis failed: {exc}")
-            # If sync execution failed, clean up temp dir now; if async, process_analyze_job cleans it up
-            if sync or request_temp_dir is not None:
-                if request_temp_dir and os.path.exists(request_temp_dir):
-                    try:
-                        shutil.rmtree(request_temp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-            return JSONResponse(status_code=500, content={"detail": f"Analysis failed: {exc}"})
-        finally:
-            if sync:
-                if request_temp_dir and os.path.exists(request_temp_dir):
-                    try:
-                        shutil.rmtree(request_temp_dir, ignore_errors=True)
-                    except Exception as cleanup_err:
-                        logger.error(f"Failed to clean up temporary directory {request_temp_dir}: {cleanup_err}")
-
-    @app.get("/analyze/heatmap/{job_id}")
-    @limiter.limit("60/minute")
-    async def get_heatmap_file(
-        job_id: str,
-        request: Request,
-        format: str = "png",
-        api_key: str = Security(verify_api_key, scopes=["cases:read"])
-    ):
-        from fastapi.responses import FileResponse
-        from pathlib import Path
-        import io
-        
-        relative_png_path = f"heatmaps/{job_id}.png"
-        relative_dcm_path = f"heatmaps/{job_id}.dcm"
-        
-        if storage_mode == "s3":
-            try:
-                await asyncio.to_thread(storage.client.stat_object, storage.bucket, relative_png_path)
-            except Exception:
-                raise HTTPException(status_code=404, detail="Heatmap not found for this job ID.")
-            
-            png_path_str = await asyncio.to_thread(storage.load, relative_png_path)
-            png_path = Path(png_path_str)
-        else:
-            png_path = Path("outputs/heatmaps") / f"{job_id}.png"
-            if not png_path.exists():
-                raise HTTPException(status_code=404, detail="Heatmap not found for this job ID.")
-            
-        if format.lower() == "dicom":
-            # Retrieve stored patient metadata from the jobs database to prevent PACS integration identity loss
-            job_data = None
-            if use_redis and redis_client:
+            logger.error(f"Request {request_id} failed: {exc}")
+            if request_temp_dir and os.path.exists(request_temp_dir):
                 try:
-                    raw = await asyncio.to_thread(redis_client.get, f"medi_chain:jobs:{job_id}")
-                    if raw:
-                        job_data = json.loads(raw)
-                except Exception as e:
-                    logger.error(f"Failed to read job {job_id} from Redis: {e}")
-            if job_data is None:
-                async with _jobs_db_lock:
-                    job_data = _jobs_db.get(job_id)
-            
-            dicom_metadata = None
-            if job_data and "result" in job_data:
-                raw_meta = job_data["result"].get("dicom_metadata")
-                if isinstance(raw_meta, dict) and raw_meta.get("encrypted"):
-                    try:
-                        from src.utils.security import decrypt_payload
-                        decrypted_str = decrypt_payload(raw_meta["data"])
-                        dicom_metadata = json.loads(decrypted_str)
-                    except Exception as decrypt_err:
-                        logger.error(f"Failed to decrypt DICOM metadata for heatmap: {decrypt_err}")
-                else:
-                    dicom_metadata = raw_meta
+                    shutil.rmtree(request_temp_dir, ignore_errors=True)
+                except Exception as cleanup_err:
+                    logger.error(f"Failed to clean up temporary directory {request_temp_dir}: {cleanup_err}")
+            raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}")
 
-            if storage_mode == "s3":
-                exists_dcm = False
-                try:
-                    await asyncio.to_thread(storage.client.stat_object, storage.bucket, relative_dcm_path)
-                    exists_dcm = True
-                except Exception:
-                    pass
-                
-                if exists_dcm:
-                    dcm_path_str = await asyncio.to_thread(storage.load, relative_dcm_path)
-                    dcm_path = Path(dcm_path_str)
-                else:
-                    import tempfile
-                    fd, temp_dcm_name = tempfile.mkstemp(suffix=".dcm")
-                    os.close(fd)
-                    try:
-                        from src.data.dicom_handler import create_secondary_capture
-                        await asyncio.to_thread(create_secondary_capture, dicom_metadata, str(png_path), temp_dcm_name)
-                        with open(temp_dcm_name, "rb") as f:
-                            await asyncio.to_thread(storage.save, f, relative_dcm_path)
-                        dcm_path = Path(temp_dcm_name)
-                    except Exception as e:
-                        if os.path.exists(temp_dcm_name):
-                            os.unlink(temp_dcm_name)
-                        logger.error(f"Failed to generate Secondary Capture DICOM: {e}")
-                        raise HTTPException(status_code=500, detail=f"Failed to generate DICOM: {e}")
-            else:
-                dcm_path = Path("outputs/heatmaps") / f"{job_id}.dcm"
-                if not dcm_path.exists():
-                    try:
-                        from src.data.dicom_handler import create_secondary_capture
-                        await asyncio.to_thread(create_secondary_capture, dicom_metadata, str(png_path), str(dcm_path))
-                    except Exception as e:
-                        logger.error(f"Failed to generate Secondary Capture DICOM: {e}")
-                        raise HTTPException(status_code=500, detail=f"Failed to generate DICOM: {e}")
-                        
-            return FileResponse(
-                path=str(dcm_path),
-                media_type="application/dicom",
-                filename=f"heatmap_{job_id}.dcm"
-            )
-        else:
-            return FileResponse(
-                path=str(png_path),
-                media_type="image/png",
-                filename=f"heatmap_{job_id}.png"
-            )
-
-    @app.get("/analyze/status/{job_id}")
+    @app.get("/v1/analyze/status/{job_id}")
     @limiter.limit("60/minute")
     async def get_job_status(
         job_id: str,
@@ -1394,13 +1304,165 @@ def create_app() -> FastAPI:
             raw_meta = job_data["result"].get("dicom_metadata")
             if isinstance(raw_meta, dict) and raw_meta.get("encrypted"):
                 try:
-                    from src.utils.security import decrypt_payload
                     decrypted_str = decrypt_payload(raw_meta["data"])
                     job_data["result"]["dicom_metadata"] = json.loads(decrypted_str)
                 except Exception as decrypt_err:
                     logger.error(f"Failed to decrypt DICOM metadata for status: {decrypt_err}")
-            
+        
         return JSONResponse(content=job_data)
+
+    @app.get("/v1/cases/review-queue")
+    @limiter.limit("30/minute")
+    async def get_review_queue(
+        request: Request,
+        limit: int = 50,
+        api_key: str = Security(verify_api_key, scopes=["cases:read"])
+    ):
+        """Fetch the list of escalated cases pending radiologist review."""
+        if not use_redis or not redis_client:
+            raise HTTPException(status_code=503, detail="Review queue requires Redis.")
+            
+        try:
+            # Fetch oldest pending cases from the sorted set
+            raw_queue = await asyncio.to_thread(redis_client.zrange, "medi_chain:review_queue", 0, limit - 1, withscores=True)
+            queue_items = [{"job_id": str(item[0], 'utf-8') if isinstance(item[0], bytes) else item[0], "timestamp": item[1]} for item in raw_queue]
+            return JSONResponse(content={"queue": queue_items, "count": len(queue_items)})
+        except Exception as e:
+            logger.error(f"Failed to fetch review queue: {e}")
+            raise HTTPException(status_code=500, detail="Failed to fetch review queue")
+
+    @dataclass
+    class ReviewPayload:
+        verdict: str  # agree, disagree, modify
+        final_diagnosis: Optional[str] = None
+        notes: str = ""
+        doctor_id: str = "dr-anonymous"
+        time_spent_seconds: Optional[float] = None
+
+    @app.post("/v1/cases/{job_id}/review")
+    @limiter.limit("30/minute")
+    async def submit_radiologist_review(
+        job_id: str,
+        request: Request,
+        payload: ReviewPayload,
+        api_key: str = Security(verify_api_key, scopes=["cases:write", "feedback:write"])
+    ):
+        """Submit radiologist review for an escalated case. Updates FHIR report status and logs feedback."""
+        # Validate verdict
+        allowed_verdicts = {"agree", "disagree", "modify"}
+        verdict_normalized = payload.verdict.strip().lower()
+        if verdict_normalized not in allowed_verdicts:
+            raise HTTPException(400, f"verdict must be one of: {', '.join(sorted(allowed_verdicts))}")
+        
+        # Load job
+        job_data = None
+        if use_redis and redis_client:
+            try:
+                raw = await asyncio.to_thread(redis_client.get, f"medi_chain:jobs:{job_id}")
+                if raw:
+                    job_data = json.loads(raw)
+            except Exception as e:
+                logger.error(f"Failed to read job {job_id} from Redis: {e}")
+                
+        if job_data is None:
+            async with _jobs_db_lock:
+                job_data = _jobs_db.get(job_id)
+                
+        if job_data is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        if job_data.get("status") != "completed":
+            raise HTTPException(400, "Can only review completed cases")
+        
+        result = job_data.get("result", {})
+        diagnosis = result.get("diagnosis", {})
+        was_escalated = result.get("escalation_required", False)
+        
+        # Log feedback
+        agreement = verdict_normalized == "agree"
+        session_id = job_id
+        history_metadata = {"job_id": job_id, "escalated": was_escalated}
+        
+        try:
+            path = await asyncio.to_thread(
+                feedback_logger.log_feedback,
+                session_id=session_id,
+                verdict=verdict_normalized,
+                notes=payload.notes,
+                diagnosis=diagnosis,
+                history_metadata=history_metadata,
+                doctor_id=payload.doctor_id,
+            )
+        except Exception as e:
+            logger.error(f"Feedback logging failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to log feedback: {e}")
+        
+        # Update drift detector feedback summary
+        await drift_detector.update_feedback_summary(agreement)
+        
+        # Record metrics
+        PROM_FEEDBACK.labels(verdict=verdict_normalized).inc()
+        if payload.time_spent_seconds is not None:
+            PROM_SIGN_OFF_TIME.observe(payload.time_spent_seconds)
+        
+        # Update FHIR report status to final if radiologist agrees or modifies
+        if verdict_normalized in {"agree", "modify"}:
+            try:
+                from src.data.fhir_formatter import FHIRFormatter
+                fhir_formatter = FHIRFormatter()
+                hl7_oru = fhir_formatter.generate_hl7_oru(
+                    diagnosis_data=result,
+                    verdict=verdict_normalized,
+                    final_diagnosis=payload.final_diagnosis,
+                    notes=payload.notes,
+                    doctor_id=payload.doctor_id
+                )
+                logger.info(f"Generated HL7 ORU for job {job_id}:\n{hl7_oru}")
+                
+                # Actively transmit to EHR Gateway
+                if EHR_GATEWAY_URL:
+                    import httpx
+                    async with httpx.AsyncClient() as client:
+                        mllp_url = f"{EHR_GATEWAY_URL.rstrip('/')}/mllp_bridge"
+                        try:
+                            ehr_resp = await client.post(
+                                mllp_url, 
+                                content=hl7_oru, 
+                                headers={"Content-Type": "application/hl7-v2"}, 
+                                timeout=5.0
+                            )
+                            ehr_resp.raise_for_status()
+                            logger.info(f"Successfully transmitted HL7 to EHR gateway at {mllp_url}")
+                        except Exception as ehr_err:
+                            logger.error(f"Failed to transmit HL7 to EHR gateway: {ehr_err}")
+                
+                _write_audit_event({
+                    "event": "radiologist_review",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "job_id": job_id,
+                    "doctor_id_hash": hashlib.sha256(payload.doctor_id.encode("utf-8")).hexdigest(),
+                    "verdict": verdict_normalized,
+                    "agreement": agreement,
+                    "final_diagnosis": payload.final_diagnosis,
+                    "time_spent_seconds": payload.time_spent_seconds,
+                    "hl7_oru_generated": True
+                })
+            except Exception as e:
+                logger.error(f"Failed to update FHIR report after review: {e}")
+                
+        # Remove from review queue
+        if use_redis and redis_client:
+            try:
+                await asyncio.to_thread(redis_client.zrem, "medi_chain:review_queue", job_id)
+            except Exception as e:
+                logger.error(f"Failed to remove {job_id} from review queue: {e}")
+        
+        return JSONResponse(content={
+            "status": "success",
+            "message": "Radiologist review recorded",
+            "saved_path": str(path),
+            "verdict": verdict_normalized,
+        })
 
     class FeedbackPayload(BaseModel):
         session_id: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
@@ -1410,6 +1472,8 @@ def create_app() -> FastAPI:
         history_metadata: dict
         doctor_id: str = Field("dr-anonymous", max_length=128)
         start_time: Optional[float] = None
+        disagreement_reason: Optional[str] = Field(None, max_length=256)
+        correction_mask_base64: Optional[str] = None
 
         @field_validator("verdict")
         @classmethod
@@ -1428,9 +1492,7 @@ def create_app() -> FastAPI:
         @field_validator("doctor_id")
         @classmethod
         def doctor_id_must_use_doctor_prefix(cls, value: str) -> str:
-            # Flaw #6 Fix: Allow doctor prefix 'dr-', UUIDs, hospital emails, or NPI numbers
             value_stripped = value.strip()
-            # Allow email address format, standard UUID format, or numeric NPI (10 digits), or standard dr- prefix
             is_valid = (
                 value_stripped.startswith("dr-") or
                 "@" in value_stripped or
@@ -1441,8 +1503,19 @@ def create_app() -> FastAPI:
                 raise ValueError("doctor_id must start with 'dr-', or be a valid email/UUID/NPI.")
             return value_stripped
 
-    @app.post("/feedback")
-    @limiter.limit("30/minute")  # Flaw #4 Fix: Rate limit feedback endpoint to prevent spam/poisoning
+    @app.get("/v1/storage/{path:path}")
+    async def get_storage_file(path: str, api_key: str = Security(verify_api_key, scopes=["cases:read"])):
+        from fastapi.responses import FileResponse
+        safe_path = Path(path).resolve()
+        cwd = Path.cwd()
+        if not (safe_path.is_relative_to(cwd / "outputs") or safe_path.is_relative_to(cwd / "temp")):
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if not safe_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(str(safe_path))
+
+    @app.post("/v1/feedback")
+    @limiter.limit("30/minute")
     async def receive_feedback(
         request: Request,
         background_tasks: BackgroundTasks,
@@ -1457,11 +1530,12 @@ def create_app() -> FastAPI:
                 verdict=payload.verdict,
                 notes=payload.notes,
                 diagnosis=payload.diagnosis,
-                history_metadata=payload.history_metadata
+                history_metadata=payload.history_metadata,
+                disagreement_reason=payload.disagreement_reason,
+                correction_mask_base64=payload.correction_mask_base64
             )
             background_tasks.add_task(drift_detector.update_feedback_summary, agreement)
             
-            # Record clinician sign-off latency and verdict count in Prometheus metrics
             PROM_FEEDBACK.labels(verdict=payload.verdict).inc()
             if payload.start_time is not None:
                 latency = time.time() - payload.start_time
@@ -1480,25 +1554,22 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.error(f"Feedback logging failed: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to log feedback: {e}")
- 
-    @app.get("/feedback/discrepancies")
+
+    @app.get("/v1/feedback/discrepancies")
     @limiter.limit("10/minute")
     async def get_discrepancies(
         request: Request,
         api_key: str = Security(verify_api_key, scopes=["feedback:read"])
     ):
-        """Retrieves aggregated discrepancy records across all stateless replicas using Redis/S3."""
         try:
             records = []
             if redis_client is not None:
-                # Load from shared Redis list
                 raw_records = await asyncio.to_thread(redis_client.lrange, "medi_chain:feedback:records", 0, -1)
                 for r_raw in raw_records:
                     rec = json.loads(r_raw)
                     if rec.get("verdict") in {"disagree", "mismatch"}:
                         records.append(rec)
             else:
-                # Fallback to reading the local CSV if Redis isn't configured
                 def read_local_csv():
                     import csv
                     csv_path = feedback_logger.csv_path
@@ -1510,48 +1581,59 @@ def create_app() -> FastAPI:
                                 if row.get("verdict") in {"disagree", "mismatch"}:
                                     local_records.append(row)
                     return local_records
-                
                 records = await asyncio.to_thread(read_local_csv)
             return JSONResponse(content={"discrepancies": records})
         except Exception as e:
             logger.error(f"Failed to load discrepancies: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to load discrepancies: {e}")
 
-    @app.get("/telemetry/metrics")
+    @app.get("/v1/metrics/clinical")
+    @limiter.limit("10/minute")
+    async def get_clinical_metrics(
+        request: Request,
+        api_key: str = Security(verify_api_key, scopes=["metrics:read"])
+    ):
+        try:
+            from src.config.settings import get_clinical_thresholds
+            thresholds = get_clinical_thresholds()
+            if not thresholds.thresholds_validated:
+                return JSONResponse(status_code=404, content={"message": "Clinical thresholds and validation metrics have not been generated."})
+            
+            return JSONResponse(content={
+                "validation_dataset": thresholds.validation_dataset,
+                "validation_date": thresholds.validation_date,
+                "metrics": thresholds.validation_metrics
+            })
+        except Exception as e:
+            logger.error(f"Failed to fetch clinical metrics: {e}")
+            raise HTTPException(status_code=500, detail="Internal Server Error retrieving metrics")
+
+
+    @app.get("/v1/telemetry/metrics")
     @limiter.limit("10/minute")
     async def get_telemetry_metrics(
         request: Request,
         baseline_minutes: Optional[int] = None,
-        automated_minutes: Optional[int] = None,
         hourly_rate: Optional[float] = None,
         gpu_hourly_cost: Optional[float] = None,
         api_key: str = Security(verify_api_key, scopes=["metrics:read"])
     ):
-        """Returns production telemetry metrics including the real-world escalation rate and clinician override rates."""
-        # Resolve inputs with environment fallback
-        b_mins = baseline_minutes if baseline_minutes is not None else int(os.getenv("TELEMETRY_BASELINE_MINUTES", "18"))
-        a_mins = automated_minutes if automated_minutes is not None else int(os.getenv("TELEMETRY_AUTOMATED_MINUTES", "1"))
         h_rate = hourly_rate if hourly_rate is not None else float(os.getenv("TELEMETRY_HOURLY_RATE", "250.0"))
-        gpu_cost = gpu_hourly_cost if gpu_hourly_cost is not None else float(os.getenv("GPU_HOURLY_COST", "0.0" if os.getenv("TESTING") == "true" else "0.90"))
+        gpu_cost = gpu_hourly_cost if gpu_hourly_cost is not None else float(os.getenv("GPU_HOURLY_COST", "0.0" if TESTING else "0.90"))
 
-        # Validate inputs to enforce standard business boundaries and prevent logical/arithmetic errors
-        if b_mins <= 0 or b_mins > 1440:
+        if baseline_minutes is not None and (baseline_minutes <= 0 or baseline_minutes > 1440):
             raise HTTPException(status_code=400, detail="baseline_minutes must be between 1 and 1440 (24 hours).")
-        if a_mins < 0 or a_mins >= b_mins:
-            raise HTTPException(status_code=400, detail="automated_minutes must be non-negative and less than baseline_minutes.")
         if h_rate < 0.0 or h_rate > 10000.0:
             raise HTTPException(status_code=400, detail="hourly_rate must be between 0.0 and 10000.0.")
         if gpu_cost < 0.0 or gpu_cost > 1000.0:
             raise HTTPException(status_code=400, detail="gpu_hourly_cost must be between 0.0 and 1000.0.")
 
-        # Calculate elapsed runtime of the API container to factor in continuous GPU hosting cost
         started_at = getattr(request.app.state, "started_at", None)
         if started_at is None:
-            started_at = time.time() - 3600 # Default to 1 hour if not recorded
+            started_at = time.time() - 3600
         elapsed_hours = max(0.01, (time.time() - started_at) / 3600.0)
         infra_cost = round(elapsed_hours * gpu_cost, 2)
 
-        # Calculate feedback metrics first
         feedback_total = 0
         agreements = 0
         disagreements = 0
@@ -1576,7 +1658,6 @@ def create_app() -> FastAPI:
             except Exception as parse_err:
                 logger.error(f"Failed to parse Redis feedback summary: {parse_err}")
         else:
-            # Fallback: parse from local CSV file directly
             def read_local_csv_telemetry():
                 import csv
                 csv_path = feedback_logger.csv_path
@@ -1622,7 +1703,33 @@ def create_app() -> FastAPI:
             escalated = int((await asyncio.to_thread(redis_client.get, "medi_chain:telemetry:escalated_cases")) or 0)
             rate = escalated / total if total > 0 else 0.0
             
-            # ROI Calculations (factor in manual radiologist baseline vs automated with escalation)
+            processing_sum = 0.0
+            processing_count = 0.0
+            try:
+                for sample in PROM_PROCESSING_TIME.collect()[0].samples:
+                    if sample.name.endswith('_sum'):
+                        processing_sum = sample.value
+                    elif sample.name.endswith('_count'):
+                        processing_count = sample.value
+            except Exception:
+                pass
+            
+            signoff_sum = 0.0
+            signoff_count = 0.0
+            try:
+                for sample in PROM_SIGN_OFF_TIME.collect()[0].samples:
+                    if sample.name.endswith('_sum'):
+                        signoff_sum = sample.value
+                    elif sample.name.endswith('_count'):
+                        signoff_count = sample.value
+            except Exception:
+                pass
+                
+            actual_baseline_mins = (signoff_sum / signoff_count) / 60.0 if signoff_count > 0 else float(os.getenv("TELEMETRY_BASELINE_MINUTES", "18"))
+            b_mins = baseline_minutes if baseline_minutes is not None else actual_baseline_mins
+            
+            a_mins = (processing_sum / processing_count) / 60.0 if processing_count > 0 else float(os.getenv("TELEMETRY_AUTOMATED_MINUTES", "1"))
+            
             saved_minutes = (total - escalated) * (b_mins - a_mins)
             saved_hours = round(saved_minutes / 60, 2)
             saved_cost = round(saved_hours * h_rate, 2)
@@ -1646,20 +1753,70 @@ def create_app() -> FastAPI:
             logger.error(f"Failed to load telemetry metrics: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to load telemetry metrics: {e}")
 
-    @app.get("/metrics")
+    @app.get("/v1/metrics")
     async def metrics_endpoint():
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-    @app.get("/health")
+    @app.get("/v1/health")
     async def health_check(request: Request):
+        # Check inference API connectivity
+        inference_healthy = False
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(f"{os.getenv('INFERENCE_API_URL', 'http://inference-api:8001')}/health")
+                inference_healthy = resp.status_code == 200
+        except Exception:
+            pass
+        
         return {
             "status": "ok",
             "models_loaded": request.app.state.agent is not None,
+            "inference_api_healthy": inference_healthy,
             "concurrency_limit": MAX_CONCURRENT_REQUESTS,
             "version": APP_VERSION,
+            "config_audit": get_config().audit_dump(),
         }
 
+    @app.get("/v1/health/gpu")
+    async def gpu_health():
+        """GPU health endpoint for inference API monitoring."""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return {"gpu_available": False, "message": "CUDA not available"}
+            
+            device_count = torch.cuda.device_count()
+            gpu_info = []
+            for i in range(device_count):
+                props = torch.cuda.get_device_properties(i)
+                allocated = torch.cuda.memory_allocated(i) / (1024 ** 3)
+                reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)
+                total = props.total_memory / (1024 ** 3)
+                free = total - reserved
+                
+                gpu_info.append({
+                    "device": i,
+                    "name": props.name,
+                    "total_memory_gb": round(total, 2),
+                    "allocated_gb": round(allocated, 2),
+                    "reserved_gb": round(reserved, 2),
+                    "free_gb": round(free, 2),
+                    "utilization_pct": round((reserved / total) * 100, 1),
+                })
+            
+            return {
+                "gpu_available": True,
+                "device_count": device_count,
+                "gpus": gpu_info,
+                "cuda_version": torch.version.cuda,
+            }
+        except Exception as e:
+            logger.error(f"GPU health check failed: {e}")
+            return {"gpu_available": False, "error": str(e)}
+
     return app
+
 
 app = create_app()
 

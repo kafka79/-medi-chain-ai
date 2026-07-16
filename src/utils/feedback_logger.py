@@ -26,6 +26,8 @@ class FeedbackLogger:
         notes: str,
         diagnosis: Dict[str, Any],
         history_metadata: Dict[str, Any],
+        disagreement_reason: Optional[str] = None,
+        correction_mask_base64: Optional[str] = None,
     ) -> Path:
         record = {
             "feedback_id": uuid.uuid4().hex,
@@ -37,6 +39,8 @@ class FeedbackLogger:
             "uncertainty_std": diagnosis.get("uncertainty_std", ""),
             "patient_id": history_metadata.get("patient_id", "Unknown"),
             "occupation": history_metadata.get("occupation", "Unknown"),
+            "disagreement_reason": disagreement_reason or "",
+            "correction_mask": correction_mask_base64 or "",
         }
 
         # 1. Distributed sync to Redis if available
@@ -57,21 +61,37 @@ class FeedbackLogger:
             except Exception as e:
                 logger.error(f"Failed to save feedback to S3: {e}")
 
-        # 3. Fallback to local append (configurable and protected by file lock)
+        # 3. Fallback to local append (configurable, purely instance-local without POSIX locks)
         import os
+        import tempfile
         if os.getenv("ENABLE_LOCAL_CSV_LOGGING", "true").lower() == "true":
             try:
-                from filelock import FileLock
-                lock_path = self.csv_path.with_suffix(".csv.lock")
-                # Ensure the directory exists
                 self.output_dir.mkdir(parents=True, exist_ok=True)
-                with FileLock(str(lock_path), timeout=5.0):
-                    write_header = not self.csv_path.exists()
-                    with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+                write_header = not self.csv_path.exists()
+                
+                # Atomic write: Read existing, append to temp file, then rename
+                fd, tmp_path = tempfile.mkstemp(dir=str(self.output_dir), suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
                         writer = csv.DictWriter(handle, fieldnames=list(record.keys()))
-                        if write_header:
+                        
+                        # Copy existing content if it exists
+                        if self.csv_path.exists():
+                            with open(self.csv_path, "r", encoding="utf-8") as old_handle:
+                                handle.write(old_handle.read())
+                        elif write_header:
                             writer.writeheader()
+                            
                         writer.writerow(record)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    
+                    # Atomic replace
+                    os.replace(tmp_path, str(self.csv_path))
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
             except Exception as e:
                 logger.error(f"Failed to append local feedback CSV: {e}")
 

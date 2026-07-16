@@ -3,13 +3,14 @@ import base64
 import logging
 from typing import Optional
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from src.utils.secrets_manager import SecretsManager
 
 logger = logging.getLogger("medi-chain-security")
 
 _EPHEMERAL_KEY = AESGCM.generate_key(bit_length=256)
 
 def _get_encryption_key() -> bytes:
-    key_str = os.getenv("DLQ_ENCRYPTION_KEY")
+    key_str = SecretsManager.get_secret("DLQ_ENCRYPTION_KEY")
     if not key_str:
         if os.getenv("TESTING") == "true":
             return _EPHEMERAL_KEY

@@ -25,6 +25,11 @@ class UncertaintyEstimator:
         """
         self.model.eval()
         
+        import torch.nn.functional as F
+        # Flaw #4 Fix: Ensure embeddings are explicitly L2 unit-normalized at ingestion
+        vision_emb = F.normalize(vision_emb, p=2, dim=-1)
+        text_emb = F.normalize(text_emb, p=2, dim=-1)
+        
         # Load empirical baseline standard deviations to capture non-isotropic manifold variance
         empirical_std = None
         baseline_mean = None
@@ -32,25 +37,23 @@ class UncertaintyEstimator:
         try:
             import json
             from pathlib import Path
-            baseline_path = Path("temp/drift/features_baseline_cache.json")
-            if baseline_path.exists():
-                with open(baseline_path, "r") as f:
-                    baseline_features = json.load(f)
-                if baseline_features and len(baseline_features) > 1:
-                    baseline_arr = np.array(baseline_features)
-                    empirical_std_np = np.std(baseline_arr, axis=0) + 1e-6
-                    empirical_std = torch.tensor(empirical_std_np, dtype=torch.float32, device=vision_emb.device)
-                    # Compute baseline centroid for visual epistemic uncertainty scaling
-                    mean_val = np.mean(baseline_arr, axis=0)
+            centroid_path = Path("temp/drift/features_centroid.json")
+            if centroid_path.exists():
+                with open(centroid_path, "r") as f:
+                    centroid_data = json.load(f)
+                if centroid_data and "centroid" in centroid_data:
+                    mean_val = centroid_data["centroid"]
                     baseline_mean = torch.tensor(mean_val, dtype=torch.float32, device=vision_emb.device)
-                    
-            text_baseline_path = Path("temp/drift/text_baseline_cache.json")
-            if text_baseline_path.exists():
-                with open(text_baseline_path, "r") as f:
-                    text_baseline_features = json.load(f)
-                if text_baseline_features and len(text_baseline_features) > 1:
-                    text_baseline_arr = np.array(text_baseline_features)
-                    text_mean_val = np.mean(text_baseline_arr, axis=0)
+                    if "std" in centroid_data:
+                        empirical_std_np = np.array(centroid_data["std"]) + 1e-6
+                        empirical_std = torch.tensor(empirical_std_np, dtype=torch.float32, device=vision_emb.device)
+                        
+            text_centroid_path = Path("temp/drift/text_centroid.json")
+            if text_centroid_path.exists():
+                with open(text_centroid_path, "r") as f:
+                    text_centroid_data = json.load(f)
+                if text_centroid_data and "centroid" in text_centroid_data:
+                    text_mean_val = text_centroid_data["centroid"]
                     baseline_mean_text = torch.tensor(text_mean_val, dtype=torch.float32, device=text_emb.device)
         except Exception:
             pass
@@ -60,20 +63,16 @@ class UncertaintyEstimator:
         # Calculate visual OOD distance (1 - cosine similarity) to baseline centroid
         visual_ood_distance = torch.zeros(batch_size, device=vision_emb.device)
         if baseline_mean is not None:
-            norm_bm = baseline_mean.norm()
-            norm_ve = vision_emb.norm(dim=-1)
-            if norm_bm > 0:
-                cos_sim = (vision_emb @ baseline_mean) / (torch.clamp(norm_ve, min=1e-8) * norm_bm)
-                visual_ood_distance = torch.clamp(1.0 - cos_sim, min=0.0)
+            baseline_mean = F.normalize(baseline_mean, p=2, dim=-1)
+            cos_sim = (vision_emb @ baseline_mean)
+            visual_ood_distance = torch.clamp(1.0 - cos_sim, min=0.0)
 
         # Calculate text OOD distance to text baseline centroid
         text_ood_distance = torch.zeros(batch_size, device=text_emb.device)
         if baseline_mean_text is not None:
-            norm_bmt = baseline_mean_text.norm()
-            norm_te = text_emb.norm(dim=-1)
-            if norm_bmt > 0:
-                cos_sim_t = (text_emb @ baseline_mean_text) / (torch.clamp(norm_te, min=1e-8) * norm_bmt)
-                text_ood_distance = torch.clamp(1.0 - cos_sim_t, min=0.0)
+            baseline_mean_text = F.normalize(baseline_mean_text, p=2, dim=-1)
+            cos_sim_t = (text_emb @ baseline_mean_text)
+            text_ood_distance = torch.clamp(1.0 - cos_sim_t, min=0.0)
 
         # Joint out-of-distribution distance
         if baseline_mean is not None and baseline_mean_text is not None:

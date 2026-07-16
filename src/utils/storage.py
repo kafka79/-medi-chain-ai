@@ -23,6 +23,10 @@ class StorageProvider(ABC):
     def cleanup(self, max_age_seconds: int):
         pass
 
+    @abstractmethod
+    def get_download_url(self, relative_path: str, expires_in_seconds: int = 3600) -> str:
+        pass
+
 class LocalStorageProvider(StorageProvider):
     """Addresses the 'Stateful Temp Storage' flaw with a cleaner abstraction."""
     def __init__(self, root_dir: str = "temp/storage"):
@@ -59,6 +63,9 @@ class LocalStorageProvider(StorageProvider):
         except Exception as e:
             logger.error(f"Failed to cleanup local storage: {e}")
 
+    def get_download_url(self, relative_path: str, expires_in_seconds: int = 3600) -> str:
+        return f"/v1/storage/{relative_path}"
+
 class S3StorageProvider(StorageProvider):
     """MinIO/S3 implementation to resolve the 'Stateful Temp Storage' flaw for K8s."""
     def __init__(self, endpoint: str = None, access_key: str = None, secret_key: str = None, bucket: str = "medi-chain-bucket"):
@@ -93,18 +100,30 @@ class S3StorageProvider(StorageProvider):
                 secure=os.getenv("S3_SECURE", "false").lower() == "true",
                 http_client=http_client
             )
-            # Create bucket if it doesn't exist
-            if not self.client.bucket_exists(self.bucket):
-                self.client.make_bucket(self.bucket)
+            self._bucket_verified = False
         except Exception as e:
             logger.error(f"S3StorageProvider initialization error: {e}")
             self.client = None
+
+    def _ensure_bucket(self):
+        if not self.client or self._bucket_verified:
+            return
+        try:
+            if not self.client.bucket_exists(self.bucket):
+                self.client.make_bucket(self.bucket)
+            self._bucket_verified = True
+        except Exception as e:
+            logger.error(f"S3 bucket verification failed: {e}")
+            # Do not raise here so that operations can fail gracefully or retry
+
 
     def save(self, file_obj, relative_path: str):
         if not self.client:
             logger.error("S3 client not initialized. Cannot save.")
             raise RuntimeError("S3 client not initialized")
-            
+        
+        self._ensure_bucket()
+
         tmp_path = None
         try:
             import os
@@ -140,7 +159,9 @@ class S3StorageProvider(StorageProvider):
         if not self.client:
             logger.error("S3 client not initialized. Cannot load.")
             raise RuntimeError("S3 client not initialized")
-            
+        
+        self._ensure_bucket()
+
         try:
             from tempfile import NamedTemporaryFile
             suffix = Path(relative_path).suffix
@@ -209,3 +230,18 @@ class S3StorageProvider(StorageProvider):
                     logger.info(f"Cleaned up old object from S3: {obj.object_name}")
         except Exception as e:
             logger.error(f"Failed to cleanup S3 bucket: {e}")
+
+    def get_download_url(self, relative_path: str, expires_in_seconds: int = 3600) -> str:
+        if not self.client:
+            return ""
+        try:
+            from datetime import timedelta
+            url = self.client.presigned_get_object(
+                self.bucket, 
+                relative_path, 
+                expires=timedelta(seconds=expires_in_seconds)
+            )
+            return url
+        except Exception as e:
+            logger.error(f"Failed to generate presigned URL: {e}")
+            return ""

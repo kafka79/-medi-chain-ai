@@ -37,11 +37,11 @@ async def test_node_extract_visuals_cleanup_on_failure():
                 "patient_pdf_path": "history.pdf"
             }
             
-            # Execute node_extract_visuals, which will throw error when trying to POST to invalid url
-            with pytest.raises(RuntimeError) as exc_info:
-                await agent.node_extract_visuals(state)
+            # Execute node_extract_visuals, which will degrade gracefully on failure
+            result_state = await agent.node_extract_visuals(state)
                 
-            assert "Visual encoder failed" in str(exc_info.value)
+            assert result_state.get("inference_failed") is True
+            assert result_state.get("escalation_required") is True
             
             # Crucial assertion: the temporary file MUST be deleted by the finally block
             assert not os.path.exists(temp_dummy_path)
@@ -535,6 +535,7 @@ async def test_redis_semaphore_self_healing_reconnect():
         # Start with None/offline Redis, but store mock_redis in orig_redis
         sem = RedisDistributedSemaphore(mock_redis, "test_reconnect", limit=2)
         sem.redis = None  # Simulate offline/fallback state
+        sem.reconnect_cooldown = 0.01
         
         # 1. First enter: ping fails, so it stays in fallback mode (acquires fallback_sem)
         await sem.__aenter__()
@@ -601,11 +602,13 @@ def test_failed_pdf_parsing_raises_http_400(monkeypatch):
     monkeypatch.setattr(api_main, "storage", MagicMock())
 
     # Set TESTING to false to simulate production fail-fast check
+    from src.utils.secrets_manager import SecretsManager
+    SecretsManager._cache.clear()
     with patch.dict("os.environ", {"TESTING": "false", "API_KEY": "test-secret"}):
         app = api_main.create_app()
         with TestClient(app) as client:
             response = client.post(
-                "/analyze?sync=true",
+                "/v1/analyze?sync=true",
                 files={
                     "image": ("scan.png", BytesIO(b"image-bytes"), "image/png"),
                     "history": ("corrupt.pdf", BytesIO(b"this-is-garbage-pdf-bytes"), "application/pdf")
@@ -637,13 +640,13 @@ def test_static_ood_threshold(monkeypatch):
         }
     }
     
-    # Write a baseline cache JSON file
+    # Write a centroid cache JSON file
     baseline_cache_dir = Path("temp/drift")
     baseline_cache_dir.mkdir(parents=True, exist_ok=True)
-    baseline_cache_path = baseline_cache_dir / "features_baseline_cache.json"
+    baseline_cache_path = baseline_cache_dir / "features_centroid.json"
     
-    # Set a baseline of 10 samples
-    baseline_data = [[0.9] * 256 + [0.0] * 256] * 10
+    # Set a baseline centroid of 10 samples
+    baseline_data = {"centroid": [0.9] * 256 + [0.0] * 256, "count": 10}
     with open(baseline_cache_path, "w") as f:
         json.dump(baseline_data, f)
         
@@ -727,6 +730,9 @@ def test_roi_telemetry_custom_config(monkeypatch):
     monkeypatch.setattr(api_main, "redis_client", mock_redis)
     monkeypatch.setattr(api_main, "use_redis", True)
     
+    from src.utils.secrets_manager import SecretsManager
+    SecretsManager._cache.clear()
+    
     with patch.dict("os.environ", {
         "TESTING": "true",
         "API_KEY": "secret-key",
@@ -736,7 +742,7 @@ def test_roi_telemetry_custom_config(monkeypatch):
     }):
         app = api_main.create_app()
         with TestClient(app) as client:
-            response = client.get("/telemetry/metrics", headers={"X-API-Key": "secret-key"})
+            response = client.get("/v1/telemetry/metrics", headers={"X-API-Key": "secret-key"})
             assert response.status_code == 200
             data = response.json()
             

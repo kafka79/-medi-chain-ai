@@ -2,12 +2,13 @@ from opacus import PrivacyEngine
 import torch
 
 class PrivateTrainingManager:
-    def __init__(self, model, optimizer, data_loader, target_epsilon=8.0, target_delta=1e-5):
+    def __init__(self, model, optimizer, data_loader, target_epsilon=8.0, target_delta=1e-5, epochs=10):
         self.model = model
         self.optimizer = optimizer
         self.data_loader = data_loader
         self.target_epsilon = target_epsilon
         self.target_delta = target_delta
+        self.epochs = epochs
         
         self.privacy_engine = PrivacyEngine()
         
@@ -18,10 +19,10 @@ class PrivateTrainingManager:
             data_loader=self.data_loader,
             target_epsilon=target_epsilon,
             target_delta=target_delta,
-            epochs=10, # Example
+            epochs=self.epochs,
             max_grad_norm=1.0,
         )
-        print(f"Privacy engine initialized. Epsilon budget: {target_epsilon} Delta: {target_delta}")
+        print(f"Privacy engine initialized. Epsilon budget: {target_epsilon} Delta: {target_delta} Epochs: {self.epochs}")
 
     def get_privacy_stats(self):
         """Current privacy budget spent."""

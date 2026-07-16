@@ -3,6 +3,7 @@ import sys
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 from pathlib import Path
+import hashlib
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Security, Depends, Request
 from fastapi.security import APIKeyHeader
@@ -16,7 +17,6 @@ import asyncio
 import base64
 import cv2
 import concurrent.futures
-import hashlib
 
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -25,9 +25,9 @@ from src.vlm.visual_encoder import BiomedVisualEncoder
 from sentence_transformers import SentenceTransformer
 from src.models.fusion import LateFusionModel
 from src.vlm.explainability import VisualExplainer
+from src.config.settings import get_inference_config
 
-# Flaw #8 Fix: Single explicit ThreadPoolExecutor replaces the dual asyncio.Semaphore + asyncio.to_thread pattern.
-# Make workers count configurable via INFERENCE_MAX_WORKERS to handle high-throughput production settings.
+# Thread pool for inference
 INFERENCE_MAX_WORKERS = int(os.getenv("INFERENCE_MAX_WORKERS", "1"))
 _inference_executor = concurrent.futures.ThreadPoolExecutor(max_workers=INFERENCE_MAX_WORKERS)
 MODEL_CHECKPOINT = os.getenv("MODEL_CHECKPOINT", "models/fusion_model.pt")
@@ -44,6 +44,7 @@ def _file_sha256(path: str):
             digest.update(chunk)
     return digest.hexdigest()
 
+
 class InferenceService:
     def __init__(self):
         self.encoder = BiomedVisualEncoder()
@@ -53,7 +54,7 @@ class InferenceService:
         checkpoint_path = MODEL_CHECKPOINT
         if os.path.exists(checkpoint_path):
             state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-            # Copy v_proj and t_proj weights to gates if gates are missing in checkpoint to prevent random initialization degradation
+            # Copy v_proj and t_proj weights to gates if gates are missing in checkpoint
             if "v_gate.weight" not in state_dict and "v_proj.weight" in state_dict:
                 state_dict["v_gate.weight"] = state_dict["v_proj.weight"].clone()
                 state_dict["v_gate.bias"] = state_dict["v_proj.bias"].clone()
@@ -113,7 +114,9 @@ class InferenceService:
             
         return features.tolist(), visual_std.tolist(), heatmap_base64
 
+
 service = None
+
 
 def _allowed_image_roots() -> List[Path]:
     configured = os.getenv(
@@ -205,7 +208,7 @@ class EstimatePayload(BaseModel):
     visual_features: Any
     visual_std: Optional[List[float]] = None
     text_features: Any
-    num_passes: int = 50  # ponytail: 50 passes for stable MC Dropout variance
+    num_passes: int = 50
 
 INTERNAL_API_KEY_HEADER = APIKeyHeader(name="X-Internal-API-Key", auto_error=False)
 
@@ -217,6 +220,7 @@ async def verify_internal_api_key(api_key: str = Security(INTERNAL_API_KEY_HEADE
     if not api_key or not secrets.compare_digest(api_key, expected_key):
         raise HTTPException(status_code=403, detail="Invalid Internal API Key")
     return api_key
+
 
 @app.post("/encode/image")
 async def encode_image(
@@ -232,7 +236,6 @@ async def encode_image(
         request.state.upload_path = tmp_path
         
     try:
-        # Flaw #8 Fix: Submit to explicit single-worker executor instead of semaphore + to_thread
         loop = asyncio.get_running_loop()
         features_list, visual_std_list, heatmap_base64 = await loop.run_in_executor(
             _inference_executor, active_service.run_visual_inference_sync, tmp_path
@@ -249,6 +252,7 @@ async def encode_image(
         except Exception:
             pass
 
+
 @app.post("/encode/image_path")
 async def encode_image_path(
     request: Request,
@@ -260,7 +264,6 @@ async def encode_image_path(
     img_path = validate_local_image_path(payload.image_path)
     request.state.image_path = img_path
         
-    # Flaw #8 Fix: Submit to explicit single-worker executor
     loop = asyncio.get_running_loop()
     features_list, visual_std_list, heatmap_base64 = await loop.run_in_executor(
         _inference_executor, active_service.run_visual_inference_sync, img_path
@@ -272,6 +275,7 @@ async def encode_image_path(
         "heatmap_base64": heatmap_base64
     }
 
+
 @app.post("/encode/text")
 async def encode_text(
     request: Request,
@@ -280,12 +284,12 @@ async def encode_text(
 ):
     active_service = get_service(request)
     
-    # Flaw #8 Fix: Submit to explicit single-worker executor
     loop = asyncio.get_running_loop()
     emb = await loop.run_in_executor(
         _inference_executor, active_service.text_encoder.encode, [payload.text]
     )
     return {"embeddings": emb.tolist()}
+
 
 @app.post("/estimate")
 async def estimate_uncertainty(
@@ -308,7 +312,7 @@ async def estimate_uncertainty(
     if payload.visual_std is not None:
         visual_std = torch.tensor(payload.visual_std, dtype=torch.float32, device=active_service.encoder.device)
         
-    # Flaw #8 Fix: Submit to explicit single-worker executor
+    # Run uncertainty estimation in thread pool
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(
         _inference_executor, active_service.uncertainty.estimate_uncertainty, v, t, payload.num_passes, visual_std
@@ -324,6 +328,7 @@ async def estimate_uncertainty(
             
     return clean_results
 
+
 @app.get("/health")
 async def health_check(request: Request):
     return {
@@ -331,9 +336,46 @@ async def health_check(request: Request):
         "models_loaded": getattr(request.app.state, "service", None) is not None,
     }
 
+
+@app.get("/health/gpu")
+async def gpu_health():
+    """GPU health endpoint for monitoring."""
+    try:
+        if not torch.cuda.is_available():
+            return {"gpu_available": False, "message": "CUDA not available"}
+        
+        device_count = torch.cuda.device_count()
+        gpu_info = []
+        for i in range(device_count):
+            props = torch.cuda.get_device_properties(i)
+            allocated = torch.cuda.memory_allocated(i) / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)
+            total = props.total_memory / (1024 ** 3)
+            free = total - reserved
+            
+            gpu_info.append({
+                "device": i,
+                "name": props.name,
+                "total_memory_gb": round(total, 2),
+                "allocated_gb": round(allocated, 2),
+                "reserved_gb": round(reserved, 2),
+                "free_gb": round(free, 2),
+                "utilization_pct": round((reserved / total) * 100, 1),
+            })
+        
+        return {
+            "gpu_available": True,
+            "device_count": device_count,
+            "gpus": gpu_info,
+            "cuda_version": torch.version.cuda,
+        }
+    except Exception as e:
+        return {"gpu_available": False, "error": str(e)}
+
+
 @app.get("/version")
 async def get_version():
-    """Flaw #17 (partial): Expose model version metadata for audit trail."""
+    """Expose model version metadata for audit trail."""
     return {
         "service": "inference-api",
         "version": "1.3.0",
@@ -342,6 +384,7 @@ async def get_version():
         "visual_encoder": "BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
         "text_encoder": "cambridgeltl/SapBERT-from-PubMedBERT-fulltext",
     }
+
 
 if __name__ == "__main__":
     ssl_keyfile = os.getenv("INFERENCE_SSL_KEYFILE", None)

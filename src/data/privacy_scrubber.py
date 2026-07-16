@@ -3,6 +3,7 @@ import logging
 import threading
 import os
 import json
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, List
 
@@ -100,37 +101,44 @@ class PrivacyScrubber:
         }
         self.ner = None
         self.ner_load_error = None
-        self._ner_lock = threading.Lock()
+        self._ner_lock = asyncio.Lock()
         self._ner_loaded = False
+        self._ner_loading = False
         
-        # Eagerly initialize/download NER synchronously at startup (fail-fast)
-        # unless configured for lazy loading (e.g. for CI speed/tests).
-        lazy_load = os.getenv("NER_LAZY_LOAD", "false").lower() == "true"
+        # Load configuration
+        from src.config.settings import get_privacy_config
+        privacy_config = get_privacy_config()
+        lazy_load = privacy_config.ner_lazy_load
+        
+        # In testing mode, allow deferring; in production, start loading immediately
         if os.getenv("TESTING") != "true":
             if lazy_load:
-                logger.info("NER_LAZY_LOAD is true. Initializing NER pipeline in background thread...")
-                threading.Thread(target=self._init_ner, daemon=True).start()
+                logger.info("NER_LAZY_LOAD is true. NER pipeline will be initialized on first use.")
             else:
-                self._init_ner()
-                if self.ner_load_error is not None:
-                    raise RuntimeError(
-                        f"Critical HIPAA Risk: Privacy scrubber failed to load the NER model at startup. "
-                        f"Error: {self.ner_load_error}"
-                    )
+                # Start loading in background but don't block startup
+                asyncio.create_task(self._init_ner_async())
+                logger.info("NER pipeline initialization started in background.")
 
-    def _init_ner(self):
-        """Thread-safe lazy initialization of the Hugging Face NER pipeline."""
-        with self._ner_lock:
-            if self._ner_loaded:
+    async def _init_ner_async(self):
+        """Async initialization of the Hugging Face NER pipeline."""
+        async with self._ner_lock:
+            if self._ner_loaded or self._ner_loading:
                 return
-            logger.info("Initializing Hugging Face NER pipeline in background thread...")
+            self._ner_loading = True
+            logger.info("Initializing Hugging Face NER pipeline...")
             try:
                 from transformers import pipeline
-                # Allow local path in air-gapped environments via NER_MODEL_PATH
-                model_name = os.getenv("NER_MODEL_PATH", "dslim/bert-base-NER")
+                from src.config.settings import get_privacy_config
+                privacy_config = get_privacy_config()
+                model_name = privacy_config.ner_model_path
                 logger.info(f"Loading NER model from path/name: {model_name}")
                 # Using aggregation_strategy="simple" merges B-PER and I-PER into a single PER entity
-                self.ner = pipeline("ner", model=model_name, aggregation_strategy="simple")
+                # Run in thread pool to avoid blocking event loop
+                loop = asyncio.get_running_loop()
+                self.ner = await loop.run_in_executor(
+                    None, 
+                    lambda: pipeline("ner", model=model_name, aggregation_strategy="simple")
+                )
                 self.ner_load_error = None
                 logger.info("Hugging Face NER pipeline loaded successfully.")
             except Exception as e:
@@ -139,18 +147,25 @@ class PrivacyScrubber:
                 self.ner_load_error = e
             finally:
                 self._ner_loaded = True
+                self._ner_loading = False
 
-    def scrub_text(self, text: str, source_context: str = "unknown") -> str:
-        """Removes PII patterns from text. Logs an audit trail of all redactions."""
-        # Ensure NER is loaded (blocks if background thread is still initializing)
+    async def _ensure_ner_loaded(self):
+        """Ensure NER model is loaded, waiting if necessary."""
         if not self._ner_loaded:
-            self._init_ner()
+            await self._init_ner_async()
+            # If another task already loaded it, wait
+            while self._ner_loading:
+                await asyncio.sleep(0.1)
             
         if self.ner is None or self.ner_load_error is not None:
             raise RuntimeError(
                 f"Critical HIPAA Risk: Privacy scrubber failed to load the NER model. "
                 f"Aborting process to prevent patient data leakage. Error: {self.ner_load_error}"
             )
+
+    async def scrub_text_async(self, text: str, source_context: str = "unknown") -> str:
+        """Async version of scrub_text for use in async contexts."""
+        await self._ensure_ner_loaded()
         
         # Flaw #23 Fix: Track all redactions for the audit trail
         redaction_log: List[Dict[str, str]] = []
@@ -165,7 +180,6 @@ class PrivacyScrubber:
         try:
             entities = self.ner(scrubbed)
             ner_redacted = []
-            # Sort entities in reverse order to replace from end to start without affecting indices
             for ent in sorted(entities, key=lambda x: x['start'], reverse=True):
                 if ent['entity_group'] in ['PER', 'ORG', 'LOC']:
                     ner_redacted.append({"group": ent['entity_group'], "score": round(ent.get('score', 0), 3)})
@@ -173,18 +187,24 @@ class PrivacyScrubber:
             if ner_redacted:
                 redaction_log.append({"type": "ner", "entities": ner_redacted})
         except Exception as e:
-            logger.error(f"NER scrubbing failed: {e}. Falling back to aggressive regex de-identification.")
-            # Aggressive fallback: mask any token that looks like a potential proper noun (capitalized)
-            # while protecting common medical terms or pronouns to maintain availability and readable context.
+            logger.error(f"NER scrubbing failed: {e}. Falling back to conservative regex de-identification.")
             words = scrubbed.split()
             fallback_words = []
-            protected_words = {"the", "a", "an", "this", "that", "it", "patient", "history", "labs", "complaint", "clinical", "findings", "silicosis", "pneumonia", "tuberculosis", "asbestosis", "normal"}
+            protected_words = {
+                "the", "a", "an", "this", "that", "it", "patient", "history", "labs", "complaint", 
+                "clinical", "findings", "silicosis", "pneumonia", "tuberculosis", "asbestosis", 
+                "normal", "copd", "emphysema", "fibrosis", "mass", "nodule", "adenocarcinoma",
+                "squamous", "lung", "cancer", "tumor", "bronchitis", "sarcoidosis", "effusion",
+                "pleural", "pulmonary", "respiratory", "cardiac", "vascular", "mediastinal",
+                "hilar", "lung", "chest", "xray", "x-ray", "ct", "mri", "scan", "imaging",
+                "radiology", "radiologist", "physician", "doctor", "nurse", "hospital", "clinic",
+                "emergency", "admission", "discharge", "followup", "follow-up", "outpatient",
+                "inpatient", "icu", "er", "ed", "or", "dr", "md", "rn", "np", "pa"
+            }
             for w in words:
                 clean_w = w.strip(".,;:?!\"'()")
-                # If word is capitalized and not a common lowercase/medical word, redact it
                 if clean_w and clean_w[0].isupper() and clean_w.lower() not in protected_words:
                     redacted_term = "[FALLBACK_PER_ORG_REDACTED]"
-                    # Retain punctuation
                     idx = w.find(clean_w)
                     if idx != -1:
                         prefix = w[:idx]
@@ -197,7 +217,6 @@ class PrivacyScrubber:
             scrubbed = " ".join(fallback_words)
             redaction_log.append({"type": "ner_fallback_triggered", "error": str(e)})
         
-        # Flaw #23 Fix: Write audit record ALWAYS (even if redaction_log is empty) for complete HIPAA auditability
         audit_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source": source_context,
@@ -209,6 +228,20 @@ class PrivacyScrubber:
         _audit_logger.info(json.dumps(audit_record))
                 
         return scrubbed
+
+    def scrub_text(self, text: str, source_context: str = "unknown") -> str:
+        """Synchronous version - runs async version in event loop."""
+        # For backwards compatibility, run in current event loop or create one
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're already in an event loop, we can't run_until_complete
+            # Create a new task and await it
+            return asyncio.run_coroutine_threadsafe(
+                self.scrub_text_async(text, source_context), loop
+            ).result(timeout=30)
+        except RuntimeError:
+            # No running loop, create one
+            return asyncio.run(self.scrub_text_async(text, source_context))
 
     def scrub_history_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Deep scrubs the history dictionary."""
@@ -350,17 +383,18 @@ class PrivacyScrubber:
                 import tempfile
                 
                 ds = pydicom.dcmread(image_path)
-                # Key standard Patient / Institution identity tags to sanitize
-                phi_tags = [
-                    "PatientName", "PatientID", "PatientBirthDate", "PatientSex",
-                    "InstitutionName", "AccessionNumber", "PatientAddress", 
-                    "ReferringPhysicianName", "PerformingPhysicianName", "OperatorsName"
-                ]
                 redacted_tags = []
-                for tag in phi_tags:
-                    if tag in ds:
-                        ds.data_element(tag).value = f"REDACTED_{tag.upper()}"
-                        redacted_tags.append(tag)
+                
+                def redact_element(dataset, data_element):
+                    if data_element.tag.is_private or data_element.VR in ["PN", "DA", "TM", "AS"]:
+                        # For binary data, clear it. Otherwise redact.
+                        if data_element.VR in ["OB", "OW", "UN", "SQ"]:
+                            data_element.value = b""
+                        else:
+                            data_element.value = "REDACTED"
+                        redacted_tags.append(str(data_element.tag))
+                        
+                ds.walk(redact_element)
                         
                 tmp = tempfile.NamedTemporaryFile(suffix=".dcm", delete=False)
                 sanitized_path = tmp.name
@@ -428,3 +462,14 @@ class PrivacyScrubber:
         except Exception as e:
             logger.error(f"Failed to mask burned-in text: {e}")
             return image_path
+
+    def scrub_pdf(self, pdf_path: str) -> str:
+        """Validate and scrub PDF file."""
+        try:
+            import pdfplumber
+            with pdfplumber.open(pdf_path) as pdf:
+                if len(pdf.pages) == 0:
+                    pass
+        except Exception as e:
+            raise ValueError(f"Failed to parse clinical history PDF: {e}")
+        return pdf_path

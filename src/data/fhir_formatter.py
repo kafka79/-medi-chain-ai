@@ -7,28 +7,91 @@ from fhir.resources.extension import Extension
 from fhir.resources.observation import Observation
 from fhir.resources.quantity import Quantity
 import json
+import os
 from datetime import datetime, timezone
+from typing import Dict, Optional, Tuple
+from pathlib import Path
 
-SNOMED_CODES = {
-    "silicosis": ("50751000", "Silicosis"),
-    "asbestosis": ("284594005", "Asbestosis"),
-    "pneumonia": ("233604007", "Pneumonia"),
-    "tuberculosis": ("56717001", "Tuberculosis"),
-    "normal": ("17621005", "Normal"),
+
+# Externalized SNOMED CT code system - loaded from config file
+DEFAULT_SNOMED_CODES = {
+    "Silicosis": ("50751000", "Silicosis"),
+    "Asbestosis": ("284594005", "Asbestosis"),
+    "Pneumonia": ("233604007", "Pneumonia"),
+    "Tuberculosis": ("56717001", "Tuberculosis"),
+    "Normal": ("17621005", "Normal"),
+    "Lung Cancer": ("93880001", "Malignant neoplasm of lung"),
+    "Pulmonary Nodule": ("311589007", "Pulmonary nodule"),
+    "COPD": ("13645005", "Chronic obstructive pulmonary disease"),
+    "Pulmonary Embolism": ("59282003", "Pulmonary embolism"),
+    "Interstitial Lung Disease": ("700250004", "Interstitial lung disease"),
 }
 
+_SNOMED_CODES: Optional[Dict[str, Tuple[str, str]]] = None
+
+
+def load_snomed_codes(config_path: str = None) -> Dict[str, Tuple[str, str]]:
+    """Load SNOMED CT codes from external configuration file."""
+    global _SNOMED_CODES
+    if _SNOMED_CODES is not None:
+        return _SNOMED_CODES
+    
+    if config_path is None:
+        config_path = os.getenv("SNOMED_CODES_PATH", "config/snomed_codes.json")
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                _SNOMED_CODES = {k.lower(): tuple(v) for k, v in data.items()}
+                return _SNOMED_CODES
+        except Exception as e:
+            print(f"Warning: Failed to load SNOMED codes from {config_path}: {e}")
+    
+    # Fallback to defaults
+    _SNOMED_CODES = {k.lower(): v for k, v in DEFAULT_SNOMED_CODES.items()}
+    return _SNOMED_CODES
+
+
 def get_snomed_coding(condition_name: str) -> Coding:
+    codes = load_snomed_codes()
     key = condition_name.lower().strip()
-    code, display = SNOMED_CODES.get(key, ("unknown", condition_name))
+    code, display = codes.get(key, ("unknown", condition_name))
     return Coding(
         system="http://snomed.info/sct",
         code=code,
         display=display
     )
 
+
 class FHIRFormatter:
     def __init__(self):
         pass
+
+    def generate_hl7_oru(self, diagnosis_data: Dict, verdict: str, final_diagnosis: str = None, notes: str = "", doctor_id: str = "dr-anonymous") -> str:
+        """
+        Generate a basic HL7 ORU^R01 message string for a radiologist review.
+        """
+        import uuid
+        msg_id = uuid.uuid4().hex[:10].upper()
+        patient_id = diagnosis_data.get('patient_id', 'Unknown')
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        
+        # MSH: Message Header
+        msh = f"MSH|^~\\&|MEdiChainAI|MEdiChain|PACS|Hospital|{timestamp}||ORU^R01|{msg_id}|P|2.5"
+        
+        # PID: Patient Identification
+        pid = f"PID|1||{patient_id}||Unknown^Patient|||||||||||||"
+        
+        # OBR: Observation Request
+        obr = f"OBR|1|||RAD^Radiology Report|||{timestamp}|||||||||||||{doctor_id}"
+        
+        # OBX: Observation/Result
+        finding = final_diagnosis if final_diagnosis else diagnosis_data.get('primary_finding', 'Unknown')
+        obs_val = f"Verdict: {verdict}. Finding: {finding}. Notes: {notes}"
+        obx = f"OBX|1|TX|REPORT^Final Report||{obs_val}||||||F|||{timestamp}"
+        
+        return "\r".join([msh, pid, obr, obx])
 
     def create_diagnostic_report(self, diagnosis_data):
         """
@@ -43,12 +106,30 @@ class FHIRFormatter:
             f"Differential: {differential_str}"
         )
         
-        # Structure warning flags as standard FHIR Extensions rather than raw strings in text blocks
+        # Structure warning flags as standard FHIR Extensions
         extensions = []
         if diagnosis_data.get('escalation_required', False):
             extensions.append(
                 Extension(
                     url="http://medi-chain.io/fhir/StructureDefinition/escalation-required",
+                    valueBoolean=True
+                )
+            )
+        
+        # Add uncertainty extension if present
+        if 'uncertainty_std' in diagnosis_data:
+            extensions.append(
+                Extension(
+                    url="http://medi-chain.io/fhir/StructureDefinition/uncertainty-std",
+                    valueDecimal=float(diagnosis_data['uncertainty_std'])
+                )
+            )
+        
+        # Add OOD extension if present
+        if diagnosis_data.get('ood_detected', False):
+            extensions.append(
+                Extension(
+                    url="http://medi-chain.io/fhir/StructureDefinition/out-of-distribution",
                     valueBoolean=True
                 )
             )
@@ -127,9 +208,9 @@ class FHIRFormatter:
     def to_json(self, fhir_resource):
         return fhir_resource.json(indent=2)
 
+
 class EHRGateway:
     """
-    Addresses the 'Integration Friction' and 'Silent Failure' flaws.
     Mediates FHIR integrations with external EHR systems, featuring tenacity-based
     exponential backoff retries and a local Dead Letter Queue (DLQ) fallback.
     """
@@ -243,7 +324,7 @@ class EHRGateway:
             parsed_payload = json.loads(fhir_json) if isinstance(fhir_json, str) else fhir_json
         except json.JSONDecodeError:
             parsed_payload = fhir_json  # Fallback to raw string if invalid JSON
- 
+  
         payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "error": str(exception),
@@ -278,17 +359,16 @@ class EHRGateway:
         except Exception as s3_err:
             self.logger.warning(f"[EHR Gateway] S3 DLQ upload failed: {s3_err}")
         
-        # 3. Emergency local fallback: atomic write-then-rename (no filelock needed)
-        # This is per-replica and NOT shared, but prevents data loss if Redis AND S3 are both down.
         if not redis_success:
             try:
-                dlq_dir = Path(os.getenv("DLQ_DIR", "temp/dlq"))
+                dlq_dir_str = os.getenv("DLQ_DIR", "temp/dlq")
+                dlq_dir = Path(dlq_dir_str)
                 dlq_dir.mkdir(parents=True, exist_ok=True)
+                
+                local_path = dlq_dir / filename
                 
                 # Check free space on local partition
                 total, used, free = shutil.disk_usage(dlq_dir)
-                local_path = dlq_dir / filename
-                
                 if free < 50 * 1024 * 1024:  # Warning if < 50 MB
                     self.logger.critical("Local disk space critically low. Attempting to write full payload despite space warning.")
                     try:
@@ -339,6 +419,13 @@ class EHRGateway:
             raise RuntimeError(
                 f"Failed to persist report to any DLQ. Redis failed, and local disk failed: {exception}"
             )
+
+
+class MockEHRGateway(EHRGateway):
+    async def push_report(self, fhir_json: str, is_retry: bool = False):
+        # Return success immediately
+        return True
+
 
 if __name__ == "__main__":
     formatter = FHIRFormatter()

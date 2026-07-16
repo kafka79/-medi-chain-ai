@@ -9,7 +9,7 @@ import requests as http_requests
 from datetime import datetime, timezone
 import asyncio
 import tempfile
-from typing import Any, Optional
+from typing import Any, Optional, Tuple, Union
 
 logger = logging.getLogger("drift-detector")
 
@@ -227,6 +227,16 @@ class DriftDetector:
         self._write_local_cache("prediction_baseline_cache.json", probs)
         self.baseline = np.array(probs)
 
+    def _update_prediction_baseline(self, current_probs: list):
+        if self.baseline is None:
+            self._save_baseline(current_probs)
+            return
+        combined = np.vstack([self.baseline, current_probs])
+        max_size = 2000
+        if combined.shape[0] > max_size:
+            combined = combined[-max_size:]
+        self._save_baseline(combined.tolist())
+
     def _load_features_baseline(self):
         data = None
         if self.redis_client is not None:
@@ -263,6 +273,41 @@ class DriftDetector:
                 
         self._write_local_cache("features_baseline_cache.json", features)
         self.features_baseline = np.array(features)
+        
+        # Calculate dynamic centroid metrics
+        arr = self.features_baseline
+        mean_val = np.mean(arr, axis=0)
+        std_val = np.std(arr, axis=0)
+        norm_b = np.linalg.norm(mean_val)
+        
+        median_sim = 0.0
+        mad_std = 0.0
+        if norm_b > 0:
+            norms = np.linalg.norm(arr, axis=1)
+            valid = (norms > 0)
+            if np.any(valid):
+                sims = np.dot(arr[valid], mean_val) / (norms[valid] * norm_b)
+                median_sim = float(np.median(sims))
+                mad_std = float(np.median(np.abs(sims - median_sim)) * 1.4826)
+                
+        centroid_data = {
+            "centroid": mean_val.tolist(),
+            "std": std_val.tolist(),
+            "median_sim": median_sim,
+            "mad_std": mad_std,
+            "count": len(features)
+        }
+        self._write_local_cache("features_centroid.json", centroid_data)
+
+    def _update_features_baseline(self, current_features: list):
+        if self.features_baseline is None:
+            self._save_features_baseline(current_features)
+            return
+        combined = np.vstack([self.features_baseline, current_features])
+        max_size = 2000
+        if combined.shape[0] > max_size:
+            combined = combined[-max_size:]
+        self._save_features_baseline(combined.tolist())
 
     def _load_text_baseline(self):
         data = None
@@ -300,6 +345,24 @@ class DriftDetector:
                 
         self._write_local_cache("text_baseline_cache.json", features)
         self.text_baseline = np.array(features)
+        
+        arr = self.text_baseline
+        mean_val = np.mean(arr, axis=0)
+        centroid_data = {
+            "centroid": mean_val.tolist(),
+            "count": len(features)
+        }
+        self._write_local_cache("text_centroid.json", centroid_data)
+
+    def _update_text_baseline(self, current_features: list):
+        if self.text_baseline is None:
+            self._save_text_baseline(current_features)
+            return
+        combined = np.vstack([self.text_baseline, current_features])
+        max_size = 2000
+        if combined.shape[0] > max_size:
+            combined = combined[-max_size:]
+        self._save_text_baseline(combined.tolist())
 
     def _refresh_baselines_if_changed(self):
         if self.redis_client is None:
@@ -331,6 +394,19 @@ class DriftDetector:
         """Synchronous implementation of add_prediction to be run in asyncio.to_thread."""
         try:
             self._refresh_baselines_if_changed()
+            
+            import torch
+            import torch.nn.functional as F
+            
+            # Flaw #4 Fix: Explicitly L2 normalize visual and text features before baseline addition
+            if visual_features is not None:
+                vf_tensor = torch.tensor(visual_features, dtype=torch.float32)
+                visual_features = F.normalize(vf_tensor, p=2, dim=-1).tolist()
+                
+            if text_features is not None:
+                tf_tensor = torch.tensor(text_features, dtype=torch.float32)
+                text_features = F.normalize(tf_tensor, p=2, dim=-1).tolist()
+            
             val_probs = json.dumps(probs)
             val_features = json.dumps(visual_features) if visual_features is not None else ""
             
@@ -338,6 +414,14 @@ class DriftDetector:
                 try:
                     self.redis_client.rpush("medi_chain:drift:text_window", json.dumps(text_features))
                     self.redis_client.ltrim("medi_chain:drift:text_window", -100, -1)
+                    
+                    # Opportunistically update text baseline if it's full enough
+                    text_len = self.redis_client.llen("medi_chain:drift:text_window")
+                    if text_len >= 100:
+                        raw_texts = self.redis_client.lrange("medi_chain:drift:text_window", 0, -1)
+                        current_texts = [json.loads(t) for t in raw_texts]
+                        self._update_text_baseline(current_texts)
+                        self.redis_client.delete("medi_chain:drift:text_window")
                 except Exception as text_err:
                     logger.error(f"Failed to push text features to Redis: {text_err}")
             
@@ -391,12 +475,8 @@ class DriftDetector:
 
     def check_prediction_drift(self, current_probs: list):
         """
-        Monitors Prediction Drift / Label Shift P(Y_hat) using Kolmogorov-Smirnov test
-        applied to prediction confidence (maximum softmax probabilities).
-        
-        Note: Softmax outputs across classes for a single sample sum to 1 and are highly dependent.
-        Running univariate KS-tests class-by-class violates the independence assumption.
-        Comparing the univariate distributions of maximum prediction confidence scores is statistically valid.
+        Monitors Prediction Drift / Label Shift P(Y_hat) using multidimensional
+        Maximum Mean Discrepancy (MMD) on full probability vectors.
         """
         if self.disabled or not current_probs:
             return False
@@ -419,21 +499,24 @@ class DriftDetector:
 
         drift_detected = False
         
-        # Extract maximum probability (confidence) score for each sample in baseline and current
-        baseline_conf = np.max(self.baseline, axis=1)
-        current_conf = np.max(current, axis=1)
+        # Compare full probability distributions using MMD
+        mmd_value, (ci_lower, ci_upper) = self._compute_mmd(self.baseline, current, compute_ci=True)
         
-        # Compare confidence distributions using Kolmogorov-Smirnov test
-        stat, p_value = ks_2samp(baseline_conf, current_conf)
-        if p_value < 0.05:
-            msg = f"Significant Prediction Drift detected in confidence score distributions (p={p_value:.4f}, threshold=0.05)"
+        # If the lower bound of the confidence interval is clearly above zero, we have drift
+        if ci_lower > 0.05:
+            msg = f"Significant Prediction Drift detected: MMD²={mmd_value:.4f} (95% CI: [{ci_lower:.4f}, {ci_upper:.4f}])"
             _send_alert("Prediction Drift", msg)
             drift_detected = True
+        else:
+            # Update rolling baseline if no drift detected
+            self._update_prediction_baseline(current_probs)
         
         return drift_detected
 
-    def _compute_mmd(self, X: np.ndarray, Y: np.ndarray, gamma: float = None) -> float:
-        """Hybrid unbiased MMD² estimator (Gretton et al. 2012).
+    def _compute_mmd(self, X: np.ndarray, Y: np.ndarray, gamma: float = None, 
+                     compute_ci: bool = False, ci_level: float = 0.95, 
+                     n_bootstrap: int = 500) -> Union[float, Tuple[float, Tuple[float, float]]]:
+        """Hybrid unbiased MMD² estimator (Gretton et al. 2012) with optional bootstrap CI.
 
         Panel Flaw #5 Fix: The previous O(N²) implementation computed full
         pairwise distance matrices which blocked the Python GIL for the entire computation,
@@ -442,15 +525,27 @@ class DriftDetector:
         This uses a hybrid approach:
         - For N < 100: Uses the O(N²) quadratic unbiased estimator for statistical efficiency.
         - For N >= 100: Uses the O(N) linear-time estimator to avoid GIL blocks.
+
+        Args:
+            X, Y: Feature matrices of shape (n_samples, n_features)
+            gamma: RBF kernel bandwidth (auto-estimated if None)
+            compute_ci: If True, compute bootstrap confidence interval
+            ci_level: Confidence level for bootstrap CI (default 0.95)
+            n_bootstrap: Number of bootstrap resamples for CI
+
+        Returns:
+            MMD² value, or (MMD² value, (ci_lower, ci_upper)) if compute_ci=True
         """
         n = min(X.shape[0], Y.shape[0])
         if n < 4:
+            if compute_ci:
+                return 0.0, (0.0, 0.0)
             return 0.0
 
         # Truncate to equal length and shuffle for unbiased pairing
         X, Y = X[:n], Y[:n]
-        # Use a deterministic RandomState to make MMD calculation deterministic for identical datasets
-        rng = np.random.RandomState(42)
+        # Use a fresh RNG per call for valid bootstrap resampling (not fixed seed)
+        rng = np.random.default_rng()
         perm = rng.permutation(n)
         X, Y = X[perm], Y[perm]
 
@@ -466,36 +561,53 @@ class DriftDetector:
             sq_dists = np.sum((a - b) ** 2, axis=1)
             return np.exp(-gamma * sq_dists)
 
-        if n < 100:
-            # O(N^2) quadratic unbiased estimator
-            def rbf_kernel_matrix(a, b):
-                sq_dists = np.sum((a[:, np.newaxis, :] - b[np.newaxis, :, :]) ** 2, axis=2)
-                return np.exp(-gamma * sq_dists)
+        def compute_mmd_point(X_sub: np.ndarray, Y_sub: np.ndarray) -> float:
+            n_sub = X_sub.shape[0]
+            if n_sub < 100:
+                def rbf_kernel_matrix(a, b):
+                    sq_dists = np.sum((a[:, np.newaxis, :] - b[np.newaxis, :, :]) ** 2, axis=2)
+                    return np.exp(-gamma * sq_dists)
+                    
+                K_xx = rbf_kernel_matrix(X_sub, X_sub)
+                K_yy = rbf_kernel_matrix(Y_sub, Y_sub)
+                K_xy = rbf_kernel_matrix(X_sub, Y_sub)
                 
-            K_xx = rbf_kernel_matrix(X, X)
-            K_yy = rbf_kernel_matrix(Y, Y)
-            K_xy = rbf_kernel_matrix(X, Y)
+                np.fill_diagonal(K_xx, 0)
+                np.fill_diagonal(K_yy, 0)
+                
+                m_val = n_sub * (n_sub - 1)
+                return float(np.sum(K_xx) / m_val + np.sum(K_yy) / m_val - 2 * np.sum(K_xy) / (n_sub * n_sub))
+            else:
+                m = n_sub // 2
+                X_even, X_odd = X_sub[:m], X_sub[m:2*m]
+                Y_even, Y_odd = Y_sub[:m], Y_sub[m:2*m]
             
-            # Remove diagonal for unbiased estimator
-            np.fill_diagonal(K_xx, 0)
-            np.fill_diagonal(K_yy, 0)
+                h = (rbf_kernel(X_even, X_odd)
+                     + rbf_kernel(Y_even, Y_odd)
+                     - rbf_kernel(X_even, Y_odd)
+                     - rbf_kernel(X_odd, Y_even))
             
-            m_val = n * (n - 1)
-            return float(np.sum(K_xx) / m_val + np.sum(K_yy) / m_val - 2 * np.sum(K_xy) / (n * n))
-        else:
-            # O(N) linear-time unbiased estimator
-            # Use only even number of samples for clean pairing
-            m = n // 2
-            X_even, X_odd = X[:m], X[m:2*m]
-            Y_even, Y_odd = Y[:m], Y[m:2*m]
-    
-            # h_i = k(x_even, x_odd) + k(y_even, y_odd) - k(x_even, y_odd) - k(x_odd, y_even)
-            h = (rbf_kernel(X_even, X_odd)
-                 + rbf_kernel(Y_even, Y_odd)
-                 - rbf_kernel(X_even, Y_odd)
-                 - rbf_kernel(X_odd, Y_even))
-    
-            return float(np.mean(h))
+                return float(np.mean(h))
+
+        mmd_value = compute_mmd_point(X, Y)
+        
+        if not compute_ci:
+            return mmd_value
+        
+        # Bootstrap confidence interval
+        bootstrap_values = []
+        for _ in range(n_bootstrap):
+            idx = rng.choice(n, size=n, replace=True)
+            X_boot = X[idx]
+            Y_boot = Y[idx]
+            boot_val = compute_mmd_point(X_boot, Y_boot)
+            bootstrap_values.append(boot_val)
+        
+        alpha = (1 - ci_level) / 2
+        ci_lower = float(np.percentile(bootstrap_values, 100 * alpha))
+        ci_upper = float(np.percentile(bootstrap_values, 100 * (1 - alpha)))
+        
+        return mmd_value, (ci_lower, ci_upper)
 
     def check_covariate_shift(self, current_features: list):
         """
@@ -534,8 +646,11 @@ class DriftDetector:
             return False
             
         # 1. Compute MMD (Maximum Mean Discrepancy) - First-principles multidimensional feature shift
-        mmd_value = self._compute_mmd(self.features_baseline, current)
-        logger.info(f"Visual covariate shift analysis - Maximum Mean Discrepancy (MMD): {mmd_value:.6f}")
+        # with bootstrap confidence interval to avoid false alarms from estimator variance
+        mmd_result = self._compute_mmd(self.features_baseline, current, compute_ci=True, ci_level=0.95, n_bootstrap=500)
+        mmd_value = mmd_result[0]
+        mmd_ci = mmd_result[1]
+        logger.info(f"Visual covariate shift analysis - MMD: {mmd_value:.6f} (95% CI: [{mmd_ci[0]:.6f}, {mmd_ci[1]:.6f}])")
 
         # 2. Compute Cosine Similarity between baseline and current mean feature vectors
         mean_baseline = np.mean(self.features_baseline, axis=0)
@@ -549,18 +664,24 @@ class DriftDetector:
             cosine_sim = np.dot(mean_baseline, mean_current) / (norm_b * norm_c)
             logger.info(f"Visual covariate shift analysis - Cosine Similarity: {cosine_sim:.4f}")
         
-        # Alert if MMD exceeds threshold (indicating distribution shift) or cosine similarity falls below threshold
+        # Alert if MMD CI lower bound exceeds threshold (statistically significant shift) 
+        # or cosine similarity falls below threshold
         mmd_threshold = 0.05
         cosine_threshold = 0.95
         
-        if mmd_value > mmd_threshold or cosine_sim < cosine_threshold:
+        shift_detected = mmd_ci[0] > mmd_threshold or cosine_sim < cosine_threshold
+        
+        if shift_detected:
             msg = (
                 f"Significant Covariate Shift P(X) detected in visual feature space! "
-                f"MMD: {mmd_value:.6f} (threshold: {mmd_threshold}), "
+                f"MMD: {mmd_value:.6f} (95% CI: [{mmd_ci[0]:.6f}, {mmd_ci[1]:.6f}], threshold: {mmd_threshold}), "
                 f"Cosine Similarity: {cosine_sim:.4f} (threshold: {cosine_threshold})."
             )
             _send_alert("Covariate Shift", msg)
             return True
+        else:
+            # Update rolling baseline if no shift detected
+            self._update_features_baseline(current_features)
             
         return False
 
