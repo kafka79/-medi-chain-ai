@@ -21,7 +21,7 @@ services:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/bin/data
     command: minio server /bin/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
       interval: 30s
       timeout: 20s
       retries: 3
@@ -32,7 +32,7 @@ services:
     container_name: medi-chain-redis
     image: redis:7-alpine
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -42,7 +42,7 @@ services:
   standalone:
     container_name: milvus-standalone
     image: milvusdb/milvus:v2.3.16
-    command: ["milvus", "run", "standalone"]
+    command: [ "milvus", "run", "standalone" ]
     environment:
       - ETCD_ENDPOINTS=etcd:2379
       - MINIO_ADDRESS=minio:9000
@@ -61,7 +61,7 @@ services:
     build:
       context: ..
       dockerfile: deployment/Dockerfile
-    command: ["uvicorn", "deployment.api.inference_service:app", "--host", "0.0.0.0", "--port", "8001"]
+    command: [ "uvicorn", "deployment.api.inference_service:app", "--host", "0.0.0.0", "--port", "8001" ]
     expose:
       - "8001"
     volumes:
@@ -78,9 +78,9 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -94,7 +94,7 @@ services:
     build:
       context: ..
       dockerfile: deployment/Dockerfile
-    command: ["uvicorn", "deployment.api.inference_service:app", "--host", "0.0.0.0", "--port", "8001"]
+    command: [ "uvicorn", "deployment.api.inference_service:app", "--host", "0.0.0.0", "--port", "8001" ]
     expose:
       - "8001"
     volumes:
@@ -111,9 +111,9 @@ services:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [gpu]
+              capabilities: [ gpu ]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -144,7 +144,7 @@ services:
     build:
       context: ..
       dockerfile: deployment/Dockerfile
-    command: ["gunicorn", "deployment.api.main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120"]
+    command: [ "gunicorn", "deployment.api.main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120" ]
     expose:
       - "8000"
     volumes:
@@ -211,7 +211,7 @@ services:
     deploy:
       replicas: 3
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/v1/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -233,7 +233,7 @@ services:
     build:
       context: ..
       dockerfile: deployment/Dockerfile
-    command: ["python", "-m", "src.worker"]
+    command: [ "python", "-m", "src.worker" ]
     volumes:
       - ..:/app
       - shared-scans:/app/shared_scans
