@@ -389,13 +389,17 @@ class EHRGateway:
                 # Atomic: write to temp file, then rename (rename is atomic on POSIX)
                 fd, tmp_path = tempfile.mkstemp(dir=str(dlq_dir), suffix=".tmp")
                 try:
-                    with os.fdopen(fd, "w") as f:
-                        f.write(wrapper_json)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp_path, str(local_path))
+                    from filelock import FileLock
+                    lock_path = str(local_path) + ".lock"
+                    with FileLock(lock_path, timeout=5):
+                        with os.fdopen(fd, "w") as f:
+                            f.write(wrapper_json)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp_path, str(local_path))
                     
                     # Sync parent directory to ensure directory metadata changes are durable (POSIX)
+
                     if os.name != "nt":
                         try:
                             dir_fd = os.open(str(dlq_dir), os.O_RDONLY)

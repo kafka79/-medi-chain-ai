@@ -43,6 +43,50 @@ def _send_alert(title: str, message: str):
     _alert_executor.submit(_send_alert_sync, title, message)
 
 
+_process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+
+def _global_rbf_kernel(a: np.ndarray, b: np.ndarray, gamma: float) -> np.ndarray:
+    sq_dists = np.sum((a - b) ** 2, axis=1)
+    return np.exp(-gamma * sq_dists)
+
+def _global_compute_mmd_point(X_sub: np.ndarray, Y_sub: np.ndarray, gamma: float) -> float:
+    n_sub = X_sub.shape[0]
+    if n_sub < 100:
+        def rbf_kernel_matrix(a, b):
+            sq_dists = np.sum((a[:, np.newaxis, :] - b[np.newaxis, :, :]) ** 2, axis=2)
+            return np.exp(-gamma * sq_dists)
+            
+        K_xx = rbf_kernel_matrix(X_sub, X_sub)
+        K_yy = rbf_kernel_matrix(Y_sub, Y_sub)
+        K_xy = rbf_kernel_matrix(X_sub, Y_sub)
+        
+        np.fill_diagonal(K_xx, 0)
+        np.fill_diagonal(K_yy, 0)
+        
+        m_val = n_sub * (n_sub - 1)
+        return float(np.sum(K_xx) / m_val + np.sum(K_yy) / m_val - 2 * np.sum(K_xy) / (n_sub * n_sub))
+    else:
+        m = n_sub // 2
+        X_even, X_odd = X_sub[:m], X_sub[m:2*m]
+        Y_even, Y_odd = Y_sub[:m], Y_sub[m:2*m]
+    
+        h = (_global_rbf_kernel(X_even, X_odd, gamma)
+             + _global_rbf_kernel(Y_even, Y_odd, gamma)
+             - _global_rbf_kernel(X_even, Y_odd, gamma)
+             - _global_rbf_kernel(X_odd, Y_even, gamma))
+    
+        return float(np.mean(h))
+
+def _global_bootstrap_step_args(args):
+    seed, X, Y, gamma = args
+    local_rng = np.random.default_rng(seed)
+    n = X.shape[0]
+    idx = local_rng.choice(n, size=n, replace=True)
+    X_boot = X[idx]
+    Y_boot = Y[idx]
+    return _global_compute_mmd_point(X_boot, Y_boot, gamma)
+
+
 class DriftDetector:
     """
     Monitors three tiers of model and data drift:
@@ -297,6 +341,12 @@ class DriftDetector:
             "mad_std": mad_std,
             "count": len(features)
         }
+        if self.redis_client is not None:
+            try:
+                self.redis_client.set("medi_chain:drift:features_centroid", json.dumps(centroid_data))
+            except Exception as e:
+                logger.error(f"Failed to save features centroid to Redis: {e}")
+                
         self._write_local_cache("features_centroid.json", centroid_data)
 
     def _update_features_baseline(self, current_features: list):
@@ -556,52 +606,16 @@ class DriftDetector:
             median_dist = np.median(dists)
             gamma = 1.0 / (median_dist + 1e-8)
 
-        def rbf_kernel(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            """Vectorized RBF kernel for paired rows: k(a_i, b_i) for all i."""
-            sq_dists = np.sum((a - b) ** 2, axis=1)
-            return np.exp(-gamma * sq_dists)
-
-        def compute_mmd_point(X_sub: np.ndarray, Y_sub: np.ndarray) -> float:
-            n_sub = X_sub.shape[0]
-            if n_sub < 100:
-                def rbf_kernel_matrix(a, b):
-                    sq_dists = np.sum((a[:, np.newaxis, :] - b[np.newaxis, :, :]) ** 2, axis=2)
-                    return np.exp(-gamma * sq_dists)
-                    
-                K_xx = rbf_kernel_matrix(X_sub, X_sub)
-                K_yy = rbf_kernel_matrix(Y_sub, Y_sub)
-                K_xy = rbf_kernel_matrix(X_sub, Y_sub)
-                
-                np.fill_diagonal(K_xx, 0)
-                np.fill_diagonal(K_yy, 0)
-                
-                m_val = n_sub * (n_sub - 1)
-                return float(np.sum(K_xx) / m_val + np.sum(K_yy) / m_val - 2 * np.sum(K_xy) / (n_sub * n_sub))
-            else:
-                m = n_sub // 2
-                X_even, X_odd = X_sub[:m], X_sub[m:2*m]
-                Y_even, Y_odd = Y_sub[:m], Y_sub[m:2*m]
-            
-                h = (rbf_kernel(X_even, X_odd)
-                     + rbf_kernel(Y_even, Y_odd)
-                     - rbf_kernel(X_even, Y_odd)
-                     - rbf_kernel(X_odd, Y_even))
-            
-                return float(np.mean(h))
-
-        mmd_value = compute_mmd_point(X, Y)
+        mmd_value = _global_compute_mmd_point(X, Y, gamma)
         
         if not compute_ci:
             return mmd_value
         
-        # Bootstrap confidence interval
-        bootstrap_values = []
-        for _ in range(n_bootstrap):
-            idx = rng.choice(n, size=n, replace=True)
-            X_boot = X[idx]
-            Y_boot = Y[idx]
-            boot_val = compute_mmd_point(X_boot, Y_boot)
-            bootstrap_values.append(boot_val)
+        # Bootstrap confidence interval parallelized via pre-warmed process pool to bypass GIL
+        seeds = rng.integers(0, 2**32 - 1, size=n_bootstrap).tolist()
+        args_list = [(seed, X, Y, gamma) for seed in seeds]
+        
+        bootstrap_values = list(_process_pool.map(_global_bootstrap_step_args, args_list))
         
         alpha = (1 - ci_level) / 2
         ci_lower = float(np.percentile(bootstrap_values, 100 * alpha))

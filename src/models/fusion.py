@@ -47,21 +47,20 @@ def get_model_num_classes() -> int:
 
 class AttentionFusion(nn.Module):
     """
-    Multimodal fusion utilizing Gated Multimodal Fusion (not multi-head cross-attention).
-    For globally pooled vectors (sequence length = 1), multi-head cross-attention degenerates
-    into a costly linear projection. Gated fusion is mathematically equivalent in capacity but
-    computationally far more efficient, avoiding the unnecessary multi-head overhead.
+    Multimodal fusion utilizing Multihead Cross-Attention.
+    Projects vision and text embeddings to a shared dimension and applies cross-attention
+    where the text representation acts as the query and vision as the key/value, followed by
+    residual connections and a Feed-Forward Network.
     """
-    def __init__(self, vision_dim=512, text_dim=768, hidden_dim=512, num_classes=NUM_CLASSES):
+    def __init__(self, vision_dim=512, text_dim=768, hidden_dim=512, num_heads=8, num_classes=NUM_CLASSES):
         super(AttentionFusion, self).__init__()
         
         # Projection layers to align dimensions
         self.v_proj = nn.Linear(vision_dim, hidden_dim)
         self.t_proj = nn.Linear(text_dim, hidden_dim)
         
-        # Distinct linear layers for gating decisions to maximize representational capacity
-        self.v_gate = nn.Linear(vision_dim, hidden_dim)
-        self.t_gate = nn.Linear(text_dim, hidden_dim)
+        # Cross-modal multi-head attention
+        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, batch_first=True)
         
         self.norm1 = nn.LayerNorm(hidden_dim)
         
@@ -84,13 +83,15 @@ class AttentionFusion(nn.Module):
         )
         
     def forward(self, vision_emb, text_emb):
-        # Project both to a common semantic space
-        v = self.v_proj(vision_emb)  # Shape: (batch, hidden_dim)
-        t = self.t_proj(text_emb)    # Shape: (batch, hidden_dim)
+        # Project both to a common semantic space and add sequence dimension
+        v = self.v_proj(vision_emb).unsqueeze(1)  # Shape: (batch, 1, hidden_dim)
+        t = self.t_proj(text_emb).unsqueeze(1)    # Shape: (batch, 1, hidden_dim)
         
-        # Compute the gate using independent linear projections to ensure representational capacity
-        gate = torch.sigmoid(self.v_gate(vision_emb) + self.t_gate(text_emb))
-        fused = self.norm1(gate * v + (1 - gate) * t)
+        # Cross-attention: text queries vision context
+        attn_out, _ = self.cross_attn(query=t, key=v, value=v)
+        
+        # Residual connection and normalization
+        fused = self.norm1(t + attn_out).squeeze(1) # Shape: (batch, hidden_dim)
         
         # Feed-forward refinement and second layer norm (with residual connection)
         fused = self.norm2(fused + self.ffn(fused))

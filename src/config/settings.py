@@ -17,11 +17,13 @@ class ClinicalThresholds(BaseSettings):
     confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     uncertainty_threshold: float = Field(default=0.15, ge=0.0, le=1.0)
     uncertainty_calibration_factor: float = Field(default=1.0, gt=0.0)
+    calibration_temperature: float = Field(default=1.0, gt=0.0)
     ood_confidence_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
     ood_use_static_threshold: bool = Field(default=True)
     ood_cosine_threshold: float = Field(default=0.82, ge=0.0, le=1.0)
     ood_text_cosine_threshold: float = Field(default=0.82, ge=0.0, le=1.0)
     mc_dropout_passes: int = Field(default=50, ge=10, le=200)
+
 
     thresholds_validated: bool = Field(default=False)
     validation_dataset: str = Field(default="")

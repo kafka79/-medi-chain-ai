@@ -838,34 +838,45 @@ async def reconcile_dlq_task():
                         local_files = []
                         
                     for file_path in local_files:
-                        processing_path = file_path.with_suffix(".processing")
+                        from filelock import FileLock, Timeout
+                        lock_path = file_path.with_suffix(".lock")
                         try:
-                            file_path.rename(processing_path)
-                        except FileNotFoundError:
+                            # Use filelock to acquire exclusive access to the file before processing it
+                            with FileLock(str(lock_path), timeout=0):
+                                processing_path = file_path.with_suffix(".processing")
+                                try:
+                                    file_path.rename(processing_path)
+                                except FileNotFoundError:
+                                    continue
+                                except Exception as e:
+                                    logger.error(f"[DLQ Reconciler] Failed to rename local DLQ file {file_path.name}: {e}")
+                                    continue
+                                
+                                try:
+                                    with open(processing_path, "r") as f:
+                                        wrapper = json.load(f)
+                                    if isinstance(wrapper, dict) and wrapper.get("encrypted"):
+                                        decrypted_data = decrypt_payload(wrapper["data"])
+                                        item = json.loads(decrypted_data)
+                                    else:
+                                        item = wrapper
+                                    task = asyncio.create_task(process_reconciliation(item, "local", str(processing_path)))
+                                    active_tasks.add(task)
+                                    task.add_done_callback(active_tasks.discard)
+                                    item_found = True
+                                    break
+                                except Exception as e:
+                                    logger.error(f"[DLQ Reconciler] Failed to read local DLQ file {processing_path.name}: {e}")
+                                    try:
+                                        processing_path.rename(file_path)
+                                    except Exception:
+                                        pass
+                        except Timeout:
+                            # Skip if another replica is currently locking this file
                             continue
                         except Exception as e:
-                            logger.error(f"[DLQ Reconciler] Failed to rename local DLQ file {file_path.name}: {e}")
+                            logger.error(f"[DLQ Reconciler] Failed to acquire lock for local DLQ file {file_path.name}: {e}")
                             continue
-                        
-                        try:
-                            with open(processing_path, "r") as f:
-                                wrapper = json.load(f)
-                            if isinstance(wrapper, dict) and wrapper.get("encrypted"):
-                                decrypted_data = decrypt_payload(wrapper["data"])
-                                item = json.loads(decrypted_data)
-                            else:
-                                item = wrapper
-                            task = asyncio.create_task(process_reconciliation(item, "local", str(processing_path)))
-                            active_tasks.add(task)
-                            task.add_done_callback(active_tasks.discard)
-                            item_found = True
-                            break
-                        except Exception as e:
-                            logger.error(f"[DLQ Reconciler] Failed to read local DLQ file {processing_path.name}: {e}")
-                            try:
-                                processing_path.rename(file_path)
-                            except Exception:
-                                pass
                                     
             if not item_found:
                 dlq_semaphore.release()

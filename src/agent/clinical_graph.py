@@ -128,7 +128,8 @@ class ResilientHTTPClient:
         if not self._check_circuit_breaker(endpoint):
             raise httpx.ConnectError(f"Circuit breaker open for {endpoint}")
         
-        hedging_delay = self.config.request_timeout_seconds / self.config.hedging_delay_factor
+        timeout_budget = self.config.request_timeout_seconds
+        hedging_delay = timeout_budget / self.config.hedging_delay_factor
         first_response: Optional[httpx.Response] = None
         first_error: Optional[Exception] = None
         
@@ -155,7 +156,21 @@ class ResilientHTTPClient:
             else:
                 # Fire hedging request
                 task2 = asyncio.create_task(make_request())
-                done, _ = await asyncio.wait([task1, task2], return_when=asyncio.FIRST_COMPLETED)
+                remaining_time = max(0.1, timeout_budget - hedging_delay)
+                
+                done, pending = await asyncio.wait(
+                    [task1, task2], 
+                    timeout=remaining_time,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                if not done:
+                    # Both timed out (API is sluggish)
+                    for t in [task1, task2]:
+                        if not t.done():
+                            t.cancel()
+                    self._get_circuit_breaker(endpoint).record_failure()
+                    raise httpx.ConnectTimeout(f"Circuit breaker trip: inference API is sluggish for {endpoint} (timeout exhausted).")
                 
                 for task in done:
                     try:
@@ -439,18 +454,46 @@ class ClinicalAgent:
         mean_confidence = float(results['mean_confidence'][0])
         uncertainty_std = float(results['std_deviation'][0])
         all_probs = results['all_probs'][0]
+        
+        # Apply Temperature Scaling Calibration to probabilities before checking thresholds
+        temperature = clinical_config.calibration_temperature
+        if temperature != 1.0 and all_probs:
+            # Reconstruct relative logits and scale
+            logits = np.log(np.array(all_probs) + 1e-9)
+            scaled_logits = logits / temperature
+            scaled_probs = np.exp(scaled_logits) / np.sum(np.exp(scaled_logits))
+            all_probs = scaled_probs.tolist()
+            # Update the confidence to the calibrated probability for thresholding
+            mean_confidence = float(max(all_probs))
+            
         max_softmax = max(all_probs) if all_probs else 0.0
 
         # Distance-based visual OOD detection
         visual_ood_detected = False
         try:
             import json
-            centroid_path = Path("temp/drift/features_centroid.json")
-            if centroid_path.exists():
-                with open(centroid_path, "r") as f:
-                    centroid_data = json.load(f)
+            import redis
+            import os
+            centroid_data = None
+            try:
+                redis_client = redis.Redis(
+                    host=os.getenv("REDIS_HOST", "redis"), 
+                    port=int(os.getenv("REDIS_PORT", "6379")), 
+                    db=0, decode_responses=True, socket_connect_timeout=1, socket_timeout=1
+                )
+                data_str = redis_client.get("medi_chain:drift:features_centroid")
+                if data_str:
+                    centroid_data = json.loads(data_str)
+            except Exception as e:
+                pass
                 
-                if centroid_data and "centroid" in centroid_data:
+            if not centroid_data:
+                centroid_path = Path("temp/drift/features_centroid.json")
+                if centroid_path.exists():
+                    with open(centroid_path, "r") as f:
+                        centroid_data = json.load(f)
+                
+            if centroid_data and "centroid" in centroid_data:
                     mean_baseline = np.array(centroid_data["centroid"])
                     current_arr = np.array(v)
                     mean_current = np.mean(current_arr, axis=0)

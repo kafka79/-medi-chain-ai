@@ -37,11 +37,28 @@ class UncertaintyEstimator:
         try:
             import json
             from pathlib import Path
-            centroid_path = Path("temp/drift/features_centroid.json")
-            if centroid_path.exists():
-                with open(centroid_path, "r") as f:
-                    centroid_data = json.load(f)
-                if centroid_data and "centroid" in centroid_data:
+            centroid_data = None
+            try:
+                import redis
+                import os
+                redis_client = redis.Redis(
+                    host=os.getenv("REDIS_HOST", "redis"), 
+                    port=int(os.getenv("REDIS_PORT", "6379")), 
+                    db=0, decode_responses=True, socket_connect_timeout=1, socket_timeout=1
+                )
+                data_str = redis_client.get("medi_chain:drift:features_centroid")
+                if data_str:
+                    centroid_data = json.loads(data_str)
+            except Exception as e:
+                pass
+                
+            if not centroid_data:
+                centroid_path = Path("temp/drift/features_centroid.json")
+                if centroid_path.exists():
+                    with open(centroid_path, "r") as f:
+                        centroid_data = json.load(f)
+                        
+            if centroid_data and "centroid" in centroid_data:
                     mean_val = centroid_data["centroid"]
                     baseline_mean = torch.tensor(mean_val, dtype=torch.float32, device=vision_emb.device)
                     if "std" in centroid_data:
